@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devdiary:attribution:schema:v1:registry",
+  "title": "DevDiary Cast Registry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "namespace", "principal_ref", "defaults", "ingest", "actors", "adapters"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "version": {"const": 1},
+    "namespace": {"type": "string", "minLength": 1},
+    "principal_ref": {"type": "string", "minLength": 1},
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enforcement", "anonymous_subagent_policy"],
+      "properties": {
+        "enforcement": {"enum": ["off", "warn", "enforce"]},
+        "anonymous_subagent_policy": {"enum": ["inherit", "reject"]}
+      }
+    },
+    "ingest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key_env"],
+      "properties": {
+        "url": {"type": "string", "format": "uri", "pattern": "^[^?#]+$"},
+        "key_env": {"type": "string", "pattern": "^DEVDIARY_INGEST_KEY(?:_[A-Z0-9_]+)?$"}
+      }
+    },
+    "actors": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/actor"}
+    },
+    "adapters": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/adapter"}
+    }
+  },
+  "$defs": {
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_ref", "kind", "display_name", "attester_ref"],
+      "properties": {
+        "actor_ref": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["agent", "automation"]},
+        "display_name": {"type": "string", "minLength": 1},
+        "humanized_name": {"type": ["string", "null"], "minLength": 1},
+        "principal_ref": {"type": "string", "minLength": 1},
+        "attester_ref": {"type": "string", "minLength": 1},
+        "lane": {"type": ["string", "null"], "minLength": 1},
+        "aliases": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "identities": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "git_name",
+              "git_email",
+              "paperclip_agent_id",
+              "hermes_agent_id",
+              "claude_code_account_id",
+              "codex_account_id",
+              "ci_actor_id",
+              "cron_job_id"
+            ]
+          },
+          "additionalProperties": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "execution_role": {"enum": ["orchestrator", "executor"]},
+        "runtime": {"type": "string", "minLength": 1},
+        "map": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "session_ref": {"type": "string", "pattern": "^env:DEVDIARY_RUNTIME_SESSION_REF(?:_[A-Z0-9]+(?:_[A-Z0-9]+)*)?$"},
+            "provider": {"type": "string", "pattern": "^env:DEVDIARY_RUNTIME_PROVIDER(?:_[A-Z0-9]+(?:_[A-Z0-9]+)*)?$"},
+            "model": {"type": "string", "pattern": "^env:DEVDIARY_RUNTIME_MODEL(?:_[A-Z0-9]+(?:_[A-Z0-9]+)*)?$"}
+          }
+        }
+      }
+    }
+  }
+}

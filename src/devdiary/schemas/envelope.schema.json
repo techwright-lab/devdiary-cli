@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devdiary:attribution:schema:v1:envelope",
+  "title": "DevDiary Terminal Attribution Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "event_type", "actor", "execution_chain", "run_ref", "session_type", "started_at", "ended_at", "work", "outcome", "attribution"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "event_id": {"type": "string", "minLength": 1},
+    "event_type": {"enum": ["run.completed", "run.failed", "run.cancelled"]},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "kind"],
+      "properties": {
+        "ref": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["agent", "automation"]},
+        "display_name": {"type": "string", "minLength": 1},
+        "humanized_name": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "lane_ref": {"type": ["string", "null"]},
+    "principal_ref": {"type": ["string", "null"]},
+    "execution_chain": {
+      "type": "array",
+      "minItems": 1,
+      "contains": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {"kind": {"enum": ["orchestrator", "executor"]}}
+      },
+      "items": {"$ref": "#/$defs/execution_entry"}
+    },
+    "run_ref": {"type": "string", "minLength": 1},
+    "parent_run_ref": {"type": ["string", "null"]},
+    "task_refs": {"$ref": "#/$defs/string_list"},
+    "session_type": {"const": "coding"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "work": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositories", "commits", "pull_requests", "issues", "artifacts"],
+      "properties": {
+        "repositories": {"$ref": "#/$defs/string_list"},
+        "commits": {"$ref": "#/$defs/string_list"},
+        "pull_requests": {"$ref": "#/$defs/string_list"},
+        "issues": {"$ref": "#/$defs/string_list"},
+        "artifacts": {"$ref": "#/$defs/string_list"}
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status"],
+      "properties": {"status": {"enum": ["completed", "failed", "cancelled"]}}
+    },
+    "attribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "attester_ref", "confidence"],
+      "properties": {
+        "source": {"const": "declared"},
+        "attester_ref": {"type": "string", "minLength": 1},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "trace": {"type": "object"},
+    "extensions": {"type": "object"}
+  },
+  "$defs": {
+    "execution_entry": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["orchestrator", "executor", "model"]},
+        "system": {"type": "string", "minLength": 1},
+        "session_ref": {"type": "string", "minLength": 1},
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "model"}}},
+          "then": {"required": ["provider", "model"]},
+          "else": {"required": ["system"]}
+        }
+      ]
+    },
+    "string_list": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    }
+  }
+}

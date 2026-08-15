@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "devdiary"
+version = "0.1.0"
+description = "Portable DevDiary attribution launcher and conformance tooling"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "TechWright" }]
+dependencies = []
+
+[project.scripts]
+devdiary = "devdiary.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/devdiary"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/devdiary", "tests", "bin/test", "README.md", "pyproject.toml"]
+
+[tool.pyright]
+include = ["src", "tests"]
+extraPaths = ["src"]
+pythonVersion = "3.11"
