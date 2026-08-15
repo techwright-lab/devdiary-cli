@@ -35,7 +35,7 @@ def post_envelope(
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "devdiary-attribution/0.1",
+                "User-Agent": "devdiary/0.1",
             },
             method="POST",
         )

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from devdiary_attribution import git_refs
+from devdiary import git_refs
 
 
 @unittest.skipIf(git_refs.GIT_EXECUTABLE is None, "git is not installed")

@@ -4,8 +4,8 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from devdiary_attribution import contract
-from devdiary_attribution.config import default_registry
+from devdiary import contract
+from devdiary.config import default_registry
 
 
 class ContractTest(unittest.TestCase):

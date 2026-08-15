@@ -7,8 +7,8 @@ import sys
 from importlib import resources
 from pathlib import Path
 
-from devdiary_attribution import __version__, doctor, runner, spool
-from devdiary_attribution.config import (
+from devdiary import __version__, doctor, runner, spool
+from devdiary.config import (
     ConfigError,
     add_actor,
     add_adapter,
@@ -24,7 +24,7 @@ from devdiary_attribution.config import (
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="devdiary-attribution")
+    root = argparse.ArgumentParser(prog="devdiary")
     root.add_argument("--version", action="version", version=__version__)
     root.add_argument("--config", type=Path, default=default_config_path())
     commands = root.add_subparsers(dest="command", required=True)
@@ -118,7 +118,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "emit":
             return _emit(args, registry)
     except (ConfigError, spool.SpoolError) as error:
-        print(f"devdiary-attribution: {error}", file=sys.stderr)
+        print(f"devdiary: {error}", file=sys.stderr)
         return 2
     return 2
 
@@ -220,12 +220,12 @@ def _emit(args: argparse.Namespace, registry: dict) -> int:
     delivered, errors = spool.flush(args.config.parent / "attribution-events", url, key)
     print(f"delivered {delivered} queued declaration(s)")
     for error in errors:
-        print(f"devdiary-attribution: warning: {error}", file=sys.stderr)
+        print(f"devdiary: warning: {error}", file=sys.stderr)
     return 1 if errors else 0
 
 
 def _schema(name: str) -> int:
-    package = resources.files("devdiary_attribution.schemas")
+    package = resources.files("devdiary.schemas")
     schema = json.loads(
         package.joinpath(f"{name}.schema.json").read_text(encoding="utf-8")
     )

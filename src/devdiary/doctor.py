@@ -10,7 +10,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from devdiary_attribution.config import endpoint, find_actor, key_environment
+from devdiary.config import endpoint, find_actor, key_environment
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,7 @@ def report(checks: list[Check], json_output: bool = False) -> int:
 
 def _schema_check() -> Check:
     try:
-        schema_package = resources.files("devdiary_attribution.schemas")
+        schema_package = resources.files("devdiary.schemas")
         names = ("registry.schema.json", "context.schema.json", "envelope.schema.json")
         for name in names:
             json.loads(schema_package.joinpath(name).read_text(encoding="utf-8"))
@@ -74,9 +74,7 @@ def _git_check() -> Check:
 
 
 def _context_permissions_check() -> Check:
-    with tempfile.TemporaryDirectory(
-        prefix="devdiary-attribution-doctor-"
-    ) as directory:
+    with tempfile.TemporaryDirectory(prefix="devdiary-doctor-") as directory:
         path = Path(directory) / "context.json"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(descriptor)

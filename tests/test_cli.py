@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from devdiary_attribution.cli import main
-from devdiary_attribution.config import load_registry
+from devdiary.cli import main
+from devdiary.config import load_registry
 
 
 class CliTest(unittest.TestCase):

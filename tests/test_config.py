@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from devdiary_attribution.config import (
+from devdiary.config import (
     ConfigError,
     add_actor,
     default_config_path,
@@ -138,8 +138,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_registry_schema_matches_adapter_mapping_constraints(self) -> None:
         schema_path = (
-            Path(__file__).parents[1]
-            / "src/devdiary_attribution/schemas/registry.schema.json"
+            Path(__file__).parents[1] / "src/devdiary/schemas/registry.schema.json"
         )
         mapping = json.loads(schema_path.read_text(encoding="utf-8"))["$defs"][
             "adapter"
@@ -215,7 +214,7 @@ class ConfigTest(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "devdiary_attribution.config.os.replace",
+                    "devdiary.config.os.replace",
                     side_effect=OSError("simulated atomic replacement failure"),
                 ),
                 self.assertRaisesRegex(ConfigError, "could not be written"),

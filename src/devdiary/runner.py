@@ -11,16 +11,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from devdiary_attribution import contract, git_refs, spool
-from devdiary_attribution.config import (
+from devdiary import contract, git_refs, spool
+from devdiary.config import (
     ConfigError,
     endpoint,
     enforcement,
     key_environment,
 )
-from devdiary_attribution.process_tree import ProcessTree
-from devdiary_attribution.secure_environment import scrub_inherited_variable
-from devdiary_attribution.transport import TransportError, post_envelope
+from devdiary.process_tree import ProcessTree
+from devdiary.secure_environment import scrub_inherited_variable
+from devdiary.transport import TransportError, post_envelope
 
 CONTEXT_ENV = "DEVDIARY_ATTRIBUTION_CONTEXT"
 ACTOR_ENV = "DEVDIARY_ACTOR_REF"
@@ -79,7 +79,7 @@ def run_command(
     )
 
     before = git_refs.capture(cwd)
-    with tempfile.TemporaryDirectory(prefix="devdiary-attribution-") as directory:
+    with tempfile.TemporaryDirectory(prefix="devdiary-") as directory:
         context_path = Path(directory) / "context.json"
         _write_context(context_path, run_context)
         child_environment = _child_environment(
@@ -113,12 +113,12 @@ def run_command(
                 ingest_key,
             )
             print(
-                f"devdiary-attribution: queued declaration at {pending_path}",
+                f"devdiary: queued declaration at {pending_path}",
                 file=sys.stderr,
             )
         except (OSError, spool.SpoolError, KeyError, TypeError) as error:
             print(
-                f"devdiary-attribution: warning: could not queue declaration: {error}",
+                f"devdiary: warning: could not queue declaration: {error}",
                 file=sys.stderr,
             )
     if emission_failed and enforcement(registry) == "enforce" and exit_code == 0:
@@ -210,7 +210,7 @@ def _spawn(
             )
         except OSError as error:
             print(
-                f"devdiary-attribution: could not start command: {error}",
+                f"devdiary: could not start command: {error}",
                 file=sys.stderr,
             )
             return 127, False
@@ -226,7 +226,7 @@ def _spawn(
             tree_ready = False
             _stop_unisolated_process(process, process_tree)
             print(
-                f"devdiary-attribution: could not isolate command process tree: {error}",
+                f"devdiary: could not isolate command process tree: {error}",
                 file=sys.stderr,
             )
             return 127, False
@@ -305,7 +305,7 @@ def _emit(
             else "declaration cannot be authenticated or queued"
         )
         print(
-            f"devdiary-attribution: warning: {missing} is not configured; {disposition}",
+            f"devdiary: warning: {missing} is not configured; {disposition}",
             file=sys.stderr,
         )
         return False, True
@@ -314,7 +314,7 @@ def _emit(
         post_envelope(url, key, envelope)
         return True, False
     except TransportError as error:
-        print(f"devdiary-attribution: warning: {error}", file=sys.stderr)
+        print(f"devdiary: warning: {error}", file=sys.stderr)
         return False, True
 
 

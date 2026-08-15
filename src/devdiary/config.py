@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from devdiary_attribution.secure_paths import UnsafePathError, reject_symlink_components
+from devdiary.secure_paths import UnsafePathError, reject_symlink_components
 
 DEFAULT_KEY_ENV = "DEVDIARY_INGEST_KEY"
 ALLOWED_KINDS = {"agent", "automation"}

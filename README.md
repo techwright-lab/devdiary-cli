@@ -1,4 +1,4 @@
-# DevDiary Attribution CLI
+# devdiary
 
 A runtime-dependency-free Python launcher for the DevDiary Agent Attribution Contract.
 It keeps stable actor identity separate from runtime/model metadata, removes the
@@ -10,41 +10,41 @@ This package is an early portable artifact. It intentionally starts in `warn`
 mode and does not install hooks or enforce attribution for ordinary human Git
 commands.
 
-## Install from a checkout
+## Install
 
 Python 3.11 or newer is required.
 
 ```text
-uv tool install ./packages/devdiary-attribution
-# or: pipx install ./packages/devdiary-attribution
-uv build packages/devdiary-attribution  # build sdist and wheel artifacts
+uv tool install .
+# or: pipx install .
+uv build .  # build sdist and wheel artifacts
 ```
 
 ## First run
 
 ```text
-devdiary-attribution init \
+devdiary init \
   --namespace urn:acme \
   --principal-ref urn:acme:human:owner \
   --endpoint https://app.example.test/ingest/v1/sessions
 
-devdiary-attribution actor add \
+devdiary actor add \
   --ref urn:acme:actor:reviewer \
   --display-name "Code Reviewer" \
   --attester-ref urn:acme:attester:local-launcher \
   --lane review \
   --identity paperclip_agent_id=agent-123
 
-devdiary-attribution adapter add \
+devdiary adapter add \
   --name my-runtime \
   --runtime custom-cli \
   --session-ref-env DEVDIARY_RUNTIME_SESSION_REF_MY_RUNTIME \
   --provider-env DEVDIARY_RUNTIME_PROVIDER_MY_RUNTIME \
   --model-env DEVDIARY_RUNTIME_MODEL_MY_RUNTIME
 
-devdiary-attribution doctor --actor urn:acme:actor:reviewer
+devdiary doctor --actor urn:acme:actor:reviewer
 
-devdiary-attribution run --actor urn:acme:actor:reviewer -- your-command
+devdiary run --actor urn:acme:actor:reviewer -- your-command
 ```
 
 Known outputs may be declared explicitly before the command, for example with
@@ -66,7 +66,7 @@ No entry is queued when a key is absent. Retry without minting a new event
 identity:
 
 ```text
-devdiary-attribution emit pending
+devdiary emit pending
 ```
 
 Set the configured key environment variable (default:

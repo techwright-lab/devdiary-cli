@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from devdiary_attribution.process_tree import ProcessTree
+from devdiary.process_tree import ProcessTree
 
 
 class ProcessTreeTest(unittest.TestCase):
@@ -17,9 +17,7 @@ class ProcessTreeTest(unittest.TestCase):
             windows_suspended=True,
         )
 
-        with mock.patch(
-            "devdiary_attribution.process_tree._resume_windows_process"
-        ) as resume:
+        with mock.patch("devdiary.process_tree._resume_windows_process") as resume:
             tree.resume()
 
         resume.assert_called_once_with(process)

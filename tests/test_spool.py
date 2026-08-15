@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
 
-from devdiary_attribution import spool
+from devdiary import spool
 
 
 class ReplayHandler(BaseHTTPRequestHandler):

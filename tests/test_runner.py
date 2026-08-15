@@ -16,8 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from devdiary_attribution import runner
-from devdiary_attribution.config import ConfigError, default_registry
+from devdiary import runner
+from devdiary.config import ConfigError, default_registry
 
 DUMMY_KEY = "test-only-not-a-live-key"
 
@@ -306,8 +306,8 @@ class RunnerTest(unittest.TestCase):
                 f"{DUMMY_KEY.encode()!r} in pathlib.Path(f'/proc/{{os.getppid()}}/environ').read_bytes()))"
             )
             launcher = (
-                "from pathlib import Path; from devdiary_attribution import runner;"
-                "from devdiary_attribution.config import default_registry;"
+                "from pathlib import Path; from devdiary import runner;"
+                "from devdiary.config import default_registry;"
                 "registry=default_registry('urn:acme','urn:acme:human:owner',None);"
                 "registry['defaults']['enforcement']='off';"
                 "actor={'actor_ref':'urn:acme:actor:reviewer','kind':'agent',"
@@ -433,7 +433,7 @@ class RunnerTest(unittest.TestCase):
             marker = Path(directory) / "started"
             with (
                 mock.patch(
-                    "devdiary_attribution.runner.scrub_inherited_variable",
+                    "devdiary.runner.scrub_inherited_variable",
                     side_effect=ValueError("simulated native scrub failure"),
                 ),
                 self.assertRaisesRegex(ConfigError, "could not scrub"),
@@ -467,13 +467,13 @@ class RunnerTest(unittest.TestCase):
             events.append("handler")
 
         with (
-            mock.patch("devdiary_attribution.runner.subprocess.Popen", start_process),
+            mock.patch("devdiary.runner.subprocess.Popen", start_process),
             mock.patch(
-                "devdiary_attribution.runner.ProcessTree.attach",
+                "devdiary.runner.ProcessTree.attach",
                 return_value=process_tree,
             ),
             mock.patch(
-                "devdiary_attribution.runner.signal.signal",
+                "devdiary.runner.signal.signal",
                 side_effect=install_handler,
             ),
         ):
@@ -501,10 +501,8 @@ class RunnerTest(unittest.TestCase):
 
         with (
             mock.patch.object(runner.os, "name", "nt"),
-            mock.patch("devdiary_attribution.runner.subprocess.Popen", start_process),
-            mock.patch(
-                "devdiary_attribution.runner.ProcessTree.attach", side_effect=attach
-            ),
+            mock.patch("devdiary.runner.subprocess.Popen", start_process),
+            mock.patch("devdiary.runner.ProcessTree.attach", side_effect=attach),
         ):
             result = runner._spawn(["runtime"], cwd, {})
 
@@ -532,15 +530,13 @@ class RunnerTest(unittest.TestCase):
 
         process_tree.resume.side_effect = resume
         with (
+            mock.patch("devdiary.runner.subprocess.Popen", return_value=process),
             mock.patch(
-                "devdiary_attribution.runner.subprocess.Popen", return_value=process
-            ),
-            mock.patch(
-                "devdiary_attribution.runner.ProcessTree.attach",
+                "devdiary.runner.ProcessTree.attach",
                 return_value=process_tree,
             ),
             mock.patch(
-                "devdiary_attribution.runner.signal.signal",
+                "devdiary.runner.signal.signal",
                 side_effect=install_handler,
             ),
         ):

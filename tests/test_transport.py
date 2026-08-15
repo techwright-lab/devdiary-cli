@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 from unittest import mock
 
-from devdiary_attribution.transport import TransportError, post_envelope
+from devdiary.transport import TransportError, post_envelope
 
 DUMMY_KEY = "test-only-not-a-live-key"
 
@@ -83,10 +83,10 @@ class TransportTest(unittest.TestCase):
         disconnect = http.client.RemoteDisconnected("peer closed connection")
         with (
             mock.patch(
-                "devdiary_attribution.transport.OPENER.open",
+                "devdiary.transport.OPENER.open",
                 side_effect=disconnect,
             ) as open_request,
-            mock.patch("devdiary_attribution.transport.time.sleep"),
+            mock.patch("devdiary.transport.time.sleep"),
             self.assertRaisesRegex(TransportError, "could not be reached") as raised,
         ):
             post_envelope(

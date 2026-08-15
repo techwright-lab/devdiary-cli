@@ -8,8 +8,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from devdiary_attribution.secure_paths import UnsafePathError, reject_symlink_components
-from devdiary_attribution.transport import TransportError, post_envelope
+from devdiary.secure_paths import UnsafePathError, reject_symlink_components
+from devdiary.transport import TransportError, post_envelope
 
 
 class SpoolError(RuntimeError):
@@ -19,7 +19,7 @@ class SpoolError(RuntimeError):
 MAX_ENVELOPE_BYTES = 1_048_576
 QUEUE_VERSION = 1
 INTEGRITY_ALGORITHM = "hmac-sha256"
-SIGNATURE_DOMAIN = b"devdiary-attribution-spool-v1\0"
+SIGNATURE_DOMAIN = b"devdiary-spool-v1\0"
 
 
 def enqueue(directory: Path, envelope: dict[str, Any], key: str) -> Path:
