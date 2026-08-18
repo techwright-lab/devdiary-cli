@@ -99,7 +99,12 @@ def run_command(
             event_type,
             contract.timestamp(),
             _merge_work_references(
-                git_refs.work_references(before, after), explicit_work
+                git_refs.work_references(
+                    before,
+                    after,
+                    author_email=(actor.get("identities") or {}).get("git_email"),
+                ),
+                explicit_work,
             ),
         )
         emitted, emission_failed = _emit(registry, ingest_key, envelope)
