@@ -129,7 +129,13 @@ normal interactive `/hooks` approval, and inspect observations after normal exit
 No launcher or vendor/orchestrator patch is required.
 
 Use absolute paths. `--executable` is a trusted **Python interpreter**, not the
-vendor binary. In an installed package, use its stable Python environment. From
+vendor binary. The interpreter, hook script and their resolved ancestors must
+be owned by the current user or root and not group/world-writable (sticky temporary
+ancestors are allowed). Shared writable toolcache interpreters are rejected, not
+implicitly trusted. Use a private copied virtualenv (`python -m venv --copies ...`)
+or a suitably protected installation. This path check is not a Python dependency
+sandbox: the interpreter's standard library and base installation must also be trusted.
+In an installed package, use its stable Python environment. From
 this source checkout, prefix commands with `PYTHONPATH=src python3 -m devdiary` in
 place of `devdiary`. Only `apply --consent` and `remove --consent` change settings.
 Planning writes nothing; redirect its JSON output to a private plan file yourself.
@@ -266,8 +272,12 @@ If an ingest key is present but the endpoint is unavailable in `warn` or
 file beside the registry (`0600` on POSIX; inherited user ACLs on Windows). Each
 queue entry is authenticated with HMAC-SHA-256;
 modified, injected, or key-rotation-stale entries are retained but never sent.
-No entry is queued when a key is absent. Retry without minting a new event
-identity:
+No legacy HMAC entry is queued when a key is absent. The durable capture still
+retains its frozen terminal envelope, including when delivery is disabled; it is
+not HMAC-authenticated and relies on the private state directory/OS access controls.
+Retry durable records with JSON stdin to `capture retry --state-dir STATE --json`
+using the original `capture_id` and the configured credential. To retry legacy
+HMAC entries without minting a new event identity:
 
 ```text
 devdiary emit pending
@@ -277,7 +287,7 @@ Set the configured key environment variable (default:
 `DEVDIARY_INGEST_KEY`) only in the launcher environment. The launcher consumes
 it, scrubs the inherited native environment block on Linux, and removes it
 before starting `your-command`. Runtime contexts retain only a generic command
-classification and argument count, never raw command arguments. Never place a
+classification (legacy contexts also include an argument count), never raw command arguments. Never place a
 key in the Cast Registry, command arguments, runtime metadata, work-reference
 URLs, or exported aliases.
 

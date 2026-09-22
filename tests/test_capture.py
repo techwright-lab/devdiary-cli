@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -22,7 +23,7 @@ class CaptureFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.state_path = self.root / "state/captures.sqlite3"
         self.payloads = []
         self.ack = "valid"
@@ -35,7 +36,7 @@ class CaptureFixture(unittest.TestCase):
                 )
                 owner.payloads.append(payload)
                 # Terminal evidence must already be committed before HTTP.
-                with sqlite3.connect(owner.state_path) as db:
+                with closing(sqlite3.connect(owner.state_path)) as db:
                     owner.assertIn(
                         db.execute(
                             "select state from captures where run_ref=?",

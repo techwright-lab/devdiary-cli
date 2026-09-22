@@ -35,13 +35,18 @@ PUBLIC_FIELDS = (
 # nested JSON. Extract only two actor identity fields, never the actor object.
 # Use one member walk and a two-path extraction rather than repeating
 # full-record extraction for every public field of a potentially 64 MiB record.
-_PUBLIC_KEYS_SQL = ",".join(f"'{key}'" for key in PUBLIC_FIELDS)
-_STATUS_PROJECTION = (
-    "json_object('public',(SELECT json_group_object(key,value) "
-    f"FROM json_each(captures.record) WHERE key IN ({_PUBLIC_KEYS_SQL})),"
-    "'git_identity',json_extract(record,"
-    "'$.actor.identities.git_name','$.actor.identities.git_email'))"
-)
+_STATUS_SELECT = """
+SELECT seq, json_object(
+    'public', (SELECT json_group_object(key,
+        CASE WHEN type IN ('object', 'array') THEN json(value)
+             WHEN type IN ('true', 'false') THEN json(type)
+             ELSE value END)
+        FROM json_each(captures.record)
+        WHERE key IN (SELECT value FROM json_each(?))),
+    'git_identity', json_extract(record,
+        '$.actor.identities.git_name', '$.actor.identities.git_email')
+) AS projection FROM captures WHERE
+"""
 
 
 def dumps_record(record: dict) -> str:
@@ -159,11 +164,8 @@ class Store:
             # and use SQLite's default binary (exact, case-sensitive) equality.
             clauses.append(f"json_extract(record,'$.source.{key}')=?")
             values.append(value)
-        sql = (
-            f"SELECT seq,{_STATUS_PROJECTION} AS projection FROM captures WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY seq LIMIT ?"
-        )
+        # Clauses contain only SOURCE_FIELDS paths; every data value is bound.
+        sql = _STATUS_SELECT + " AND ".join(clauses) + " ORDER BY seq LIMIT ?"
         # Seek each state separately: IN (...) followed by ORDER BY seq can
         # sort an entire state's history before LIMIT. One UNION statement
         # merges at most 3 bounded pages in a consistent SQLite read snapshot.
@@ -172,8 +174,9 @@ class Store:
         queries = []
         parameters = []
         for state in states:
-            queries.append(f"SELECT seq,projection FROM ({sql})")
-            parameters.extend((state, after, *values, limit))
+            # The nested query is built exclusively from fixed/allowlisted SQL.
+            queries.append(f"SELECT seq,projection FROM ({sql})")  # nosec B608
+            parameters.extend((json.dumps(PUBLIC_FIELDS), state, after, *values, limit))
         parameters.append(limit)
         return self.db.execute(
             " UNION ALL ".join(queries) + " ORDER BY seq LIMIT ?", parameters

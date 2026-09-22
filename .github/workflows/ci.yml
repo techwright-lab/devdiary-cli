@@ -48,7 +48,12 @@ jobs:
           python-version: "3.11"
       - name: Test source tree (Linux)
         if: runner.os == 'Linux'
-        run: bin/test
+        run: |
+          # setup-python's shared toolcache may be group-writable. The observer
+          # must reject that interpreter; test with a private copy, not a bypass.
+          python -m venv --copies "$HOME/.devdiary-test-venv"
+          export PATH="$HOME/.devdiary-test-venv/bin:$PATH"
+          bin/test
       - name: Test source tree (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

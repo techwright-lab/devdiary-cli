@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import unittest
+from contextlib import closing
 from unittest import mock
 
 from test_capture import KEY, ROOT, CaptureFixture
@@ -130,7 +131,7 @@ class CaptureSafetyTest(CaptureFixture):
             self.assertNotIn(KEY.encode(), output + error)
             self.assertEqual(143, process.returncode)
             self.assertEqual("run.cancelled", self.payloads[-1]["event_type"])
-            with sqlite3.connect(self.state_path) as db:
+            with closing(sqlite3.connect(self.state_path)) as db:
                 self.assertEqual(
                     "delivered", db.execute("select state from captures").fetchone()[0]
                 )

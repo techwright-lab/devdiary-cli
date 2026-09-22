@@ -146,6 +146,27 @@ class CaptureStatusTest(unittest.TestCase):
             [], capture.status(self.store, {"after": "999999999999999999"})["captures"]
         )
 
+    def test_projection_preserves_json_types_and_binds_hostile_source_values(self):
+        source = {"agent_id": "x') OR 1=1 --", "company_id": "quote'_%"}
+        self.insert("other", source={"agent_id": "other"})
+        self.insert("wanted", source=source)
+        for value in (
+            {"nested": [True, False, None]},
+            [1, {"a": 2}],
+            "{}",
+            True,
+            False,
+            42,
+            None,
+        ):
+            with self.subTest(value=value):
+                record = self.store.get("wanted")
+                record["receipt"] = value
+                self.store.save(record)
+                page = capture.status(self.store, {"source": source})
+                self.assertEqual([capture.public(record)], page["captures"])
+                self.assertIs(type(value), type(page["captures"][0]["receipt"]))
+
     def test_projection_preserves_public_shape_and_snapshot_identity(self):
         for index, identities in enumerate(
             (
