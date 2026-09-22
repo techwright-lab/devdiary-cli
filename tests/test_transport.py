@@ -4,6 +4,7 @@ import http.client
 import json
 import threading
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 from unittest import mock
@@ -38,6 +39,27 @@ class RedirectSource(BaseHTTPRequestHandler):
 
 
 class TransportTest(unittest.TestCase):
+    def test_http_error_response_is_closed_before_raising(self) -> None:
+        response = mock.Mock()
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1/ingest", 503, "unavailable", mock.Mock(), response
+        )
+        with (
+            mock.patch("devdiary.transport.OPENER.open", side_effect=error),
+            self.assertRaises(TransportError),
+        ):
+            post_envelope("http://127.0.0.1/ingest", DUMMY_KEY, {}, attempts=1)
+        response.close.assert_called_once()
+
+    def test_excessive_response_nesting_is_safe_transport_failure(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"[" * 10000 + b"]" * 10000
+        with (
+            mock.patch("devdiary.transport.OPENER.open", return_value=response),
+            self.assertRaises(TransportError),
+        ):
+            post_envelope("http://127.0.0.1/ingest", DUMMY_KEY, {}, attempts=1)
+
     def setUp(self) -> None:
         RedirectTarget.requests = 0
         self.target = ThreadingHTTPServer(("127.0.0.1", 0), RedirectTarget)
@@ -78,6 +100,20 @@ class TransportTest(unittest.TestCase):
             )
 
         self.assertNotIn(DUMMY_KEY, str(raised.exception))
+
+    def test_http_success_without_bound_receipt_is_not_delivery(self) -> None:
+        envelope = {
+            "event_id": "urn:devdiary:event:test",
+            "actor": {"ref": "actor:one"},
+            "run_ref": "run:one",
+        }
+        with self.assertRaisesRegex(TransportError, "receipt mismatch"):
+            post_envelope(
+                f"http://127.0.0.1:{self.target.server_port}/ingest",
+                DUMMY_KEY,
+                envelope,
+                attempts=1,
+            )
 
     def test_response_phase_disconnect_is_retried_then_wrapped_safely(self) -> None:
         disconnect = http.client.RemoteDisconnected("peer closed connection")

@@ -18,7 +18,15 @@ class ReplayHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers["Content-Length"])
         self.__class__.payloads.append(json.loads(self.rfile.read(length)))
-        body = b'{"status":"created"}'
+        payload = self.__class__.payloads[-1]
+        body = json.dumps(
+            {
+                "actor_ref": payload["actor"]["ref"],
+                "event_id": payload["event_id"],
+                "run_ref": payload["run_ref"],
+                "session_id": 1,
+            }
+        ).encode()
         self.send_response(201)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -51,6 +59,7 @@ class SpoolTest(unittest.TestCase):
             envelope = {
                 "event_id": "urn:devdiary:event:fixed-id",
                 "event_type": "run.completed",
+                "run_ref": "urn:devdiary:run:fixed-id",
                 "actor": {"ref": "urn:acme:actor:reviewer"},
             }
             path = spool.enqueue(queue, envelope, self.KEY)

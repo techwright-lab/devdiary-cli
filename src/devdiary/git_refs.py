@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -28,6 +28,9 @@ class GitSnapshot:
     head: str | None
     reflog_entries: frozenset[tuple[str, str]]
     worktree_reflogs: dict[str, frozenset[tuple[str, str]]]
+    timed_worktree_reflogs: dict[str, frozenset[tuple[str, str, int]]] = field(
+        default_factory=dict
+    )
 
 
 def capture(cwd: Path) -> GitSnapshot:
@@ -43,15 +46,21 @@ def capture(cwd: Path) -> GitSnapshot:
     root = Path(root_value)
     head = _git(root, "rev-parse", "HEAD")
     remote = _git(root, "remote", "get-url", "origin")
+    timed = {
+        str(path): frozenset(_timed_reflog_entries(path))
+        for path in _worktree_paths(root)
+    }
     worktree_reflogs = {
-        str(path): frozenset(_reflog_entries(path)) for path in _worktree_paths(root)
+        path: frozenset((sha, action) for sha, action, _ in entries)
+        for path, entries in timed.items()
     }
     return GitSnapshot(
         root=root,
         repository=_repository_name(remote),
         head=head,
-        reflog_entries=frozenset(_reflog_entries(root)),
+        reflog_entries=worktree_reflogs[str(root)],
         worktree_reflogs=worktree_reflogs,
+        timed_worktree_reflogs=timed,
     )
 
 
@@ -136,6 +145,29 @@ def _reflog_entries(root: Path) -> list[tuple[str, str]]:
         sha, separator, action = line.partition("\t")
         if separator and SHA_PATTERN.fullmatch(sha):
             entries.append((sha, action))
+    return entries
+
+
+def _timed_reflog_entries(root: Path) -> list[tuple[str, str, int]]:
+    # %gD with --date=raw is the reflog event timestamp, NOT the commit's
+    # author/committer timestamp (%at/%ct). Messages remain memory-only.
+    output = _git(
+        root,
+        "reflog",
+        "show",
+        "HEAD",
+        f"--max-count={REFLOG_LIMIT}",
+        "--date=raw",
+        "--format=%H%x09%gD%x09%gs",
+    )
+    entries: list[tuple[str, str, int]] = []
+    for line in (output or "").splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or not SHA_PATTERN.fullmatch(parts[0]):
+            continue
+        stamp = re.fullmatch(r"HEAD@\{(-?\d+) [+-]\d{4}\}", parts[1])
+        if stamp:
+            entries.append((parts[0], parts[2], int(stamp[1])))
     return entries
 
 
