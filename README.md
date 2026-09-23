@@ -19,6 +19,80 @@ register local metadata hooks without wrapping ordinary tool commands. Optional
 explicit upload is configured separately; hooks never perform HTTP. It does not
 change Git identity, declare named work, or affect human minute derivation.
 
+## Experimental Rust collector (separate executable; Linux evidence only)
+
+`collector-rs` is an opt-in **normalized-metadata** vertical slice, not a raw
+Claude/Codex hook adapter or a replacement for Python. It reads the local observation
+shape in `collector-rs/tests/fixtures/local-observation.json`: caller-owned UUIDs,
+exact repository/installation scope, numeric epoch `observed_at`, vendor IDs and
+`attribution_basis: unknown`. It rejects named actor claims; no identity inference.
+Null optional fields are omitted like Python's upload projection. Timestamp conversion
+uses decimal half-even rounding to UTC microseconds (years 1000–9999; earlier
+year padding differs across Python platforms and is refused). Unlisted/private fields are
+discarded before storage; IDs are validated, never repaired. Caller-assigned observation
+UUIDs provide replay identity; vendor hook dedup/UUID creation remains out of scope.
+
+```sh
+cargo build --locked --manifest-path collector-rs/Cargo.toml
+COLLECTOR="$PWD/collector-rs/target/debug/devdiary-collector"
+# Use a NEW empty absolute directory, never Python's observer/capture spool.
+umask 077
+mkdir "$RUST_STATE"
+# Review scope.json: exactly endpoint, collector_ref, repository (local root),
+# repository_ref (canonical GitHub URL), installation_id (UUID). Fixture examples
+# are synthetic; no credential goes in this JSON.
+"$COLLECTOR" init "$RUST_STATE" --consent < scope.json
+"$COLLECTOR" collect "$RUST_STATE" < normalized-local-metadata.json
+"$COLLECTOR" status "$RUST_STATE"
+"$COLLECTOR" sync "$RUST_STATE" "$PRIVATE_COLLECTOR_KEY_FILE" 100
+```
+
+The Rust-only SQLite filename, application ID and schema version refuse Python,
+foreign or incompatible state; there is **no migration/shared-writer mode**. Scope
+is immutable from initialization, including after delivery. Keys stay in separate
+0600 regular files and are read only by explicit sync; rotating the key file does
+not retarget evidence. Owner-only state, no symlink ancestors or hardlinks, FULL
+SQLite commits, 250 ms lock waits, 10,000 retained rows and a 16 MiB database ceiling
+bound storage. Capacity/lock failures leave existing evidence unchanged; callers
+must retry failed collection with the same UUID. Retained receipts count toward
+capacity; no pruning yet. Same-UID processes are trusted, not sandboxed.
+
+Input is capped at 64 KiB with a 700 ms stdin deadline (not a whole-hook SLA).
+Frozen ASCII allowlisted wire bytes are capped at 16 KiB. Explicit sync attempts
+1–100 rows, commits its rotating cursor before HTTP, retains exact bytes after
+crash/response loss, and acknowledges only the exact Rails receipt. 401/403/429,
+5xx and network failures stop the batch; row failures do not starve later rows.
+No redirects or ambient proxies; verified TLS except exact loopback HTTP; each
+request has a five-second timeout including the response body. Exit 0 means the
+command succeeded, sync exit 1 means pending evidence remains, and exit 2 is a
+private/generic local error. This control executable is **not host-failure-neutral**;
+do not register it as a vendor hook. No daemon, live configuration, surveillance,
+stock-tool qualification, native Windows support, signing/update/installer or
+Python retirement is included. Rails and human-minute attribution are unchanged.
+
+Reproduce Linux checks (Rust 1.98.1, Python >=3.11):
+
+```sh
+cargo fmt --manifest-path collector-rs/Cargo.toml --check
+cargo test --locked --manifest-path collector-rs/Cargo.toml
+cargo clippy --locked --manifest-path collector-rs/Cargo.toml --all-targets -- -D warnings
+PYTHONPATH=src python3 collector-rs/tests/conformance.py -v
+cargo audit --file collector-rs/Cargo.lock
+bin/test
+```
+
+For opt-in real Rails/Puma/PostgreSQL interoperability, use a disposable Rails
+checkout at the revision in `collector-rs/tests/fixtures/provenance.json`. Set
+`RAILS_ENV=test CI=true` and a **new local** `DATABASE_URL` whose database starts
+`devdiary_rust_collector_interop_`; use only test DB credentials. From that Rails
+checkout, run `bin/rails db:create db:schema:load`, then
+`bundle exec ruby "$CLI_CHECKOUT/collector-rs/tests/rails_interop.rb"`.
+The harness refuses a nonempty workspace/observation database, provisions only a
+disposable collector credential, tests actual response-loss replay and revocation,
+and leaves the isolated database for inspection. Drop only that test DB afterward.
+The regular Rust CI job runs the subprocess/HTTP conformance suite; it does not
+claim to run this cross-repository Rails gate.
+
 ## Explicit observer upload
 
 After installing a consented repository-scoped observer, optionally configure a

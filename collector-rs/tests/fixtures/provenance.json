@@ -1,0 +1,17 @@
+{
+  "contract_version": "normalized-unknown-observation-v1",
+  "python_repository": "techwright-lab/devdiary-cli",
+  "python_revision": "ecdbca7ead10ad85f792a9f9d3fb4c70a81b01ba",
+  "python_sources": ["src/devdiary/observer_hook.py", "src/devdiary/observer_upload.py"],
+  "rails_repository": "techwright-lab/DevDiary",
+  "rails_revision": "1c91881d51d899afa0171f6d6d70f5d275e7d2ee",
+  "rails_sources": ["app/services/ingest/observation_envelope.rb", "app/services/ingest/create_observation_service.rb", "app/controllers/ingest/v1/observations_controller.rb"],
+  "wire_fixture_producer": "observer_upload.envelope({k:v for k,v in local.items() if k in observer_upload.FIELDS and v is not None}, scope)",
+  "state_version": 1,
+  "state_application_id": 1145328177,
+  "state_database": "collector-rust-v1.sqlite3",
+  "state_compatibility": "rust-only; refuse Python spools; no migration",
+  "actor_policy": "unknown-only; reject non-null actor_ref; omit nulls as Python upload projection does",
+  "input_boundary": "normalized local metadata, not vendor hook input",
+  "receipt_keys": ["collector_ref", "installation_id", "observation_id", "record_id"]
+}
