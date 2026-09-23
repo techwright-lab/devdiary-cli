@@ -90,6 +90,80 @@ def parser() -> argparse.ArgumentParser:
         "pending", help="deliver all queued declarations idempotently"
     )
 
+    capture = commands.add_parser(
+        "capture", help="durable portable attribution lifecycle"
+    )
+    operations = capture.add_subparsers(dest="capture_operation", required=True)
+    for operation in ("begin", "finish", "status", "retry"):
+        command = operations.add_parser(operation)
+        command.add_argument("--state-dir", type=Path, required=True)
+        command.add_argument("--json", action="store_true")
+
+    observer = commands.add_parser(
+        "observer", help="local-only stock Claude/Codex metadata observer (POSIX pilot)"
+    )
+    observer_ops = observer.add_subparsers(dest="observer_operation", required=True)
+    preview = observer_ops.add_parser(
+        "plan", help="preview narrow hook registration; writes nothing"
+    )
+    preview.add_argument("--vendor", choices=("claude", "codex"), default="claude")
+    discovery = observer_ops.add_parser(
+        "discover",
+        help="probe installed versions/help in isolation; never enable hooks",
+    )
+    discovery.add_argument("--vendor", choices=("claude", "codex"))
+    preview.add_argument("--settings", type=Path, required=True)
+    preview.add_argument("--state-dir", type=Path, required=True)
+    preview.add_argument("--repository", type=Path, required=True)
+    preview.add_argument(
+        "--executable",
+        type=Path,
+        required=True,
+        help="trusted absolute Python interpreter",
+    )
+    preview.add_argument("--binding-session")
+    preview.add_argument("--binding-agent-id")
+    preview.add_argument(
+        "--actor-ref",
+        help="exact known registry ref; never inferred from runtime/model",
+    )
+    install = observer_ops.add_parser("apply")
+    install.add_argument("--plan", type=Path, required=True)
+    install.add_argument("--consent", action="store_true")
+    install.add_argument(
+        "--vendor",
+        choices=("claude", "codex"),
+        help="optional assertion against saved plan",
+    )
+    for operation in ("remove", "health", "observations"):
+        op = observer_ops.add_parser(operation)
+        op.add_argument("--state-dir", type=Path, required=True)
+        if operation == "remove":
+            op.add_argument("--consent", action="store_true")
+            op.add_argument(
+                "--vendor",
+                choices=("claude", "codex"),
+                help="optional assertion against installation",
+            )
+        if operation == "observations":
+            op.add_argument("--limit", type=int, default=100)
+
+    connect = observer_ops.add_parser(
+        "connect",
+        help="consent to explicit metadata upload; never changes vendor hooks",
+    )
+    connect.add_argument("--state-dir", type=Path, required=True)
+    connect.add_argument("--endpoint", required=True)
+    connect.add_argument("--collector-ref", required=True)
+    connect.add_argument("--repository-ref", required=True)
+    connect.add_argument("--key-file", type=Path, required=True)
+    connect.add_argument("--consent", action="store_true")
+    sync = observer_ops.add_parser(
+        "sync", help="upload a bounded batch outside vendor hooks"
+    )
+    sync.add_argument("--state-dir", type=Path, required=True)
+    sync.add_argument("--limit", type=int, default=100)
+
     schema = commands.add_parser("schema", help="print a bundled public JSON Schema")
     schema.add_argument("name", choices=("registry", "context", "envelope"))
     return root
@@ -97,6 +171,10 @@ def parser() -> argparse.ArgumentParser:
 
 def main(arguments: list[str] | None = None) -> int:
     args = parser().parse_args(arguments)
+    if args.command == "capture":
+        return _capture(args)
+    if args.command == "observer":
+        return _observer(args)
     try:
         if args.command == "init":
             return _initialize(args)
@@ -121,6 +199,158 @@ def main(arguments: list[str] | None = None) -> int:
         print(f"devdiary: {error}", file=sys.stderr)
         return 2
     return 2
+
+
+def _observer(args: argparse.Namespace) -> int:
+    import sqlite3
+
+    from devdiary import observer
+    from devdiary.secure_paths import UnsafePathError
+
+    try:
+        operation = args.observer_operation
+        if not observer.supported_platform():
+            print(
+                json.dumps(
+                    {
+                        "error_code": "observer_platform_unsupported",
+                        "platform_support": "POSIX_only",
+                    }
+                )
+            )
+            return 2
+        if operation == "plan":
+            binding = None
+            if args.actor_ref or args.binding_session or args.binding_agent_id:
+                if not args.actor_ref or not args.binding_session:
+                    raise ValueError("actor_ref_and_exact_session_required")
+                registry = load_registry(args.config)
+                if not any(
+                    actor["actor_ref"] == args.actor_ref for actor in registry["actors"]
+                ):
+                    raise ValueError("exact_known_actor_required")
+                binding = {
+                    "actor_ref": args.actor_ref,
+                    "session_id": args.binding_session,
+                    "agent_id": args.binding_agent_id,
+                }
+            result = observer.plan(
+                args.settings,
+                args.state_dir,
+                args.repository,
+                args.executable,
+                binding,
+                vendor=args.vendor,
+            )
+        elif operation == "apply":
+            proposal_raw = observer.read(args.plan)
+            if proposal_raw is None:
+                raise ValueError("plan_missing")
+            proposal = json.loads(proposal_raw)
+            if proposal.get("binding"):
+                registry = load_registry(args.config)
+                if not any(
+                    actor["actor_ref"] == proposal["binding"]["actor_ref"]
+                    for actor in registry["actors"]
+                ):
+                    raise ValueError("exact_known_actor_required")
+            result = observer.apply(proposal, consent=args.consent, vendor=args.vendor)
+        elif operation == "remove":
+            result = observer.remove(
+                args.state_dir, consent=args.consent, vendor=args.vendor
+            )
+        elif operation == "discover":
+            result = observer.discover(args.vendor)
+        elif operation == "connect":
+            from devdiary import observer_upload
+
+            result = observer_upload.configure(
+                args.state_dir,
+                endpoint=args.endpoint,
+                collector_ref=args.collector_ref,
+                repository_ref=args.repository_ref,
+                key_file=args.key_file,
+                consent=args.consent,
+            )
+        elif operation == "sync":
+            from devdiary import observer_upload
+
+            result = observer_upload.sync(args.state_dir, args.limit)
+            print(json.dumps(result, sort_keys=True))
+            return 1 if result["last_failure"] else 0
+        elif operation == "health":
+            result = observer.health(args.state_dir)
+        else:
+            result = observer.observations(args.state_dir, args.limit)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        sqlite3.Error,
+        ConfigError,
+        UnsafePathError,
+    ):
+        # Do not echo settings values or paths from parser/database exceptions.
+        print(
+            json.dumps(
+                {
+                    "error_code": "observer_operation_failed",
+                    "action": "inspect_health_and_replan_with_host_quiescent",
+                }
+            )
+        )
+        return 2
+
+
+def _capture(args: argparse.Namespace) -> int:
+    import sqlite3
+
+    from devdiary import capture
+    from devdiary import capture_validation as validation
+    from devdiary.capture_store import Store
+    from devdiary.secure_paths import UnsafePathError
+
+    store = None
+    try:
+        data = validation.read_input(sys.stdin.buffer)
+        store = Store(args.state_dir)
+        if args.capture_operation == "begin":
+            result = capture.begin(store, load_registry(args.config), data)
+        elif args.capture_operation == "finish":
+            record = capture.freeze(store, data)
+            result = capture.deliver(store, record["capture_id"])
+        elif args.capture_operation == "retry":
+            validation.obj(data, {"capture_id"}, {"capture_id"})
+            result = capture.deliver(
+                store, validation.text(data["capture_id"]), replay=True
+            )
+        else:
+            result = capture.status(store, data)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        sqlite3.Error,
+        UnsafePathError,
+    ) as error:
+        code = (
+            str(error)
+            if isinstance(error, validation.CaptureError)
+            else "capture_failed"
+        )
+        print(json.dumps({"error_code": code}))
+        print(f"devdiary: {code}", file=sys.stderr)
+        return 2
+    finally:
+        if store is not None:
+            store.close()
 
 
 def _initialize(args: argparse.Namespace) -> int:
@@ -196,6 +426,7 @@ def _run(args: argparse.Namespace, registry: dict) -> int:
         adapter_name=args.adapter,
         task_ref=args.task_ref,
         spool_directory=args.config.parent / "attribution-events",
+        state_directory=args.config.parent / "attribution-captures",
         explicit_work={
             "repositories": args.repository,
             "commits": args.commit,

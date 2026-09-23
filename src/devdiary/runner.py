@@ -54,6 +54,7 @@ def run_command(
     environment: dict[str, str] | None = None,
     spool_directory: Path | None = None,
     explicit_work: dict[str, list[str]] | None = None,
+    state_directory: Path | None = None,
 ) -> RunResult:
     explicit_work = _validate_work_references(explicit_work)
     parent_environment = dict(os.environ if environment is None else environment)
@@ -78,6 +79,20 @@ def run_command(
         parent_ref,
     )
 
+    if state_directory is not None:
+        return _run_durable(
+            registry,
+            actor,
+            command,
+            cwd,
+            run_context,
+            parent_environment,
+            ingest_key,
+            state_directory,
+            spool_directory,
+            explicit_work,
+        )
+
     before = git_refs.capture(cwd)
     with tempfile.TemporaryDirectory(prefix="devdiary-") as directory:
         context_path = Path(directory) / "context.json"
@@ -99,7 +114,12 @@ def run_command(
             event_type,
             contract.timestamp(),
             _merge_work_references(
-                git_refs.work_references(before, after), explicit_work
+                git_refs.work_references(
+                    before,
+                    after,
+                    author_email=(actor.get("identities") or {}).get("git_email"),
+                ),
+                explicit_work,
             ),
         )
         emitted, emission_failed = _emit(registry, ingest_key, envelope)
@@ -131,6 +151,104 @@ def run_command(
     )
 
 
+def _run_durable(
+    registry: dict,
+    actor: dict,
+    command: list[str],
+    cwd: Path,
+    context: dict,
+    environment: dict,
+    ingest_key: str | None,
+    state_directory: Path,
+    spool_directory: Path | None,
+    explicit_work: dict,
+) -> RunResult:
+    import sqlite3
+
+    from devdiary import capture
+    from devdiary.capture_store import Store
+    from devdiary.secure_paths import UnsafePathError
+
+    store = None
+    try:
+        store = Store(state_directory)
+        opened = capture.begin(
+            store,
+            registry,
+            {
+                "actor_ref": actor["actor_ref"],
+                "run_ref": context["run"]["ref"],
+                "cwd": str(cwd.resolve()),
+                "execution_chain": context["execution_chain"],
+                "task_refs": [context["run"]["task_ref"]]
+                if context["run"].get("task_ref")
+                else [],
+                "parent_run_ref": context["run"].get("parent_ref"),
+                "source": {"system": "devdiary-run"},
+            },
+        )
+        child_environment = _child_environment(
+            environment,
+            key_environment(registry),
+            actor,
+            context,
+            Path(opened["environment"][CONTEXT_ENV]),
+        )
+        child_environment.update(opened["environment"])
+        exit_code, cancelled = _spawn(command, cwd, child_environment)
+        record = capture.freeze(
+            store,
+            {
+                "capture_id": opened["capture_id"],
+                "outcome": "cancelled"
+                if cancelled
+                else "completed"
+                if exit_code == 0
+                else "failed",
+                "work": explicit_work,
+            },
+        )
+        emitted = False
+        failed = False
+        pending_path = None
+        if enforcement(registry) != "off":
+            # Empty means explicitly absent; never recover a secret from ambient
+            # os.environ after run_command consumed a supplied environment.
+            result = capture.deliver(
+                store, opened["capture_id"], key_override=ingest_key or ""
+            )
+            emitted = result["state"] == "delivered"
+            failed = not emitted
+            if failed:
+                print(
+                    "devdiary: warning: declaration pending durable retry",
+                    file=sys.stderr,
+                )
+            if failed and ingest_key:
+                try:
+                    pending_path = spool.enqueue(
+                        spool_directory
+                        or state_directory.parent / "attribution-events",
+                        record["envelope"],
+                        ingest_key,
+                    )
+                except (OSError, spool.SpoolError):
+                    print(
+                        "devdiary: warning: legacy spool unavailable; durable capture retained",
+                        file=sys.stderr,
+                    )
+        if failed and enforcement(registry) == "enforce" and exit_code == 0:
+            exit_code = ENFORCEMENT_FAILURE
+        return RunResult(exit_code, record["envelope"], emitted, pending_path)
+    except (OSError, ValueError, sqlite3.Error, UnsafePathError) as error:
+        raise ConfigError(
+            "durable capture failed; existing evidence is retained"
+        ) from error
+    finally:
+        if store is not None:
+            store.close()
+
+
 def _write_context(path: Path, context: dict[str, Any]) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as file:
@@ -149,6 +267,7 @@ def _child_environment(
     child = dict(environment)
     child.pop(key_env, None)
     child[CONTEXT_ENV] = str(context_path)
+    child["AGENT_ATTRIBUTION_CONTEXT"] = str(context_path)
     child[ACTOR_ENV] = actor["actor_ref"]
     child[RUN_ENV] = run_context["run"]["ref"]
     if run_context["run"].get("task_ref"):

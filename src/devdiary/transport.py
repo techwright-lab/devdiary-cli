@@ -50,11 +50,12 @@ def post_envelope(
                     raise TransportError(
                         f"ingest response exceeds {MAX_DOCUMENT_BYTES} bytes"
                     )
-                return json.loads(body) if body else {}
+                return validate_receipt(json.loads(body) if body else {}, envelope)
         except urllib.error.HTTPError as error:
+            error.close()
             if error.code < 500 or attempt == attempts:
                 raise TransportError(f"ingest returned HTTP {error.code}") from error
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as error:
             if attempt == attempts:
                 raise TransportError(
                     "ingest could not be reached or returned invalid JSON"
@@ -69,3 +70,21 @@ def post_envelope(
         time.sleep(0.2 * attempt)
 
     raise TransportError("ingest failed")
+
+
+def validate_receipt(receipt: Any, envelope: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "actor_ref": envelope.get("actor", {}).get("ref"),
+        "event_id": envelope.get("event_id"),
+        "run_ref": envelope.get("run_ref"),
+    }
+    if not isinstance(receipt, dict) or any(
+        not isinstance(value, str) or not value or receipt.get(field) != value
+        for field, value in expected.items()
+    ):
+        raise TransportError("ingest receipt mismatch")
+    session_id = receipt.get("session_id")
+    if type(session_id) is not int or session_id <= 0:
+        raise TransportError("ingest receipt mismatch")
+    # Store only known acknowledgement fields, never arbitrary server content.
+    return {**expected, "session_id": session_id}

@@ -98,6 +98,44 @@ class GitRefsTest(unittest.TestCase):
             after = git_refs.capture(self.root)
 
             self.assertEqual([], git_refs.commits_between(before, after))
+            self.assertEqual(
+                [],
+                git_refs.work_references(
+                    before, after, author_email="agent@example.test"
+                )["commits"],
+            )
+        finally:
+            self._git("worktree", "remove", "--force", str(sibling))
+
+    def test_sibling_worktree_commit_is_reported_when_author_matches(self) -> None:
+        self._initialize_repository()
+        self._commit("main")
+        sibling = self.root.parent / f"{self.root.name}-sibling"
+        self._git("worktree", "add", "-b", "sibling", str(sibling))
+        try:
+            before = git_refs.capture(self.root)
+            (sibling / "sibling.txt").write_text("sibling", encoding="utf-8")
+            self._git_at(sibling, "add", "sibling.txt")
+            self._git_at(
+                sibling,
+                "-c",
+                "user.name=Codex Engineer",
+                "-c",
+                "user.email=agent@example.test",
+                "commit",
+                "-m",
+                "sibling",
+            )
+            sha = self._git_at(sibling, "rev-parse", "HEAD").stdout.strip()
+            after = git_refs.capture(self.root)
+
+            self.assertEqual([], git_refs.commits_between(before, after))
+            self.assertEqual(
+                [sha],
+                git_refs.work_references(
+                    before, after, author_email="agent@example.test"
+                )["commits"],
+            )
         finally:
             self._git("worktree", "remove", "--force", str(sibling))
 

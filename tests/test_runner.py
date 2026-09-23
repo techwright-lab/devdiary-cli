@@ -30,7 +30,16 @@ class CaptureHandler(BaseHTTPRequestHandler):
         length = int(self.headers["Content-Length"])
         self.__class__.authorization = self.headers.get("Authorization")
         self.__class__.payload = json.loads(self.rfile.read(length))
-        body = b'{"status":"created"}'
+        payload = self.__class__.payload
+        assert payload is not None
+        body = json.dumps(
+            {
+                "actor_ref": payload["actor"]["ref"],
+                "event_id": payload["event_id"],
+                "run_ref": payload["run_ref"],
+                "session_id": 1,
+            }
+        ).encode()
         self.send_response(201)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
