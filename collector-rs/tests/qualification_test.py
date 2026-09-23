@@ -184,12 +184,69 @@ class QualificationTest(unittest.TestCase):
             ):
                 q.rails_interop(args, Path("/synthetic"), {}, report)
             self.assertEqual(
-                [c[0] for c in calls], ["createdb", "bundle", "dropdb", "psql"]
+                [c[0] for c in calls], ["psql", "createdb", "bundle", "dropdb", "psql"]
             )
             self.assertTrue(report["database_dropped"])
-            self.assertEqual(calls[0][-1], calls[2][-1])
+            self.assertEqual(calls[1][-1], calls[3][-1])
 
-    def test_failed_create_never_drops_unowned_database(self):
+    def test_partial_rails_report_cannot_prevent_database_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rails-result.json").write_text('{"passed":')
+            calls = []
+
+            def fixture_run(argv, **kwargs):
+                calls.append(str(argv[0]))
+                if argv[0] == "bundle":
+                    raise KeyboardInterrupt()
+                return b"0\n"
+
+            report = {}
+            args = SimpleNamespace(
+                pg_user="fixture", pg_port=5432, rails_checkout=q.CLI
+            )
+            with (
+                patch.object(q, "run", side_effect=fixture_run),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                q.rails_interop(args, root, {}, report)
+            self.assertEqual(calls, ["psql", "createdb", "bundle", "dropdb", "psql"])
+            self.assertTrue(report["database_dropped"])
+            self.assertTrue(report["rails_report_unreadable"])
+
+    def test_interrupted_create_cleans_its_verified_absent_name(self):
+        calls = []
+
+        def fixture_run(argv, **kwargs):
+            calls.append(str(argv[0]))
+            if argv[0] == "createdb":
+                raise KeyboardInterrupt()
+            return b"0\n"
+
+        report = {}
+        args = SimpleNamespace(pg_user="fixture", pg_port=5432)
+        with (
+            patch.object(q, "run", side_effect=fixture_run),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            q.rails_interop(args, Path("/synthetic"), {}, report)
+        self.assertEqual(calls, ["psql", "createdb", "dropdb", "psql"])
+        self.assertTrue(report["database_dropped"])
+
+    def test_preexisting_database_refused_without_drop(self):
+        with (
+            patch.object(q, "run", return_value=b"1\n") as run,
+            self.assertRaises(q.GateError),
+        ):
+            q.rails_interop(
+                SimpleNamespace(pg_user="fixture", pg_port=5432),
+                Path("/synthetic"),
+                {},
+                {},
+            )
+        self.assertEqual(run.call_count, 1)
+
+    def test_failed_precheck_never_drops_unowned_database(self):
         with (
             patch.object(q, "run", side_effect=RuntimeError("exists")) as run,
             self.assertRaises(RuntimeError),

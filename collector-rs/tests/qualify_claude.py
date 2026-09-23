@@ -380,10 +380,23 @@ def rails_interop(args, root, env, report):
         "QUALIFICATION_ROOT": str(root),
     }
     report["database_name"] = name
+    count_command = [
+        "psql",
+        *pg,
+        "-d",
+        "postgres",
+        "-Atc",
+        f"SELECT count(*) FROM pg_database WHERE datname='{name}'",
+    ]
     created = False
     try:
-        run(["createdb", *pg, name], env=renv)
+        require(
+            run(count_command, env=renv).strip() == b"0", "database_name_already_exists"
+        )
+        # Reserve this unpredictable, verified-absent name before CREATE dispatch:
+        # its server commit can precede an interrupt/timeout at the client.
         created = True
+        run(["createdb", *pg, name], env=renv)
         run(
             ["bundle", "exec", "rails", "db:schema:load"],
             cwd=args.rails_checkout,
@@ -423,21 +436,16 @@ def rails_interop(args, root, env, report):
         report["exact_rails_receipts"] = True
     finally:
         if (root / "rails-result.json").exists():
-            report["rails"] = json.loads((root / "rails-result.json").read_text())
+            # A killed Ruby writer can leave a partial report. Never let parsing
+            # prevent dropping the owned DB (which invalidates any surviving key).
+            try:
+                report["rails"] = json.loads((root / "rails-result.json").read_text())
+            except (ValueError, OSError):
+                report["rails_report_unreadable"] = True
         if created:
             # Force only our randomly named owned database, never a caller's DB.
-            run(["dropdb", *pg, "--force", name], env=renv)
-            absent = run(
-                [
-                    "psql",
-                    *pg,
-                    "-d",
-                    "postgres",
-                    "-Atc",
-                    f"SELECT count(*) FROM pg_database WHERE datname='{name}'",
-                ],
-                env=renv,
-            )
+            run(["dropdb", *pg, "--if-exists", "--force", name], env=renv)
+            absent = run(count_command, env=renv)
             report["database_dropped"] = absent.strip() == b"0"
             require(report["database_dropped"], "database_cleanup")
 
