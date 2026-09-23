@@ -55,7 +55,14 @@ not retarget evidence. Owner-only state, no symlink ancestors or hardlinks, FULL
 SQLite commits, 250 ms lock waits, 10,000 retained rows and a 16 MiB database ceiling
 bound storage. Capacity/lock failures leave existing evidence unchanged; callers
 must retry failed collection with the same UUID. Retained receipts count toward
-capacity; no pruning yet. Same-UID processes are trusted, not sandboxed.
+capacity; no pruning yet. Admission reserves worst-case SQLite table/index and
+overflow pages for every retained row, including future receipts, failures and
+cursor updates. This conservative reservation intentionally refuses new rows
+before the physical file is full (currently hundreds, not thousands, of rows);
+the 10,000-row limit is an additional ceiling, not a promised capacity. Existing
+pre-fix spools are not rewritten or pruned; previously over-admitted spools may
+still lack update space and require a separately designed recovery/migration.
+Same-UID processes are trusted, not sandboxed.
 
 Input is capped at 64 KiB with a 700 ms stdin deadline (not a whole-hook SLA).
 Frozen ASCII allowlisted wire bytes are capped at 16 KiB. Explicit sync attempts

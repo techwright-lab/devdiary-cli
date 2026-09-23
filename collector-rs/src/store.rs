@@ -116,6 +116,10 @@ impl Store {
         db.execute_batch(
             "PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE; PRAGMA max_page_count=4096;",
         )?;
+        let page_size: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        if page_size != 4096 {
+            return Err("incompatible_spool".into());
+        }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id: i64 = tx.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -176,6 +180,24 @@ impl Store {
                 "INSERT INTO outbox(observation_id,payload) VALUES(?,?)",
                 params![id, payload],
             )?;
+            // Reserve the entire retained spool's worst-case geometry, not just
+            // today's compact rows. Receipt/failure updates can split leaves or
+            // create overflow pages even when the added bytes are small.
+            // Each of the table and its two indexes needs at most one leaf and
+            // one interior page per row. Overflow pages carry 4092 bytes; 1024
+            // extra bytes bound the ID, record header, exact receipt (collector
+            // <=200 ASCII bytes, two UUIDs, u64 ID), and bounded failure code.
+            // The 32-page fixed allowance covers scope/schema and transient
+            // balancing/cursor growth. This deliberately conservative reservation
+            // counts delivered rows too: acknowledgement is not pruning.
+            let reserved: i64 = tx.query_row(
+                "SELECT 32 + coalesce(sum(6 + (length(payload)+1024+4091)/4092),0) FROM outbox",
+                [],
+                |r| r.get(0),
+            )?;
+            if reserved > 4096 {
+                return Err("spool_full".into());
+            }
         }
         tx.commit()?;
         Ok(())

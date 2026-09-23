@@ -162,6 +162,61 @@ class CollectorTest(unittest.TestCase):
             self.assertNotIn(b"PRIVATE-SENTINEL", path.read_bytes())
             self.assertNotIn(b"dc_live_", path.read_bytes())
 
+    def test_byte_capacity_retains_and_delivers_every_accepted_row(self):
+        # Real valid large rows through admission, not 10,000 injected {} blobs.
+        large = {
+            key: "x" * 130
+            for key in (
+                "prompt_id", "turn_id", "tool_use_id", "agent_id", "agent_type",
+                "model", "tool_name", "source", "reason",
+            )
+        }
+        accepted = {}
+        for number in range(10001):
+            row = {**self.row, **large,
+                   "observation_id": f"{number:08d}-2222-4222-8222-222222222222"}
+            result = subprocess.run(
+                [str(BIN), "collect", str(self.state)],
+                input=json.dumps(row).encode(), capture_output=True, timeout=9,
+            )
+            if result.returncode:
+                self.assertEqual(result.returncode, 2, result.stderr)
+                break
+            projected = {k: v for k, v in row.items()
+                         if k in observer_upload.FIELDS and v is not None}
+            accepted[row["observation_id"]] = observer_upload.envelope(projected, self.config)
+        count = len(accepted)
+        self.assertGreater(count, 100)
+        self.assertLess(count, 10000)  # byte capacity, not the row-count guard
+        db = self.db()
+        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], count)
+        self.assertLessEqual(db.execute("PRAGMA page_count").fetchone()[0], 4096)
+        # Global failure, then restart and wrap all rows with row-specific failures.
+        self.mode = 503
+        self.call("sync", self.key, 100, code=1)
+        self.assertEqual(db.execute("SELECT cursor FROM scope").fetchone()[0], 1)
+        self.mode = "wrong"
+        for _ in range((count + 99) // 100):
+            self.call("sync", self.key, 100, code=1)
+        self.assertEqual(db.execute(
+            "SELECT count(*) FROM outbox WHERE failure='invalid_receipt'"
+        ).fetchone()[0], count)
+        self.mode = "ok"
+        for remaining in range(count, 0, -100):
+            self.call("sync", self.key, 100, code=int(remaining > 100))
+        self.call("status")  # another process/reopen after full drain
+        rows = db.execute("SELECT observation_id,payload,delivered,receipt,failure FROM outbox").fetchall()
+        self.assertEqual(len(rows), count)
+        for observation_id, payload, delivered, raw_receipt, failure in rows:
+            self.assertEqual(payload, accepted[observation_id])
+            self.assertEqual(delivered, 1)
+            self.assertIsNone(failure)
+            observer_upload.receipt(raw_receipt, payload, self.config["collector_ref"])
+        self.assertLessEqual(db.execute("PRAGMA page_count").fetchone()[0], 4096)
+        self.assertLessEqual((self.state / "collector-rust-v1.sqlite3").stat().st_size, 16 * 1024 * 1024)
+        for raw, _ in self.requests:
+            self.assertEqual(raw, accepted[json.loads(raw)["observation_id"]])
+
     def test_response_loss_exact_replay_and_dedup(self):
         self.collect()
         self.collect()
