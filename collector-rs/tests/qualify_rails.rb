@@ -9,6 +9,7 @@ require "digest"
 require "socket"
 require "open3"
 require "timeout"
+require_relative "qualification_cleanup"
 raise "test required" unless ENV["RAILS_ENV"] == "test"
 url = URI(ENV.fetch("DATABASE_URL"))
 raise "isolated database required" unless url.host == "127.0.0.1" && url.path.match?(%r{\A/devdiary_rust_collector_interop_[0-9a-f]{32}\z})
@@ -110,19 +111,19 @@ begin
   root.join("expected-receipts.json").write(JSON.generate(expected_receipts))
   report.merge!("passed" => true, "actual_stock_records" => actual.size, "http_requests" => requests.size, "response_loss_result" => first, "final_status" => delivered, "payload_equality" => true, "exact_replay" => true, "no_attribution_side_effects" => true)
 ensure
-  # Every stage after credential creation is inside this ensure, including setup.
-  begin
-    if collector
-      collector.update!(revoked_at: Time.current)
-      raise "revocation failed" unless collector.reload.revoked_at && CollectorCredential.authenticate(key).nil?
-      report["collector_revoked"] = true
-    end
-  ensure
-    key_path.delete if key_path.exist?
-    proxy&.close
-    server&.stop(true)
-    proxy_thread&.join(1)
-    proxy_thread&.kill if proxy_thread&.alive?
-    root.join("rails-result.json").write(JSON.pretty_generate(report))
-  end
+  # Each independent stage runs even when every preceding stage failed.
+  QualificationCleanup.run(report, {
+    "revoke" => -> {
+      if collector
+        collector.update!(revoked_at: Time.current)
+        raise "revocation failed" unless collector.reload.revoked_at && CollectorCredential.authenticate(key).nil?
+        report["collector_revoked"] = true
+      end
+    },
+    "key_delete" => -> { key_path.delete if key_path.exist? },
+    "proxy_close" => -> { proxy&.close },
+    "server_stop" => -> { server&.stop(true) },
+    "thread_join" => -> { proxy_thread&.join(1) },
+    "thread_kill" => -> { proxy_thread&.kill if proxy_thread&.alive? }
+  }, ->(text) { root.join("rails-result.json").write(text) })
 end
