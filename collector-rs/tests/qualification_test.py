@@ -16,6 +16,30 @@ import qualify_claude as q
 
 
 class QualificationTest(unittest.TestCase):
+    def test_managed_dropins_and_remote_unknown_fail_before_vendor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            system = root / "etc/claude-code"
+            home = root / "home"
+            system.mkdir(parents=True)
+            home.mkdir()
+            dropins = system / "managed-settings.d"
+            dropins.mkdir()
+            policy = dropins / "audit.json"
+            policy.write_text('{"hooks":{"SessionStart":[]}}')
+            with self.assertRaisesRegex(q.GateError, "managed_policy_requires_review"):
+                q.check_managed_policy(home, system)
+            policy.unlink()
+            # Even no on-disk policy does not prove current/cached remote absence.
+            with self.assertRaisesRegex(q.GateError, "remote_managed_policy_unverified"):
+                q.check_managed_policy(home, system)
+            with (
+                patch.object(q, "clean_env", return_value={"HOME": str(home)}),
+                patch.object(q, "run", side_effect=AssertionError("no subprocess")),
+                self.assertRaises(q.GateError),
+            ):
+                q.execute(SimpleNamespace(), {})
+
     def test_default_is_inert_even_with_live_arguments(self):
         with (
             patch.object(q, "execute", side_effect=AssertionError("must not run")),
@@ -154,6 +178,7 @@ class QualificationTest(unittest.TestCase):
 
                 with (
                     patch.object(q, "clean_env", return_value=env),
+                    patch.object(q, "check_managed_policy"),
                     patch.object(q, "run", side_effect=fixture_run),
                     self.assertRaises(type(failure)),
                 ):

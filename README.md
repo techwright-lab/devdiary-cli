@@ -201,7 +201,24 @@ Additional Linux fixture gate:
 PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
 ```
 
-## Repeatable stock-Claude qualification (explicit usage opt-in)
+## Repeatable stock-Claude qualification (live mode currently blocked)
+
+**Live qualification now fails closed before any vendor execution.** Local
+managed files (including Linux `/etc/claude-code/managed-settings.d/`) are refused.
+Even their absence cannot establish absence of cached or freshly delivered
+server policy. There is no supported pre-launch remote-policy proof implemented
+here, and no bypass flag. The opt-in command below documents the intended interface,
+not a currently available live run. Fake-vendor tests explicitly stub this gate.
+The historical one-Read runtime evidence belongs to source `a5463de`, not this
+head; no new provider run is claimed.
+
+Official references: [managed settings](https://code.claude.com/docs/en/managed-settings)
+and [server delivery/caching](https://code.claude.com/docs/en/server-managed-settings).
+Remote settings can contain hooks, apply from cache at startup, and refresh later;
+`--setting-sources ''`, an auth-method projection, and init tools/MCP/plugin lists
+are not proof that hooks or policy are isolated. Supporting live qualification
+again requires a reviewed, vendor-supported policy-proof design, not cache removal
+or disabling organizational policy.
 
 ```sh
 # Network-inert default: no authentication probe, child process or model call.

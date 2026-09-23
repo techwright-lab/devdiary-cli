@@ -166,7 +166,7 @@ def validate_host(raw):
         "host_result",
     )
     require(SENTINELS[2].encode() in raw, "host_response")
-    return {"one_read": True, "isolation_verified": True, "model": init.get("model")}
+    return {"one_read": True, "init_tool_surface_verified": True, "model": init.get("model")}
 
 
 def inspect_spool(state):
@@ -207,8 +207,30 @@ def inspect_spool(state):
     return rows, dict(counts)
 
 
+def check_managed_policy(home, system=Path("/etc/claude-code")):
+    # Official managed-settings and server-managed-settings docs: CLI setting
+    # sources cannot disable endpoint drop-ins or cached/current remote policy.
+    # Reject even empty/unreadable drop-in directories (no policy contents read).
+    managed = [
+        system / "managed-settings.json",
+        system / "managed-settings.d",
+        system / "managed-mcp.json",
+    ]
+    require(
+        not any(p.exists() or p.is_symlink() for p in managed)
+        and not list((home / ".claude").glob("*managed*")),
+        "managed_policy_requires_review",
+    )
+    # No supported pre-launch proof of remote absence exists in this harness.
+    # auth status/init tool lists don't prove it, and doctor starts the vendor.
+    # Fail closed, without a bypass flag or reading/copying the auth/cache files.
+    raise GateError("remote_managed_policy_unverified")
+
+
 def execute(args, report):
     env = clean_env()
+    report["stage"] = "managed_policy_preflight"
+    check_managed_policy(Path(env["HOME"]))
     rails = args.rails_checkout.resolve()
     require(
         not list(rails.glob(".env*"))
@@ -228,18 +250,7 @@ def execute(args, report):
     with selected.open("rb") as executable:
         require(executable.read(4) == b"\x7fELF", "native_claude_required")
     report["claude"] = {"path": str(selected), "sha256": sha(selected)}
-    # Managed policy cannot be disabled by --setting-sources. Refuse, don't bypass.
     home = Path(env["HOME"])
-    managed = [
-        Path("/etc/claude-code/managed-settings.json"),
-        Path("/etc/claude-code/managed-mcp.json"),
-        home / ".claude/managed-settings.json",
-    ]
-    require(
-        not any(p.exists() for p in managed)
-        and not list((home / ".claude").glob("*managed*")),
-        "managed_policy_requires_review",
-    )
     tracked = [home / ".claude/settings.json", home / ".claude/settings.local.json"]
     before = {p: sha(p) if p.exists() else None for p in tracked}
     with tempfile.TemporaryDirectory(prefix="claude-qualification-") as directory:
