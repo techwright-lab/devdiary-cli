@@ -12,7 +12,7 @@ require "timeout"
 require_relative "qualification_cleanup"
 raise "test required" unless ENV["RAILS_ENV"] == "test"
 url = URI(ENV.fetch("DATABASE_URL"))
-raise "isolated database required" unless url.host == "127.0.0.1" && url.path.match?(%r{\A/devdiary_rust_collector_interop_[0-9a-f]{32}\z})
+raise "isolated database required" unless url.host == "127.0.0.1" && url.path.match?(%r{\A/devdiary_qualification_[0-9a-f]{32}\z})
 root = Pathname.new(ENV.fetch("QUALIFICATION_ROOT"))
 require File.join(Dir.pwd, "config/boot")
 require_relative "qualification_database"
@@ -30,6 +30,7 @@ require "puma"
 WebMock.disable_net_connect!(allow_localhost: true)
 Rails.logger = ActiveSupport::Logger.new(File::NULL)
 FactoryBot.find_definitions if FactoryBot.factories.count.zero?
+database_guard.verify_application!
 raise "database not empty" unless CollectorObservation.count.zero? && Workspace.count.zero?
 scope = JSON.parse(root.join("scope.json").read)
 actual = JSON.parse(root.join("observations.json").read)

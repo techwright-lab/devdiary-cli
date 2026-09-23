@@ -4,10 +4,12 @@
 require "minitest/autorun"
 require "active_record"
 require "active_record/database_configurations"
+require "tmpdir"
+require "open3"
 require_relative "qualification_database"
 
 class QualificationDatabaseTest < Minitest::Test
-  OWNED = "postgresql://fixture@127.0.0.1:5432/devdiary_rust_collector_interop_#{'a' * 32}"
+  OWNED = "postgresql://fixture@127.0.0.1:5432/devdiary_qualification_#{'a' * 32}"
 
   def setup
     @old = ENV["DATABASE_URL"]
@@ -43,6 +45,33 @@ class QualificationDatabaseTest < Minitest::Test
       {"primary" => {"url" => OWNED}, "replica" => {"url" => OWNED, "replica" => true}}
     ].each do |value|
       assert_raises(RuntimeError) { @guard.verify_configurations!(resolve(value)) }
+    end
+  end
+
+  def test_actual_runner_rejects_competing_url_before_schema_or_network
+    Dir.mktmpdir("qualification-target-") do |root|
+      Dir.mkdir(File.join(root, "config"))
+      Dir.mkdir(File.join(root, "db"))
+      File.write(File.join(root, "config/boot.rb"), "")
+      File.write(File.join(root, "config/environment.rb"), <<~RUBY)
+        require "active_record"
+        require "pg"
+        def PG.connect(*) = raise("FOREIGN NETWORK ATTEMPT")
+        ActiveRecord::Base.configurations = {"test" => {
+          "url" => "postgresql://fixture@127.0.0.1:5432/unowned_fixture"
+        }}
+        ActiveRecord::Base.establish_connection(:test)
+      RUBY
+      marker = File.join(root, "schema-ran")
+      File.write(File.join(root, "db/schema.rb"), "File.write(#{marker.inspect}, 'unsafe')")
+      runner = File.join(__dir__, "qualify_rails.rb")
+      code = 'file = ARGV.fetch(0); eval(File.read(file).split(%q{require "factory_bot_rails"}).first, TOPLEVEL_BINDING, file)'
+      out, err, status = Open3.capture3({"DATABASE_URL" => OWNED, "RAILS_ENV" => "test", "QUALIFICATION_ROOT" => root},
+        RbConfig.ruby, "-e", code, runner, chdir: root)
+      refute status.success?
+      assert_includes err, "unowned database target"
+      refute_includes out + err, "FOREIGN NETWORK ATTEMPT"
+      refute File.exist?(marker)
     end
   end
 

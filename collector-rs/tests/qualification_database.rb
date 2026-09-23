@@ -15,7 +15,7 @@ class QualificationDatabase
     uri = URI(url)
     raise "isolated database required" unless uri.scheme == "postgresql" &&
       uri.host == "127.0.0.1" && uri.port && uri.user&.match?(/\A[a-zA-Z0-9]+\z/) &&
-      uri.path.match?(%r{\A/devdiary_rust_collector_interop_[0-9a-f]{32}\z}) &&
+      uri.path.match?(%r{\A/devdiary_qualification_[0-9a-f]{32}\z}) &&
       !uri.password && !uri.query && !uri.fragment
     @expected = {host: uri.host, port: uri.port, database: uri.path.delete_prefix("/"), username: uri.user}.freeze
   end

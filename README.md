@@ -254,6 +254,30 @@ collector, deletes its key, stops owned processes, drops and checks the exact DB
 SIGINT/SIGTERM use cleanup; SIGKILL/power loss cannot run finally blocks. On cleanup
 failure the sanitized report identifies the owned DB for manual investigation.
 
+Database safety does not rely on `DATABASE_URL` precedence: the Ruby process
+installs a PostgreSQL connection-target guard before application boot, rejects
+additional/hidden test configurations and routing overrides, verifies every
+application pool plus the actual server database, loads `db/schema.rb` in that
+same process, and rechecks before fixtures. Only the exact owned loopback
+host/port/database/user is accepted. The random name stays below PostgreSQL's
+63-byte identifier limit. This is protection against configuration mistakes in a
+reviewed checkout, not a sandbox for malicious Ruby application/schema code.
+Cleanup stages are independent; failures are aggregated, make the result fail,
+and cannot prevent later cleanup attempts or the parent process-group/DB fallback.
+
+Standalone safety regressions (Ruby 3.4, ActiveRecord 8.1.3.1, pg, minitest):
+
+```sh
+ruby collector-rs/tests/qualification_safety_test.rb
+ruby collector-rs/tests/qualification_cleanup_test.rb
+# Optional loopback-only real PG target/schema/drop proof; no vendor calls:
+QUALIFICATION_PG_TEST=1 QUALIFICATION_RUBY="$(mise which ruby)" \
+  python3 collector-rs/tests/qualification_postgres_test.py -v
+```
+
+The optional proof uses synthetic application/schema files, not captured vendor
+rows or product HTTP ingestion; it does not renew the historical runtime evidence.
+
 Only a sanitized stage/result JSON goes to stdout; raw host output stays bounded
 in memory, scratch settings/spool are deleted, and provider transcripts are never
 read/copied. Exit zero requires all gates. Fixture failure/child/resume/repeated-start

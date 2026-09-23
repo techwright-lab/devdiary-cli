@@ -32,7 +32,9 @@ class QualificationTest(unittest.TestCase):
             policy.unlink()
             dropins.rmdir()
             # Even no on-disk policy does not prove current/cached remote absence.
-            with self.assertRaisesRegex(q.GateError, "remote_managed_policy_unverified"):
+            with self.assertRaisesRegex(
+                q.GateError, "remote_managed_policy_unverified"
+            ):
                 q.check_managed_policy(home, system)
             with (
                 patch.object(q, "clean_env", return_value={"HOME": str(home)}),
@@ -40,6 +42,53 @@ class QualificationTest(unittest.TestCase):
                 self.assertRaises(q.GateError),
             ):
                 q.execute(SimpleNamespace(), {})
+
+    def test_dropin_prevents_vendor_dispatch_with_synthetic_system_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            system = home / "etc/claude-code"
+            (system / "managed-settings.d").mkdir(parents=True)
+            (system / "managed-settings.d/audit.json").write_text("{}")
+            native = q.CLI / "collector-rs/target/debug/devdiary-collector"
+
+            def fake_run(argv, **kwargs):
+                if list(map(str, argv))[:2] == ["mise", "which"]:
+                    return str(native).encode()
+                if "--version" in argv and "--settings" in argv:
+                    self.fail("vendor dispatched with managed drop-in")
+                return b"fixture"
+
+            original_check = getattr(q, "check_managed_policy", None)
+            with (
+                patch.object(
+                    q, "clean_env", return_value={"HOME": str(home), "PATH": "fixture"}
+                ),
+                patch.object(q, "run", side_effect=fake_run),
+                patch.object(
+                    q,
+                    "Path",
+                    side_effect=lambda value: (
+                        system / str(value).removeprefix("/etc/claude-code/")
+                        if str(value).startswith("/etc/claude-code/")
+                        else Path(value)
+                    ),
+                ),
+                contextlib.ExitStack() as stack,
+            ):
+                if original_check:
+                    stack.enter_context(
+                        patch.object(
+                            q,
+                            "check_managed_policy",
+                            side_effect=lambda h: original_check(h, system),
+                        )
+                    )
+                with self.assertRaisesRegex(
+                    q.GateError, "managed_policy_requires_review"
+                ):
+                    q.execute(
+                        SimpleNamespace(rails_checkout=q.CLI, collector=native), {}
+                    )
 
     def test_default_is_inert_even_with_live_arguments(self):
         with (
@@ -189,6 +238,26 @@ class QualificationTest(unittest.TestCase):
                 self.assertTrue(report["live_settings_unchanged"])
                 self.assertNotIn("email", report["auth"])
 
+    def test_schema_is_not_dispatched_in_an_unguarded_separate_boot(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            if argv[0] == "bundle":
+                calls.append(list(map(str, argv)))
+                raise RuntimeError("stop before Rails fixture")
+            return b"0\n"
+
+        with patch.object(q, "run", side_effect=run), self.assertRaises(RuntimeError):
+            q.rails_interop(
+                SimpleNamespace(pg_user="fixture", pg_port=5432, rails_checkout=q.CLI),
+                Path("/synthetic"),
+                {},
+                {},
+            )
+        self.assertEqual(
+            calls, [["bundle", "exec", "ruby", str(q.HERE / "qualify_rails.rb")]]
+        )
+
     def test_database_cleanup_on_schema_failure_or_interrupt(self):
         for failure in (RuntimeError("fixture"), KeyboardInterrupt()):
             calls = []
@@ -214,6 +283,7 @@ class QualificationTest(unittest.TestCase):
             )
             self.assertTrue(report["database_dropped"])
             self.assertEqual(calls[1][-1], calls[3][-1])
+            self.assertLessEqual(len(calls[1][-1].encode()), 63)
 
     def test_partial_rails_report_cannot_prevent_database_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:

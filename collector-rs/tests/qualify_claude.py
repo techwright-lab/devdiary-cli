@@ -166,7 +166,11 @@ def validate_host(raw):
         "host_result",
     )
     require(SENTINELS[2].encode() in raw, "host_response")
-    return {"one_read": True, "init_tool_surface_verified": True, "model": init.get("model")}
+    return {
+        "one_read": True,
+        "init_tool_surface_verified": True,
+        "model": init.get("model"),
+    }
 
 
 def inspect_spool(state):
@@ -377,7 +381,7 @@ def execute(args, report):
 
 
 def rails_interop(args, root, env, report):
-    name = "devdiary_rust_collector_interop_" + uuid.uuid4().hex
+    name = "devdiary_qualification_" + uuid.uuid4().hex
     pg = ["-h", "127.0.0.1", "-p", str(args.pg_port), "-U", args.pg_user]
     # No .pgpass, Rails dotenv, production credentials, or inherited DB URL.
     renv = {

@@ -14,6 +14,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  qualification-safety:
+    name: Qualification safety (no vendor or database calls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4.4"
+      - name: Install standalone resolver test dependencies
+        run: |
+          gem install --no-document activerecord -v 8.1.3.1
+          gem install --no-document pg -v 1.6.3
+          gem install --no-document minitest -v 5.25.5
+      - name: Effective database target and independent cleanup regressions
+        run: |
+          ruby collector-rs/tests/qualification_safety_test.rb
+          ruby collector-rs/tests/qualification_cleanup_test.rb
+          ruby -c collector-rs/tests/qualify_rails.rb
+
   rust-collector:
     name: Rust collector (Linux experimental)
     runs-on: ubuntu-latest
