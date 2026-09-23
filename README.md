@@ -116,8 +116,8 @@ Python, reads a transcript, makes a network call, or reads provider credentials.
 local HTTP delivery, concurrency and failure tests are not a successful stock
 Claude session. No live Claude settings were changed to develop this slice.
 A separately consented smoke still requires an unmodified Claude installation,
-disposable HOME/settings/repository, the user's normal hook trust approval and
-provider authentication/usage approval. Verify real lifecycle/tool events,
+disposable settings/repository, existing subscription authentication in normal
+HOME, and explicit provider-usage approval. Verify real lifecycle/tool events,
 unknown attribution, ordinary host output, delivery and clean removal. Do not
 bypass a trust prompt or call this runtime-qualified before that gate. Windows
 is unsupported (the crate requires Unix); macOS is unqualified and this adapter
@@ -200,6 +200,91 @@ Additional Linux fixture gate:
 ```sh
 PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
 ```
+
+## Repeatable stock-Claude qualification (live mode currently blocked)
+
+**Live qualification now fails closed before any vendor execution.** Local
+managed files (including Linux `/etc/claude-code/managed-settings.d/`) are refused.
+Even their absence cannot establish absence of cached or freshly delivered
+server policy. There is no supported pre-launch remote-policy proof implemented
+here, and no bypass flag. The opt-in command below documents the intended interface,
+not a currently available live run. Fake-vendor tests explicitly stub this gate.
+The historical one-Read runtime evidence belongs to source `a5463de`, not this
+head; no new provider run is claimed.
+
+Official references: [managed settings](https://code.claude.com/docs/en/managed-settings)
+and [server delivery/caching](https://code.claude.com/docs/en/server-managed-settings).
+Remote settings can contain hooks, apply from cache at startup, and refresh later;
+`--setting-sources ''`, an auth-method projection, and init tools/MCP/plugin lists
+are not proof that hooks or policy are isolated. Supporting live qualification
+again requires a reviewed, vendor-supported policy-proof design, not cache removal
+or disabling organizational policy.
+
+```sh
+# Network-inert default: no authentication probe, child process or model call.
+python3 collector-rs/tests/qualify_claude.py
+# Ordinary CI runs only these fake-vendor control-flow tests, NOT qualification:
+python3 collector-rs/tests/qualification_test.py -v
+# After explicit approval for ONE subscription-backed print session:
+cargo build --release --locked --manifest-path collector-rs/Cargo.toml
+python3 collector-rs/tests/qualify_claude.py \
+  --consent-provider-use --max-model-runs 1 --claude-version 2.1.280 \
+  --collector "$PWD/collector-rs/target/release/devdiary-collector" \
+  --rails-checkout "$DISPOSABLE_RAILS_CHECKOUT" --pg-user "$USER"
+```
+
+Linux prerequisites: already installed mise-selected native Claude and Ruby,
+installed Rails test bundle, and loopback PostgreSQL with a local test role allowed
+CREATE/DROP DATABASE (no password discovery/fallback; optional `--pg-port`). Use a
+reviewed Rails checkout without dotenv/credential key files. No installation or
+update is attempted. CI refuses live mode. Each invocation has one non-retried host
+launch, two turns maximum and a 100-second deadline; rerunning needs fresh consent.
+This bounds host sessions/turns, not vendor-internal HTTP retries or a dollar tariff.
+
+The harness pins source SHAs, native executable SHA-256/version and the collector
+hash; verifies subscription auth using only boolean/method/provider projection;
+uses normal HOME solely for vendor-owned auth with empty setting sources, private
+explicit settings, strict empty MCP and only synthetic Read permission. It refuses
+managed-policy files rather than bypassing them. No live hooks are installed.
+It verifies committed lifecycle/tool IDs and metadata privacy, then sends those
+exact rows through actual Rails/Puma and a newly owned PostgreSQL database. A lost
+response must replay identical bytes; persisted receipts must match remote IDs.
+Cleanup removes registration, verifies live settings hashes, revokes the disposable
+collector, deletes its key, stops owned processes, drops and checks the exact DB.
+SIGINT/SIGTERM use cleanup; SIGKILL/power loss cannot run finally blocks. On cleanup
+failure the sanitized report identifies the owned DB for manual investigation.
+
+Database safety does not rely on `DATABASE_URL` precedence: the Ruby process
+installs a PostgreSQL connection-target guard before application boot, rejects
+additional/hidden test configurations and routing overrides, verifies every
+application pool plus the actual server database, loads `db/schema.rb` in that
+same process, and rechecks before fixtures. Only the exact owned loopback
+host/port/database/user is accepted. The random name stays below PostgreSQL's
+63-byte identifier limit. This is protection against configuration mistakes in a
+reviewed checkout, not a sandbox for malicious Ruby application/schema code.
+Cleanup stages are independent; failures are aggregated, make the result fail,
+and cannot prevent later cleanup attempts or the parent process-group/DB fallback.
+
+Standalone safety regressions (Ruby 3.4, ActiveRecord 8.1.3.1, pg, minitest):
+
+```sh
+ruby collector-rs/tests/qualification_safety_test.rb
+ruby collector-rs/tests/qualification_cleanup_test.rb
+# Optional loopback-only real PG target/schema/drop proof; no vendor calls:
+QUALIFICATION_PG_TEST=1 QUALIFICATION_RUBY="$(mise which ruby)" \
+  python3 collector-rs/tests/qualification_postgres_test.py -v
+```
+
+The optional proof uses synthetic application/schema files, not captured vendor
+rows or product HTTP ingestion; it does not renew the historical runtime evidence.
+
+Only a sanitized stage/result JSON goes to stdout; raw host output stays bounded
+in memory, scratch settings/spool are deleted, and provider transcripts are never
+read/copied. Exit zero requires all gates. Fixture failure/child/resume/repeated-start
+regressions do **not** qualify real interactive/resume/child behavior. No Codex,
+named actor, original-work reconciliation, human-minute, platform or release claim.
+Canonical design and dated runtime evidence remain in the
+[DevDiary vault](../_vault/products/devdiary/docs/customer-owned-attribution-design.md).
 
 ## Explicit observer upload
 
