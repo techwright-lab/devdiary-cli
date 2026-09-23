@@ -8,9 +8,15 @@ publish = false
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
-rustix = { version = "1.1.5", features = ["process"] }
+rustix = { version = "1.1.5", features = ["process", "fs"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "v5"] }
 serde = "1"
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+
+# Keep executable pin verification inside the hook deadline in debug fixtures too.
+[profile.dev.package.sha2]
+opt-level = 3
 
 [dev-dependencies]
 tempfile = "3"

@@ -2,6 +2,7 @@
 #[cfg(not(unix))]
 compile_error!("This experimental collector currently requires Unix private-file semantics");
 
+pub mod claude;
 pub mod store;
 use chrono::{DateTime, Datelike, Utc};
 use serde::de::{MapAccess, Visitor};
