@@ -134,6 +134,123 @@ class ClaudeHookTest(unittest.TestCase):
             (result.returncode, result.stdout, result.stderr), (0, b"", b"")
         )
 
+    def test_saved_plan_validation_precedes_all_mutations(self):
+        self.command("claude-remove", self.plan, "--consent")
+        self.plan.unlink()
+        self.command("claude-plan", self.state, self.settings, self.plan)
+        original = json.loads(self.plan.read_bytes())
+        cases = [
+            dict(original, absent_events="invalid"),
+            dict(original, absent_events=original["absent_events"] + ["Stop"]),
+            dict(original, absent_events=original["absent_events"][1:]),
+            dict(original, absent_events=["Unknown"]),
+            dict(original, absent_events=[1]),
+            dict(original, absent_events=original["absent_events"] * 2),
+            dict(original, absent_hooks="false"),
+            dict(original, absent_hooks=True),
+            dict(original, unknown=True),
+            dict(
+                original,
+                scope=dict(
+                    original["scope"],
+                    installation_id="22222222-2222-4222-8222-222222222222",
+                ),
+            ),
+            dict(original, scope=dict(original["scope"], unknown=True)),
+            dict(original, scope=dict(original["scope"], collector_ref="changed")),
+        ]
+        cases += [
+            {k: v for k, v in original.items() if k != field} for field in original
+        ]
+        raws = [json.dumps(value).encode() for value in cases]
+        raws += [
+            json.dumps(original)
+            .replace('"version": 1', '"version": 1, "version": 1')
+            .encode(),
+            json.dumps(original)
+            .replace('"timeout": 2', '"timeout": 2, "timeout": 2')
+            .encode(),
+        ]
+        for raw in raws:
+            with self.subTest(plan=raw):
+                self.plan.write_bytes(raw)
+                before = {
+                    str(p.relative_to(self.root)): p.read_bytes()
+                    for p in self.root.rglob("*")
+                    if p.is_file()
+                }
+                self.command("claude-apply", self.plan, "--consent", code=2)
+                after = {
+                    str(p.relative_to(self.root)): p.read_bytes()
+                    for p in self.root.rglob("*")
+                    if p.is_file()
+                }
+                self.assertEqual(after, before)
+        self.save(self.plan, original)
+        self.command("claude-apply", self.plan, "--consent")
+        # Type-valid receipt metadata and scope edits must also fail after install.
+        for field, value in (
+            ("absent_hooks", True),
+            ("absent_events", list(EVENTS)),
+            ("scope", dict(original["scope"], collector_ref="changed")),
+            (
+                "scope",
+                dict(
+                    original["scope"],
+                    installation_id="22222222-2222-4222-8222-222222222222",
+                ),
+            ),
+        ):
+            self.save(self.plan, dict(original, **{field: value}))
+            before = {
+                str(p.relative_to(self.root)): p.read_bytes()
+                for p in self.root.rglob("*")
+                if p.is_file()
+            }
+            self.command("claude-apply", self.plan, "--consent", code=2)
+            self.command("claude-remove", self.plan, "--consent", code=2)
+            self.hook()
+            after = {
+                str(p.relative_to(self.root)): p.read_bytes()
+                for p in self.root.rglob("*")
+                if p.is_file()
+            }
+            self.assertEqual(after, before)
+        self.save(self.plan, original)
+        self.command("claude-remove", self.plan, "--consent")
+        self.command("claude-remove", self.plan, "--consent")
+        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+
+    def test_type_valid_original_presence_mismatch_is_atomic(self):
+        self.command("claude-remove", self.plan, "--consent")
+        for original, change in [
+            (self.original, {"absent_events": list(EVENTS)}),
+            ({}, {"absent_hooks": False}),
+            ({"hooks": {}}, {"absent_hooks": True}),
+        ]:
+            with self.subTest(original=original, change=change):
+                self.plan.unlink()
+                self.save(self.settings, original)
+                self.command("claude-plan", self.state, self.settings, self.plan)
+                valid = json.loads(self.plan.read_bytes())
+                self.save(self.plan, dict(valid, **change))
+                before = {
+                    str(p.relative_to(self.root)): p.read_bytes()
+                    for p in self.root.rglob("*")
+                    if p.is_file()
+                }
+                self.command("claude-apply", self.plan, "--consent", code=2)
+                after = {
+                    str(p.relative_to(self.root)): p.read_bytes()
+                    for p in self.root.rglob("*")
+                    if p.is_file()
+                }
+                self.assertEqual(before, after)
+                self.save(self.plan, valid)
+                self.command("claude-apply", self.plan, "--consent")
+                self.command("claude-remove", self.plan, "--consent")
+                self.assertEqual(json.loads(self.settings.read_bytes()), original)
+
     def test_python_reference_parity_and_dedup(self):
         py = self.root / "python"
         py.mkdir(mode=0o700)

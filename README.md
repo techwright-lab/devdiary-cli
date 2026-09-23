@@ -152,17 +152,27 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   after executable/spool failures. Same-UID processes remain trusted.
 - Plan and settings are bounded to 64 KiB. The plan stores only ownership, hashes
   and scope, **not a copy of settings secrets**. Both mutations require explicit
-  `--consent`. Apply rejects changed settings/scope/binary; retry of an already
+  `--consent`. Apply validates the complete proposal, including original key
+  presence against the hash-matched settings, before persisting ownership. Unknown
+  fields, duplicate keys and inconsistent removal metadata are refused. The private
+  `$PLAN.registration.json` receipt binds all validated plan fields by hash; retain
+  it with the plan. Apply rejects changed settings/scope/binary; retry of an already
   exact installation is harmless. Edited, duplicate or partially missing owned
-  entries block removal instead of deleting customer changes.
+  entries block removal instead of deleting customer changes. Pre-receipt
+  experimental installations are not adopted automatically.
 - Setup/removal use a stable, nonblocking advisory lock and private fsynced atomic
   replacement, with an immediate pre-rename content check. Cooperating hooks hold
   a shared lock. Noncooperating editors cannot be made transactional: keep the
   host/settings editors quiescent. A crash leaves the old or complete new JSON;
-  retry apply, or inspect settings and retry removal if entries remain. A private
-  temporary file can survive a killed settings writer. Unrelated values/hooks
-  survive removal; restoration is JSON-semantic, not original whitespace/order.
-  The private plan, lock and collected outbox are intentionally retained.
+  retry apply or removal. Removal records its target hash before replacing settings
+  and retains a final removal receipt, so retry after the settings rename completes
+  without reinstalling hooks. A prepared-but-unapplied registration can be removed.
+  If settings change after an interrupted removal's rename, recovery fails closed
+  for inspection rather than guessing ownership. A private temporary file can
+  survive a killed writer. Unrelated values/hooks survive removal; restoration is
+  JSON-semantic, not original whitespace/order. The private plan, hash-only receipt,
+  lock and collected outbox are intentionally retained. Deterministic test-only
+  interruption seams cover durable transitions; no production fault switches exist.
 - The raw allowlist is applied before persistence. Only validated session,
   prompt/tool/child IDs, event-specific model/source/reason/tool name and a local
   observation timestamp survive. Actor is always unknown; incoming actor claims,
