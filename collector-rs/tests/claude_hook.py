@@ -347,6 +347,91 @@ class ClaudeHookTest(unittest.TestCase):
             if row["event"] != "SessionEnd":
                 self.assertNotIn("reason", row)
 
+    def test_fixture_resume_failure_child_correlation_and_repeated_starts(self):
+        # Synthetic hook contract only: no claim about interactive Claude behavior.
+        def emit(event, **fields):
+            self.hook(
+                dict(
+                    hook_event_name=event,
+                    session_id="parent-session",
+                    cwd=str(self.repo),
+                    **fields,
+                )
+            )
+
+        for source in ("startup", "resume", "resume"):
+            emit("SessionStart", source=source, model="fixture-model")
+        for _ in range(2):
+            emit("PreToolUse", tool_use_id="failed-read", tool_name="Read")
+            emit(
+                "PostToolUseFailure",
+                tool_use_id="failed-read",
+                tool_name="Read",
+                error="PRIVATE_SENTINEL",
+                tool_input={"path": "PRIVATE_SENTINEL"},
+            )
+            for child in ("child-a", "child-b"):
+                emit("SubagentStart", agent_id=child, agent_type="Explore")
+                emit(
+                    "PreToolUse",
+                    agent_id=child,
+                    tool_use_id="same-tool",
+                    tool_name="Read",
+                )
+                emit(
+                    "PostToolUse",
+                    agent_id=child,
+                    tool_use_id="same-tool",
+                    tool_name="Read",
+                )
+                emit("SubagentStop", agent_id=child, agent_type="Explore")
+            emit("Stop", prompt_id="turn-one")
+        rows = self.rows()
+        self.assertEqual(len(rows), 14)
+        self.assertEqual(
+            [r["source"] for r in rows if r["event"] == "SessionStart"],
+            ["startup", "resume", "resume"],
+        )
+        self.assertFalse(any(r["event"] == "SessionEnd" for r in rows))
+        for child in ("child-a", "child-b"):
+            child_rows = [r for r in rows if r.get("agent_id") == child]
+            self.assertEqual(
+                [r["event"] for r in child_rows],
+                ["SubagentStart", "PreToolUse", "PostToolUse", "SubagentStop"],
+            )
+            self.assertTrue(
+                all(r["session_id"] == "parent-session" for r in child_rows)
+            )
+        failed = [r for r in rows if r["event"] == "PostToolUseFailure"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["tool_use_id"], "failed-read")
+        self.assertTrue(
+            all(
+                not {"duration", "ended_at", "actor_ref", "error"} & r.keys()
+                for r in rows
+            )
+        )
+        emit("SessionEnd", reason="other")
+        self.assertEqual(len(self.rows()), 15)
+        for file in self.state.iterdir():
+            if file.is_file():
+                self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
+
+    def test_fixture_exception_cleanup_disables_later_lifecycle(self):
+        try:
+            self.hook(dict(self.raw, hook_event_name="SessionStart", source="startup"))
+            raise RuntimeError("synthetic host failure")
+        except RuntimeError:
+            pass
+        finally:
+            self.command("claude-remove", self.plan, "--consent")
+        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+        before = self.rows()
+        for event in EVENTS:
+            self.hook(dict(self.raw, hook_event_name=event))
+        self.assertEqual(self.rows(), before)
+        self.assertEqual([r["event"] for r in before], ["SessionStart"])
+
     def test_invalid_scope_and_payload_are_neutral(self):
         outside = self.root / "repo-other"
         outside.mkdir()
