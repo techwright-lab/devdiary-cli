@@ -1,0 +1,21 @@
+{
+  "actor_ref": null,
+  "agent_id": "child-1",
+  "attribution_basis": "unknown",
+  "delivery": "local_only",
+  "event": "SubagentStop",
+  "installation_id": "11111111-1111-4111-8111-111111111111",
+  "observation_id": "22222222-2222-4222-8222-222222222222",
+  "observed_at": 1720000000.123456,
+  "prompt": "PRIVATE-SENTINEL",
+  "repository": "/fixture/repo",
+  "runtime": "codex",
+  "schema_version": 1,
+  "session_id": "session-1",
+  "source_tag": "codex",
+  "tool_input": {
+    "secret": "PRIVATE-SENTINEL"
+  },
+  "tool_use_id": "tool-1",
+  "turn_id": "turn-1"
+}
