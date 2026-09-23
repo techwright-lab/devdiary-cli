@@ -21,8 +21,9 @@ change Git identity, declare named work, or affect human minute derivation.
 
 ## Experimental Rust collector (separate executable; Linux evidence only)
 
-`collector-rs` is an opt-in **normalized-metadata** vertical slice, not a raw
-Claude/Codex hook adapter or a replacement for Python. It reads the local observation
+`collector-rs` provides an opt-in **normalized-metadata** control path plus the
+separate Linux Claude raw-hook adapter below. It is not a Python replacement.
+The control path reads the local observation
 shape in `collector-rs/tests/fixtures/local-observation.json`: caller-owned UUIDs,
 exact repository/installation scope, numeric epoch `observed_at`, vendor IDs and
 `attribution_basis: unknown`. It rejects named actor claims; no identity inference.
@@ -30,7 +31,8 @@ Null optional fields are omitted like Python's upload projection. Timestamp conv
 uses decimal half-even rounding to UTC microseconds (years 1000–9999; earlier
 year padding differs across Python platforms and is refused). Unlisted/private fields are
 discarded before storage; IDs are validated, never repaired. Caller-assigned observation
-UUIDs provide replay identity; vendor hook dedup/UUID creation remains out of scope.
+UUIDs provide replay identity for the normalized control path; the Claude adapter
+creates observation IDs and applies vendor-correlation dedup before collection.
 
 ```sh
 cargo build --locked --manifest-path collector-rs/Cargo.toml
@@ -72,8 +74,9 @@ crash/response loss, and acknowledges only the exact Rails receipt. 401/403/429,
 No redirects or ambient proxies; verified TLS except exact loopback HTTP; each
 request has a five-second timeout including the response body. Exit 0 means the
 command succeeded, sync exit 1 means pending evidence remains, and exit 2 is a
-private/generic local error. This control executable is **not host-failure-neutral**;
-do not register it as a vendor hook. No daemon, live configuration, surveillance,
+private/generic local error. These control commands are **not host-failure-neutral**;
+never register `collect` as a vendor hook. Only `claude-hook` has the separate
+silent deadline/exit contract below. No daemon, live host qualification, surveillance,
 stock-tool qualification, native Windows support, signing/update/installer or
 Python retirement is included. Rails and human-minute attribution are unchanged.
 
@@ -99,6 +102,94 @@ disposable collector credential, tests actual response-loss replay and revocatio
 and leaves the isolated database for inspection. Drop only that test DB afterward.
 The regular Rust CI job runs the subprocess/HTTP conformance suite; it does not
 claim to run this cross-repository Rails gate.
+
+## Rust Claude raw-hook adapter: Linux fixture-qualified only
+
+This is a distinct `claude-hook PLAN` command, not registration of the normalized
+`collect` command. It accepts stock Claude command-hook stdin for SessionStart,
+UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop, SubagentStart,
+SubagentStop and SessionEnd, following `src/devdiary/observer_hook.py`. It uses
+only the existing isolated Rust outbox and explicit `sync`; it never invokes
+Python, reads a transcript, makes a network call, or reads provider credentials.
+
+**Qualification:** executable/shell fixtures, Python-reference metadata parity,
+local HTTP delivery, concurrency and failure tests are not a successful stock
+Claude session. No live Claude settings were changed to develop this slice.
+A separately consented smoke still requires an unmodified Claude installation,
+disposable HOME/settings/repository, the user's normal hook trust approval and
+provider authentication/usage approval. Verify real lifecycle/tool events,
+unknown attribution, ordinary host output, delivery and clean removal. Do not
+bypass a trust prompt or call this runtime-qualified before that gate. Windows
+is unsupported (the crate requires Unix); macOS is unqualified and this adapter
+refuses setup/collection outside Linux. Codex is deliberately deferred: its
+future adapter must implement its own events, turn/child correlation and exact
+host trust/setup contract rather than aliasing the Claude command.
+
+Example **disposable** setup, after reviewing and initializing the scope above:
+
+```sh
+cargo build --release --locked --manifest-path collector-rs/Cargo.toml
+# PRIVATE_INSTALL and REGISTRATION must already be owner-only absolute dirs.
+# SETTINGS must already be a private JSON object file in an owner-only directory;
+# explicitly create {} under umask 077 if it does not exist. Do not overwrite it.
+install -m 700 collector-rs/target/release/devdiary-collector "$PRIVATE_INSTALL/collector"
+COLLECTOR="$PRIVATE_INSTALL/collector"
+PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
+"$COLLECTOR" claude-plan "$RUST_STATE" "$SETTINGS" "$PLAN"
+# Review PLAN locally: exact scope, executable SHA-256, settings hash and hooks.
+# Stop Claude and other settings editors before applying/removing.
+"$COLLECTOR" claude-apply "$PLAN" --consent
+# Start Claude normally and approve its normal hook/trust UI yourself.
+"$COLLECTOR" status "$RUST_STATE"
+"$COLLECTOR" sync "$RUST_STATE" "$PRIVATE_COLLECTOR_KEY_FILE" 100
+"$COLLECTOR" claude-remove "$PLAN" --consent
+```
+
+- The executable is an absolute, owner-only native ELF file with private/trusted
+  ancestors, shell-quoted paths and a SHA-256 pin verified on apply and capture.
+  Symlinks, hardlinks and shared state/config permissions are refused, not repaired.
+  Updates require removal and a freshly reviewed plan; removal remains possible
+  after executable/spool failures. Same-UID processes remain trusted.
+- Plan and settings are bounded to 64 KiB. The plan stores only ownership, hashes
+  and scope, **not a copy of settings secrets**. Both mutations require explicit
+  `--consent`. Apply rejects changed settings/scope/binary; retry of an already
+  exact installation is harmless. Edited, duplicate or partially missing owned
+  entries block removal instead of deleting customer changes.
+- Setup/removal use a stable, nonblocking advisory lock and private fsynced atomic
+  replacement, with an immediate pre-rename content check. Cooperating hooks hold
+  a shared lock. Noncooperating editors cannot be made transactional: keep the
+  host/settings editors quiescent. A crash leaves the old or complete new JSON;
+  retry apply, or inspect settings and retry removal if entries remain. A private
+  temporary file can survive a killed settings writer. Unrelated values/hooks
+  survive removal; restoration is JSON-semantic, not original whitespace/order.
+  The private plan, lock and collected outbox are intentionally retained.
+- The raw allowlist is applied before persistence. Only validated session,
+  prompt/tool/child IDs, event-specific model/source/reason/tool name and a local
+  observation timestamp survive. Actor is always unknown; incoming actor claims,
+  prompts, transcripts, tool arguments/results and extra fields are discarded.
+  CWD must resolve to the exact consented repository or a descendant; sibling
+  worktrees and symlink escapes are excluded, without invoking Git.
+- The dedup tuple matches Python (installation, session, child, event, documented
+  correlation ID), represented as a deterministic UUID in this isolated spool.
+  The first committed bytes win, including their timestamp. Lifecycle events
+  without delivery IDs get random UUIDs: repeated starts/resumes/ends are not
+  collapsed. Stop remains a **turn** observation, not SessionEnd; no completion,
+  authorship, human minutes or duration is inferred. No binding support is added.
+- Raw stdin is capped at 64 KiB. A whole-process 700 ms watchdog covers stdin,
+  validation, filesystem and SQLite work; the registered command also has a
+  two-second host timeout. The command exits zero with no stdout/stderr on malformed
+  input, missing registration, timeout, lock/full-spool/permission failures or panic.
+  A shell neutralizer also silences missing/broken executable failures. OS-level
+  scheduling stalls remain outside an application deadline guarantee. Failed
+  captures are dropped, not retried by the hook: zero exit is **not** proof of
+  capture, and `status` counts are not a complete coverage/host-health signal.
+  Conservative capacity reservation remains unchanged (hundreds of retained rows).
+
+Additional Linux fixture gate:
+
+```sh
+PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
+```
 
 ## Explicit observer upload
 

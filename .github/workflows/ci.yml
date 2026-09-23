@@ -32,6 +32,8 @@ jobs:
         run: cargo +1.98.1 clippy --locked --manifest-path collector-rs/Cargo.toml --all-targets -- -D warnings
       - name: Python conformance and real subprocess HTTP
         run: PYTHONPATH=src python3 collector-rs/tests/conformance.py -v
+      - name: Claude raw-hook fixtures and reversible setup (not stock runtime)
+        run: PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
       - name: Dependency advisories
         run: |
           cargo +1.98.1 install cargo-audit --version 0.22.2 --locked

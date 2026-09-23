@@ -25,9 +25,28 @@ fn run() -> Result<i32> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() == 2 && args[1] == "--help" {
         println!(
-            "Experimental Linux collector; no vendor registration.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nSTATE must be an existing empty private absolute directory; never a Python spool."
+            "Experimental Linux collector; Claude adapter runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
         );
         return Ok(0);
+    }
+    match args.get(1).map(String::as_str) {
+        Some("claude-plan") if args.len() == 5 => {
+            devdiary_collector::claude::plan(
+                Path::new(&args[2]),
+                Path::new(&args[3]),
+                Path::new(&args[4]),
+            )?;
+            return Ok(0);
+        }
+        Some("claude-apply" | "claude-remove") if args.len() == 4 && args[3] == "--consent" => {
+            if args[1] == "claude-apply" {
+                devdiary_collector::claude::apply(Path::new(&args[2]))?;
+            } else {
+                devdiary_collector::claude::remove(Path::new(&args[2]))?;
+            }
+            return Ok(0);
+        }
+        _ => {}
     }
     let state = Path::new(args.get(2).ok_or("state_required")?);
     let counts = match args.get(1).map(String::as_str) {
@@ -52,6 +71,32 @@ fn run() -> Result<i32> {
     })
 }
 fn main() {
+    // Dispatch before fallible UTF-8 argument parsing or control diagnostics.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == "claude-hook")
+    {
+        std::panic::set_hook(Box::new(|_| {}));
+        // Whole-process deadline includes blocked stdin, filesystem and SQLite.
+        // No child is spawned and no worker can survive this process exit.
+        if std::thread::Builder::new()
+            .spawn(|| {
+                std::thread::sleep(Duration::from_millis(700));
+                std::process::exit(0);
+            })
+            .is_err()
+        {
+            std::process::exit(0);
+        }
+        let _ = std::panic::catch_unwind(|| -> Result<()> {
+            let args: Vec<_> = std::env::args_os().collect();
+            if args.len() != 3 {
+                return Ok(());
+            }
+            devdiary_collector::claude::hook(Path::new(&args[2]), &input()?)
+        });
+        std::process::exit(0);
+    }
     // Never print input, SQL, key paths/contents, URLs or server error bodies.
     let code = match run() {
         Ok(code) => code,
