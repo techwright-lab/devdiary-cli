@@ -4,10 +4,9 @@ compile_error!("This experimental collector currently requires Unix private-file
 
 pub mod store;
 use chrono::{DateTime, Datelike, Utc};
-use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde::de::{MapAccess, Visitor};
 use serde_json::{Map, Value};
-use std::{fmt, str::FromStr};
+use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub const MAX_INPUT: usize = 65536;
@@ -182,12 +181,7 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
         .get("observed_at")
         .filter(|v| v.is_number())
         .ok_or("invalid_timestamp")?;
-    let micros = Decimal::from_str(&n.to_string())?
-        .checked_mul(Decimal::from(1_000_000))
-        .ok_or("invalid_timestamp")?
-        .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
-        .to_i64()
-        .ok_or("invalid_timestamp")?;
+    let micros = decimal_micros(&n.to_string())?;
     let time = DateTime::<Utc>::from_timestamp_micros(micros).ok_or("invalid_timestamp")?;
     // Python strftime's sub-1000 year padding varies by platform. This slice
     // refuses that historical range rather than freezing different wire bytes.
@@ -210,6 +204,53 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
         return Err("wire_too_large".into());
     }
     Ok(bytes)
+}
+
+// Input is serde_json's validated, round-trip numeric spelling, matching the
+// Python reference's Decimal(str(number)), not binary float multiplication.
+// Move the decimal point logically: never materialize exponent-sized integers
+// or impose a fixed decimal scale. Only the bounded integer microseconds are
+// accumulated; discarded digits decide exact half-even rounding.
+fn decimal_micros(number: &str) -> Result<i64> {
+    let negative = number.starts_with('-');
+    let magnitude = number.strip_prefix('-').unwrap_or(number);
+    let (coefficient, exponent) = match magnitude.split_once(['e', 'E']) {
+        Some((coefficient, exponent)) => (coefficient, exponent.parse::<i32>()?),
+        None => (magnitude, 0),
+    };
+    let whole = coefficient.find('.').unwrap_or(coefficient.len()) as i32;
+    let digits: Vec<u8> = coefficient.bytes().filter(|b| *b != b'.').collect();
+    let point = whole + exponent + 6;
+    if point < 0 {
+        return Ok(0);
+    }
+    // An i64 has at most 19 decimal digits. No accepted timestamp can be
+    // larger; range rejection happens before loops proportional to exponent.
+    if point > 19 {
+        return Err("invalid_timestamp".into());
+    }
+    let point = point as usize;
+    let mut micros = 0_u64;
+    for i in 0..point {
+        let digit = digits.get(i).copied().unwrap_or(b'0') - b'0';
+        micros = micros
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(digit)))
+            .ok_or("invalid_timestamp")?;
+    }
+    if let Some(&first) = digits.get(point) {
+        let above_half =
+            first > b'5' || (first == b'5' && digits[point + 1..].iter().any(|b| *b != b'0'));
+        if above_half || (first == b'5' && micros % 2 == 1) {
+            micros = micros.checked_add(1).ok_or("invalid_timestamp")?;
+        }
+    }
+    let signed = if negative {
+        -i128::from(micros)
+    } else {
+        i128::from(micros)
+    };
+    Ok(i64::try_from(signed)?)
 }
 
 pub fn receipt(raw: &[u8], payload: &[u8], collector: &str) -> Result<Object> {

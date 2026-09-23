@@ -70,6 +70,25 @@ fn python_frozen_bytes_and_rails_receipt() {
 }
 
 #[test]
+fn shared_python_decimal_timestamp_goldens() {
+    let config = scope(include_bytes!("fixtures/scope.json")).unwrap();
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_slice(include_bytes!("fixtures/timestamps.json")).unwrap();
+    for case in cases {
+        let mut row: serde_json::Value =
+            serde_json::from_slice(include_bytes!("fixtures/local-observation.json")).unwrap();
+        row["observed_at"] = case["observed_at"].clone();
+        let actual = freeze(&serde_json::to_vec(&row).unwrap(), &config);
+        if case["timestamp"].is_null() {
+            assert!(actual.is_err(), "{case}");
+        } else {
+            let wire: serde_json::Value = serde_json::from_slice(&actual.unwrap()).unwrap();
+            assert_eq!(wire["observed_at"], case["timestamp"], "{case}");
+        }
+    }
+}
+
+#[test]
 fn refuses_scope_and_identity_coercion() {
     let config = scope(include_bytes!("fixtures/scope.json")).unwrap();
     let original = include_str!("fixtures/local-observation.json");

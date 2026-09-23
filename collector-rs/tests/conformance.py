@@ -122,9 +122,14 @@ class CollectorTest(unittest.TestCase):
         return row
 
     def test_python_conformance_timestamp_null_and_vendor_ids(self):
-        for i, timestamp in enumerate(
-            [1720000000.123456, 0, -0.0000005, 0.0000015, 0.9999995, -1.1234565]
-        ):
+        cases = json.loads((FIXTURES / "timestamps.json").read_bytes())
+        for i, case in enumerate(cases):
+            timestamp = case["observed_at"]
+            if case["timestamp"] is None:
+                self.call(
+                    "collect", data={**self.row, "observed_at": timestamp}, code=2
+                )
+                continue
             row = self.collect(i, observed_at=timestamp, prompt_id=None)
             projected = {
                 k: v
@@ -132,6 +137,7 @@ class CollectorTest(unittest.TestCase):
                 if k in observer_upload.FIELDS and v is not None
             }
             expected = observer_upload.envelope(projected, self.config)
+            self.assertEqual(json.loads(expected)["observed_at"], case["timestamp"])
             actual = (
                 self.db()
                 .execute(
@@ -167,24 +173,43 @@ class CollectorTest(unittest.TestCase):
         large = {
             key: "x" * 130
             for key in (
-                "prompt_id", "turn_id", "tool_use_id", "agent_id", "agent_type",
-                "model", "tool_name", "source", "reason",
+                "prompt_id",
+                "turn_id",
+                "tool_use_id",
+                "agent_id",
+                "agent_type",
+                "model",
+                "tool_name",
+                "source",
+                "reason",
             )
         }
         accepted = {}
+        row = self.row
         for number in range(10001):
-            row = {**self.row, **large,
-                   "observation_id": f"{number:08d}-2222-4222-8222-222222222222"}
+            row = {
+                **self.row,
+                **large,
+                "observation_id": f"{number:08d}-2222-4222-8222-222222222222",
+            }
             result = subprocess.run(
                 [str(BIN), "collect", str(self.state)],
-                input=json.dumps(row).encode(), capture_output=True, timeout=9,
+                input=json.dumps(row).encode(),
+                check=False,
+                capture_output=True,
+                timeout=9,
             )
             if result.returncode:
                 self.assertEqual(result.returncode, 2, result.stderr)
                 break
-            projected = {k: v for k, v in row.items()
-                         if k in observer_upload.FIELDS and v is not None}
-            accepted[row["observation_id"]] = observer_upload.envelope(projected, self.config)
+            projected = {
+                k: v
+                for k, v in row.items()
+                if k in observer_upload.FIELDS and v is not None
+            }
+            accepted[row["observation_id"]] = observer_upload.envelope(
+                projected, self.config
+            )
         count = len(accepted)
         self.assertGreater(count, 100)
         self.assertLess(count, 10000)  # byte capacity, not the row-count guard
@@ -198,14 +223,23 @@ class CollectorTest(unittest.TestCase):
         self.mode = "wrong"
         for _ in range((count + 99) // 100):
             self.call("sync", self.key, 100, code=1)
-        self.assertEqual(db.execute(
-            "SELECT count(*) FROM outbox WHERE failure='invalid_receipt'"
-        ).fetchone()[0], count)
+        self.assertEqual(
+            db.execute(
+                "SELECT count(*) FROM outbox WHERE failure='invalid_receipt'"
+            ).fetchone()[0],
+            count,
+        )
         self.mode = "ok"
         for remaining in range(count, 0, -100):
             self.call("sync", self.key, 100, code=int(remaining > 100))
         self.call("status")  # another process/reopen after full drain
-        rows = db.execute("SELECT observation_id,payload,delivered,receipt,failure FROM outbox").fetchall()
+        self.call(
+            "collect", data=row, code=2
+        )  # delivered evidence still reserves capacity
+        self.collect(0, **large)  # an exact retry remains idempotent at capacity
+        rows = db.execute(
+            "SELECT observation_id,payload,delivered,receipt,failure FROM outbox"
+        ).fetchall()
         self.assertEqual(len(rows), count)
         for observation_id, payload, delivered, raw_receipt, failure in rows:
             self.assertEqual(payload, accepted[observation_id])
@@ -213,9 +247,15 @@ class CollectorTest(unittest.TestCase):
             self.assertIsNone(failure)
             observer_upload.receipt(raw_receipt, payload, self.config["collector_ref"])
         self.assertLessEqual(db.execute("PRAGMA page_count").fetchone()[0], 4096)
-        self.assertLessEqual((self.state / "collector-rust-v1.sqlite3").stat().st_size, 16 * 1024 * 1024)
+        self.assertLessEqual(
+            (self.state / "collector-rust-v1.sqlite3").stat().st_size, 16 * 1024 * 1024
+        )
         for raw, _ in self.requests:
             self.assertEqual(raw, accepted[json.loads(raw)["observation_id"]])
+        print(
+            f"capacity regression: {count} accepted, {count} acknowledged; "
+            f"{db.execute('PRAGMA page_count').fetchone()[0]} physical pages <=4096"
+        )
 
     def test_response_loss_exact_replay_and_dedup(self):
         self.collect()
