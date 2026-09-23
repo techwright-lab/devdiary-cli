@@ -30,6 +30,7 @@ class QualificationTest(unittest.TestCase):
             with self.assertRaisesRegex(q.GateError, "managed_policy_requires_review"):
                 q.check_managed_policy(home, system)
             policy.unlink()
+            dropins.rmdir()
             # Even no on-disk policy does not prove current/cached remote absence.
             with self.assertRaisesRegex(q.GateError, "remote_managed_policy_unverified"):
                 q.check_managed_policy(home, system)
