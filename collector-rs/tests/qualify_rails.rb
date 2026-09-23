@@ -13,7 +13,16 @@ raise "test required" unless ENV["RAILS_ENV"] == "test"
 url = URI(ENV.fetch("DATABASE_URL"))
 raise "isolated database required" unless url.host == "127.0.0.1" && url.path.match?(%r{\A/devdiary_rust_collector_interop_[0-9a-f]{32}\z})
 root = Pathname.new(ENV.fetch("QUALIFICATION_ROOT"))
+require File.join(Dir.pwd, "config/boot")
+require_relative "qualification_database"
+database_guard = QualificationDatabase.new(ENV.fetch("DATABASE_URL"))
+database_guard.install!
 require File.join(Dir.pwd, "config/environment")
+# No rake schema task: it may enumerate extra configs or establish a new target.
+# Validate the real resolver AND connected application in the same Ruby process.
+database_guard.verify_application!
+load File.join(Dir.pwd, "db/schema.rb")
+database_guard.verify_application!
 require "factory_bot_rails"
 require "webmock"
 require "puma"

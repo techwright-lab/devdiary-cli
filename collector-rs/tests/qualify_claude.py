@@ -409,12 +409,6 @@ def rails_interop(args, root, env, report):
         created = True
         run(["createdb", *pg, name], env=renv)
         run(
-            ["bundle", "exec", "rails", "db:schema:load"],
-            cwd=args.rails_checkout,
-            env=renv,
-            timeout=120,
-        )
-        run(
             ["bundle", "exec", "ruby", HERE / "qualify_rails.rb"],
             cwd=args.rails_checkout,
             env=renv,
