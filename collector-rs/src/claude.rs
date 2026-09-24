@@ -107,7 +107,7 @@ fn lock(settings: &Path, shared: bool) -> Result<File> {
 }
 // Settings are rewritten, unlike discarded hook payloads. Refuse duplicate
 // keys at every depth rather than silently deleting unrelated customer data.
-struct UniqueKeys;
+pub(crate) struct UniqueKeys;
 impl<'de> serde::Deserialize<'de> for UniqueKeys {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
         struct Check;
@@ -489,6 +489,30 @@ pub fn apply(plan_path: &Path) -> Result<()> {
     checkpoint("applied_settings")?;
     m.insert("status".into(), json!("installed"));
     save_manifest(plan_path, &m)
+}
+/// Read-only local evidence, never a statement of effective host trust/policy.
+pub fn registration_status(plan_path: &Path, state: &Path) -> Result<Object> {
+    let p = load(plan_path)?;
+    if Path::new(text(&p, "state")?) != state {
+        return Err("scope_changed".into());
+    }
+    let (_, doc) = settings(Path::new(text(&p, "settings")?))?;
+    let status = if manifest_path(plan_path).exists() {
+        let m = manifest(plan_path, &p)?;
+        let status = text(&m, "status")?;
+        if status == "installed" && owned(&doc, &p["entry"]).is_err() {
+            "changed".to_owned()
+        } else {
+            status.to_owned()
+        }
+    } else {
+        "planned_not_applied".to_owned()
+    };
+    object(&serde_json::to_vec(&json!({
+        "registration": status,
+        "target_settings_block": doc.get("disableAllHooks") == Some(&json!(true))
+            || doc.get("allowManagedHooksOnly") == Some(&json!(true))
+    }))?)
 }
 pub fn remove(plan_path: &Path) -> Result<()> {
     let p = load(plan_path)?;

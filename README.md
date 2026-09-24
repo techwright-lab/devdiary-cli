@@ -103,6 +103,95 @@ and leaves the isolated database for inspection. Drop only that test DB afterwar
 The regular Rust CI job runs the subprocess/HTTP conformance suite; it does not
 claim to run this cross-repository Rails gate.
 
+## Customer browser pairing (experimental Linux client)
+
+Requires the backend contract in [DevDiary PR #571](https://github.com/techwright-lab/DevDiary/pull/571)
+**merged and deployed separately**. This client PR does not deploy/enable it. The
+ordinary origin is `https://devdiary.me`; no manual collector ref, ingest endpoint,
+installation UUID or credential file contents are needed. This is DevDiary-specific
+browser approval, not OAuth/device authorization.
+
+```sh
+# Build/install the native binary privately as described below. Choose a private
+# directory OUTSIDE source control; its parent must already be owner-only.
+CONNECTION="$HOME/.config/devdiary/customer-project"
+"$COLLECTOR" setup "$CONNECTION" "$REPO"
+# Multiple distinct GitHub remotes? Repeat with --remote origin (or your choice).
+# Paste the displayed one-time code into the browser, choose the matching active
+# workspace repository, and explicitly approve metadata collection.
+
+# Approval saves a credential but DOES NOT touch Claude settings.
+# SETTINGS must be an existing private JSON file; do not overwrite customer data.
+"$COLLECTOR" setup-plan "$CONNECTION" "$SETTINGS" "$PLAN"
+# Review the private plan: repository, executable/hash, settings hash, hook entries.
+# Stop concurrent settings editors; consent separately to the exact local changes:
+"$COLLECTOR" claude-apply "$PLAN" --consent
+# Use ordinary Claude with its normal trust/organization policy. No bypass flags.
+"$COLLECTOR" connection-status "$CONNECTION" "$PLAN"
+"$COLLECTOR" connection-sync "$CONNECTION" 100
+"$COLLECTOR" claude-remove "$PLAN" --consent
+```
+
+- `setup` creates a 0700 connection directory under an existing private parent.
+  It pins the installation UUID, exact origin, local root and canonical GitHub
+  scope **before** starting HTTP. Only local read-only Git commands are run: no
+  fetch, credential helper, shell, alias/URL rewrite or global identity changes.
+  SSH/scp/HTTPS GitHub remotes map to exact canonical URLs; ambiguity needs
+  `--remote NAME`, and other hosts/aliases/query paths are refused, not guessed.
+- Verified TLS, no redirect following, no ambient proxy use, bounded responses and
+  five-second request deadlines. Alternate origins require both `--origin ORIGIN`
+  and `--trust-origin`; HTTP is accepted only for numeric loopback development.
+  `--no-browser` prints the same constant browser URL instead of opening it.
+  Neither approval code nor pairing/collector bearer is ever put in a URL, child
+  argument, environment variable, vendor settings or diagnostic. Only the user
+  code is displayed for pasting; do not capture/share terminal logs containing it.
+- Polling waits the advertised interval (at least five seconds), honors integer
+  `Retry-After`, and stops at expiry. Start-rate cooldowns survive process restart.
+  Ctrl-C leaves no hooks and no persisted pairing bearer. If exchange might have
+  consumed the credential (network loss, interruption, terminal response, failed
+  persistence), inspect/revoke unused connections in the browser, then repeat with
+  **`--new-pair`**. There is no secret replay/recovery endpoint. The same pinned
+  installation is reused. If `connection.json` was committed, ordinary `setup`
+  resumes local initialization without issuing another credential.
+- `connection.json` atomically commits the token and frozen scope together (0600,
+  fsync, no overwrite); credentials stay outside `outbox/`. Do not print or commit
+  it. A killed writer can leave a private `.pairing-*.tmp`; these are not adopted
+  as credentials. An existing connection cannot be re-paired/retargeted, even
+  after delivery. For another scope use a new directory and preserve old outboxes;
+  revocation is server-side. This slice does not implement credential rotation.
+- `setup-plan` rechecks the approved local Git remote and uses the existing
+  reversible ownership-preserving planner. Plan/apply are separate explicit
+  actions; browser approval never supplies local hook consent or Claude trust.
+  Organization policy is respected, not deleted or bypassed. Ordinary customer
+  integration does **not** require proving policy absence. Health reports host
+  trust/effective managed policy as unknown, and only reports a target-file block
+  when inspected settings explicitly disable hooks or allow managed hooks only.
+- Health separates saved connection, local registration evidence (when PLAN is
+  supplied), observed/pending counts and deliveries with validated receipts.
+  Zero observations is not proof of host coverage. Current server revocation and
+  last receipt are shown by the browser, not invented from local registration.
+  Unknown attribution remains unknown; no authorship or human minutes change.
+
+Verification:
+
+```sh
+python3 collector-rs/tests/pairing.py -v  # mock transport/subprocess fixtures
+# Optional actual Rails HTTP/PostgreSQL: reviewed credential-free server checkout,
+# installed test bundle/Ruby on PATH, local CREATE/DROP test role. No vendor run.
+python3 collector-rs/tests/pairing_rails.py \
+  --rails-checkout "$REVIEWED_RAILS_CHECKOUT" --collector "$COLLECTOR"
+```
+
+The real interop harness uses an owned, random, verified-absent loopback database,
+retains the database-target guard through schema/migrations/fixtures, and verifies
+DROP in the parent even on failure. It performs actual Rust pairing/exchange and
+scoped ingest against Puma/Rails; only login is a Warden test fixture. Browser
+approval uses real cookies and CSRF (missing token rejected); lost exchange requires
+new pairing, lost ingest response replays exact bytes with one remote record, and
+scope/actor changes are rejected. Disposable plan/apply/remove preserves settings.
+This is **fixture-driven application interoperability**, not live stock-Claude
+qualification. The stricter qualification harness below remains blocked, unchanged.
+
 ## Rust Claude raw-hook adapter: Linux fixture-qualified only
 
 This is a distinct `claude-hook PLAN` command, not registration of the normalized
