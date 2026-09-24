@@ -32,6 +32,7 @@ jobs:
           ruby collector-rs/tests/qualification_safety_test.rb
           ruby collector-rs/tests/qualification_cleanup_test.rb
           ruby -c collector-rs/tests/qualify_rails.rb
+          ruby -c collector-rs/tests/pairing_rails.rb
 
   rust-collector:
     name: Rust collector (Linux experimental)
@@ -53,6 +54,10 @@ jobs:
         run: PYTHONPATH=src python3 collector-rs/tests/conformance.py -v
       - name: Claude raw-hook fixtures and reversible setup (not stock runtime)
         run: PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
+      - name: Customer pairing transport and setup fixtures (not Rails or runtime)
+        run: |
+          python3 collector-rs/tests/pairing.py -v
+          python3 collector-rs/tests/pairing_rails_test.py -v
       - name: Qualification harness control-flow fixtures (no provider calls)
         run: python3 collector-rs/tests/qualification_test.py -v
       - name: Dependency advisories

@@ -246,17 +246,19 @@ fn credential(path: &Path) -> Result<String> {
 }
 
 pub fn sync(state: &Path, key_path: &Path, limit: usize) -> Result<(i64, i64)> {
+    // Compatibility entrypoint for existing manually provisioned credentials.
+    if key_path.starts_with(state) {
+        return Err("separate_credential_required".into());
+    }
+    sync_key(state, &credential(key_path)?, limit)
+}
+pub(crate) fn sync_key(state: &Path, key: &str, limit: usize) -> Result<(i64, i64)> {
     if !(1..=100).contains(&limit) {
         return Err("invalid_limit".into());
     }
     state_check(state)?;
-    // Do not accept a credential inside the spool, or persist its locator.
-    if key_path.starts_with(state) {
-        return Err("separate_credential_required".into());
-    }
     let lock = create_private(&state.join("sync.lock"))?;
     lock.try_lock()?;
-    let key = credential(key_path)?;
     let store = Store::open(state, None)?;
     let url = store.config["endpoint"]
         .as_str()
@@ -277,7 +279,7 @@ pub fn sync(state: &Path, key_path: &Path, limit: usize) -> Result<(i64, i64)> {
         store
             .db
             .execute("UPDATE scope SET cursor=? WHERE singleton=1", [seq])?;
-        let outcome = post(&client, url, &key, &payload, collector);
+        let outcome = post(&client, url, key, &payload, collector);
         match outcome {
             Ok(r) => {
                 store.db.execute(
