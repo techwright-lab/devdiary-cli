@@ -30,6 +30,9 @@ const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INT
 const MARKS_TABLE: &str = "CREATE TABLE IF NOT EXISTS bracket_marks (session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, checkout_key TEXT NOT NULL, offset INTEGER NOT NULL, ino INTEGER NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, PRIMARY KEY(session_id, tool_use_id)) WITHOUT ROWID;";
 const MARK_TTL_NANOS: i64 = 6 * 3_600_000_000_000;
 const MAX_MARKS: i64 = 256;
+// Claude Code's Bash tool cannot run longer than this, so an unclosed mark
+// older than it is a denied or interrupted call, not one still running.
+const MAX_BASH_NANOS: i64 = 600_000_000_000;
 
 fn trusted_ancestors(path: &Path) -> Result<()> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -49,22 +52,24 @@ fn trusted_ancestors(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn owned_by_us(path: &Path, directory: bool, forbidden_mode: u32) -> bool {
-    fs::metadata(path).is_ok_and(|m| {
-        m.uid() == rustix::process::geteuid().as_raw()
-            && m.mode() & forbidden_mode == 0
-            && if directory {
-                m.is_dir()
-            } else {
-                m.is_file() && m.nlink() == 1
-            }
-    })
+fn owned_by_us(path: &Path, directory: bool, forbidden_mode: u32) -> std::io::Result<bool> {
+    let m = fs::metadata(path)?;
+    if m.nlink() == 0 {
+        return Err(std::io::ErrorKind::NotFound.into());
+    }
+    Ok(m.uid() == rustix::process::geteuid().as_raw()
+        && m.mode() & forbidden_mode == 0
+        && if directory {
+            m.is_dir()
+        } else {
+            m.is_file() && m.nlink() == 1
+        })
 }
 // The same UID is trusted, as in the Python reference. Never follow symlink
 // ancestors; reject shared permissions/hardlinks rather than repairing them.
 pub fn private(path: &Path, directory: bool) -> Result<()> {
     trusted_ancestors(path)?;
-    if !owned_by_us(path, directory, 0o077) {
+    if !owned_by_us(path, directory, 0o077)? {
         return Err("private_state_required".into());
     }
     Ok(())
@@ -73,7 +78,7 @@ pub fn private(path: &Path, directory: bool) -> Result<()> {
 // anyone but the owner, hardlinks and symlinks are refused.
 pub fn owner_writable(path: &Path, directory: bool) -> Result<()> {
     trusted_ancestors(path)?;
-    if !owned_by_us(path, directory, 0o022) {
+    if !owned_by_us(path, directory, 0o022)? {
         return Err("unsafe_settings".into());
     }
     Ok(())
@@ -278,14 +283,15 @@ impl Store {
             ],
         )?;
         tx.execute(
-            "DELETE FROM bracket_marks WHERE (session_id,tool_use_id) IN (SELECT session_id,tool_use_id FROM bracket_marks ORDER BY opened_at DESC LIMIT -1 OFFSET ?)",
+            "DELETE FROM bracket_marks WHERE (session_id,tool_use_id) IN (SELECT session_id,tool_use_id FROM bracket_marks m ORDER BY (closed_at IS NULL OR EXISTS (SELECT 1 FROM bracket_marks o WHERE o.checkout_key=m.checkout_key AND o.closed_at IS NULL AND o.opened_at<=m.closed_at)) DESC, opened_at DESC LIMIT -1 OFFSET ?)",
             [MAX_MARKS],
         )?;
         tx.commit()?;
         Ok(())
     }
     /// Closed marks stay until pruned so a bracket that closes later still
-    /// counts this one as overlapping. Overlap is capped at the wire maximum.
+    /// counts this one as overlapping. Only other sessions are overlap: one
+    /// session's parallel calls are a single claim. Capped at the wire maximum.
     pub fn close_bracket(&self, bracket: &Bracket, at: i64) -> Result<Option<(Mark, u64)>> {
         let tx = self.db.unchecked_transaction()?;
         prune_marks(&tx, at)?;
@@ -303,8 +309,8 @@ impl Store {
         let result = match open {
             Some((key, offset, ino, opened_at)) if key == bracket.checkout_key => {
                 let overlap: i64 = tx.query_row(
-                    "SELECT count(*) FROM bracket_marks WHERE checkout_key=? AND NOT (session_id=? AND tool_use_id=?) AND opened_at<=? AND (closed_at IS NULL OR closed_at>=?)",
-                    params![key, bracket.session_id, bracket.tool_use_id, at, opened_at],
+                    "SELECT count(*) FROM bracket_marks WHERE checkout_key=? AND session_id<>? AND opened_at<=? AND (closed_at>=? OR (closed_at IS NULL AND opened_at>=?))",
+                    params![key, bracket.session_id, at, opened_at, opened_at - MAX_BASH_NANOS],
                     |r| r.get(0),
                 )?;
                 let mark = Mark {
@@ -913,6 +919,94 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn an_open_bracket_outlives_the_mark_cap() {
+        let (_dir, store) = store();
+        let long = bracket("long", "t", "k");
+        store.open_bracket(&long, MARK, HOUR).unwrap();
+        let inside = bracket("inside", "t", "k");
+        store.open_bracket(&inside, MARK, HOUR).unwrap();
+        store.close_bracket(&inside, HOUR).unwrap();
+        for i in 0..MAX_MARKS {
+            let tool = format!("t{i}");
+            let other = bracket("busy", &tool, "other");
+            store.open_bracket(&other, MARK, HOUR + 1 + i).unwrap();
+            store.close_bracket(&other, HOUR + 1 + i).unwrap();
+        }
+        let short = bracket("short", "t", "k");
+        store.open_bracket(&short, MARK, HOUR + 1000).unwrap();
+        assert_eq!(
+            store.close_bracket(&short, HOUR + 1001).unwrap(),
+            Some((MARK, 1))
+        );
+        assert_eq!(
+            store.close_bracket(&long, HOUR + 1002).unwrap(),
+            Some((MARK, 2))
+        );
+    }
+
+    #[test]
+    fn brackets_of_the_same_session_are_not_overlap() {
+        let (_dir, store) = store();
+        let status = bracket("s", "status", "k");
+        let commit = bracket("s", "commit", "k");
+        store.open_bracket(&status, MARK, 10).unwrap();
+        store.open_bracket(&commit, MARK, 20).unwrap();
+        assert_eq!(store.close_bracket(&commit, 30).unwrap(), Some((MARK, 0)));
+        assert_eq!(store.close_bracket(&status, 40).unwrap(), Some((MARK, 0)));
+    }
+
+    #[test]
+    fn an_unclosed_mark_counts_only_while_its_call_could_still_run() {
+        let (_dir, store) = store();
+        store
+            .open_bracket(&bracket("denied", "t", "k"), MARK, HOUR)
+            .unwrap();
+        let soon = bracket("soon", "t", "k");
+        store
+            .open_bracket(&soon, MARK, HOUR + MAX_BASH_NANOS)
+            .unwrap();
+        assert_eq!(
+            store
+                .close_bracket(&soon, HOUR + MAX_BASH_NANOS + 1)
+                .unwrap(),
+            Some((MARK, 1))
+        );
+        let later = bracket("later", "t", "k");
+        store
+            .open_bracket(&later, MARK, HOUR + MAX_BASH_NANOS + 2)
+            .unwrap();
+        assert_eq!(
+            store
+                .close_bracket(&later, HOUR + MAX_BASH_NANOS + 3)
+                .unwrap(),
+            Some((MARK, 0))
+        );
+    }
+
+    #[test]
+    fn a_journal_that_vanishes_during_the_state_check_is_harmless() {
+        let (dir, _store) = store();
+        let state = dir.path().join("state");
+        let journal = state.join("collector-rust-v1.sqlite3-journal");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let (journal, stop) = (journal.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    drop(create_private(&journal));
+                    drop(fs::remove_file(&journal));
+                }
+            })
+        };
+        let failures = (0..5_000)
+            .filter_map(|_| state_check(&state).err().map(|e| e.to_string()))
+            .collect::<Vec<_>>();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+        assert_eq!(failures, Vec::<String>::new());
     }
 
     #[test]

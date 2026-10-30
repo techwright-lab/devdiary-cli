@@ -1165,6 +1165,19 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.assertEqual(row["repository_ref"], "https://github.com/acme/demo")
         self.assertFalse({"orchestrator", "orchestrator_agent_ref"} & row.keys())
 
+    def test_a_v1_wire_never_marks_or_links_commits(self):
+        self.connect(versions=(1,))
+        self.hook(self.main, "commit", event="PreToolUse")
+        Path(self.main / "file").write_text("x")
+        git("-C", self.main, "add", "file")
+        git("-C", self.main, "commit", "-q", "-m", "change")
+        self.hook(self.main, "commit")
+        for row in self.rows():
+            self.assertFalse({"commits", "overlap_count", "commit_gap"} & row.keys())
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            (marks,) = db.execute("SELECT count(*) FROM bracket_marks").fetchone()
+        self.assertEqual(marks, 0)
+
     def test_out_of_scope_hook_p99_on_the_release_build(self):
         release = ROOT / "target/release/devdiary-collector"
         if not release.exists():
@@ -1198,11 +1211,11 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
         super().setUp()
         self.connect()
 
-    def post(self, tool_use_id, session="session-1"):
+    def post(self, tool_use_id, session="session-1", event="PostToolUse"):
         (row,) = [
             r
             for r in self.rows()
-            if r["event"] == "PostToolUse"
+            if r["event"] == event
             and r["tool_use_id"] == tool_use_id
             and r["session_id"] == session
         ]
@@ -1260,6 +1273,27 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
         self.assert_captured(row, [self.head()])
         self.assertEqual(self.drops(), {})
 
+    def test_revert_and_a_non_fast_forward_merge_emit_their_sha(self):
+        self.change()
+        revert = lambda: git("-C", self.main, "revert", "--no-edit", "HEAD")
+        self.assert_captured(self.bracket(self.main, "revert", revert), [self.head()])
+        git("-C", self.main, "checkout", "-q", "-b", "side", "HEAD~1")
+        self.change(name="side")
+        git("-C", self.main, "checkout", "-q", "-")
+        merge = lambda: git(
+            "-C", self.main, "merge", "-q", "--no-ff", "--no-edit", "side"
+        )
+        self.assert_captured(self.bracket(self.main, "merge", merge), [self.head()])
+
+    def test_a_failed_bash_call_still_closes_its_bracket(self):
+        self.hook(self.main, "failed", event="PreToolUse")
+        sha = self.change()
+        self.hook(self.main, "failed", event="PostToolUseFailure")
+        self.assert_captured(self.post("failed", event="PostToolUseFailure"), [sha])
+        self.assertEqual(self.marks(), ["failed"])
+        self.hook(self.main, "failed")
+        self.assert_nothing(self.post("failed"))
+
     def test_checkout_reset_and_fast_forward_merge_emit_none(self):
         self.change()
         git("-C", self.main, "checkout", "-q", "-b", "ahead")
@@ -1301,6 +1335,40 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
         self.assertIn(second, b["commits"])
         self.assertGreaterEqual(a["overlap_count"], 1)
         self.assertGreaterEqual(b["overlap_count"], 1)
+
+    def test_parallel_calls_in_one_session_are_not_overlap(self):
+        self.hook(self.main, "status", event="PreToolUse")
+        row = self.bracket(self.main, "commit", lambda: self.change())
+        self.hook(self.main, "status")
+        self.assert_captured(row, [self.head()])
+
+    def test_an_unclosed_call_from_another_session_stops_counting_after_10_minutes(
+        self,
+    ):
+        self.hook(self.main, "denied", event="PreToolUse", session="session-x")
+        row = self.bracket(self.main, "soon", lambda: self.change(name="soon"))
+        self.assert_captured(row, [self.head()], overlap=1)
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            db.execute(
+                "UPDATE bracket_marks SET opened_at = opened_at - ? WHERE tool_use_id = 'denied'",
+                (HOUR_NS // 6 + 1,),
+            )
+        row = self.bracket(self.main, "later", lambda: self.change(name="later"))
+        self.assert_captured(row, [self.head()])
+
+    def test_concurrent_brackets_on_one_checkout_drop_nothing(self):
+        sessions = [f"session-{i}" for i in range(24)]
+        with concurrent.futures.ThreadPoolExecutor(len(sessions)) as pool:
+            for event in ("PreToolUse", "PostToolUse"):
+                calls = [
+                    pool.submit(self.hook, self.main, "t", event=event, session=s)
+                    for s in sessions
+                ]
+                for call in calls:
+                    call.result()
+        self.assertEqual(self.drops(), {})
+        self.assertEqual(len(self.rows()), 2 * len(sessions))
+        self.assertEqual(len(self.marks()), len(sessions))
 
     def test_sibling_worktrees_each_get_only_their_own_sha(self):
         left, right = self.root / "left", self.root / "right"
@@ -1426,6 +1494,26 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
             f"bracket hook latency with a 10k-line reflog: {max(timings) * 1000:.1f} ms"
         )
         self.assertLess(max(timings), 0.700)
+
+    def test_nearly_64_kib_appended_inside_the_bracket_stays_under_700_ms(self):
+        head, now = self.head(), int(time.time())
+        line = (
+            f"{head} {head} t <t@t.invalid> {now} +0000\tcheckout: moving from a to b\n"
+        )
+
+        def busy():
+            with open(self.main / ".git/logs/HEAD", "a") as log:
+                log.write(line * ((63 * 1024) // len(line)))
+            return self.change()
+
+        self.hook(self.main, "busy", event="PreToolUse")
+        sha = busy()
+        before = time.perf_counter()
+        self.hook(self.main, "busy")
+        elapsed = time.perf_counter() - before
+        self.assert_captured(self.post("busy"), [sha])
+        print(f"bracket hook latency reading ~63 KiB appended: {elapsed * 1000:.1f} ms")
+        self.assertLess(elapsed, 0.700)
 
 
 if __name__ == "__main__":
