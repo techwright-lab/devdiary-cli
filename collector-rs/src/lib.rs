@@ -5,9 +5,12 @@ compile_error!("This experimental collector currently requires Unix private-file
 pub mod checkout;
 pub mod claude;
 pub mod drops;
+pub mod install;
+mod ordered;
 pub mod pairing;
 pub mod reflog;
 pub mod store;
+pub mod systemd;
 use chrono::{DateTime, Datelike, Utc};
 use serde::de::{MapAccess, Visitor};
 use serde_json::{Map, Value, json};

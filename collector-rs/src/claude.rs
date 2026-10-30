@@ -5,6 +5,7 @@ use crate::{
     MAX_HOOK_INPUT, Object, Result,
     checkout::{self, Checkout},
     drops, object,
+    ordered::{self, Json},
     reflog::{self, Appended},
     store::{Bracket, FINGERPRINT, SETTINGS_LOCK, Store, create_private, owner_writable, private},
     text, token,
@@ -32,6 +33,9 @@ pub const EVENTS: [&str; 9] = [
     "SessionEnd",
 ];
 const MAX_PLAN: usize = 65536;
+/// Sessions with this prefix exercise the installed hook end to end but are
+/// recorded only in a local table that sync never reads.
+pub const SELF_TEST: &str = "devdiary-selftest-";
 
 fn read(path: &Path) -> Result<Vec<u8>> {
     private(path, false)?;
@@ -257,18 +261,17 @@ fn owned(doc: &Object, expected: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn replace(path: &Path, value: &Object, expected: &[u8]) -> Result<()> {
+fn replace(path: &Path, bytes: &[u8], expected: &[u8]) -> Result<()> {
     let mode = fs::metadata(path)?.mode() & 0o755;
-    atomic_replace(path, value, Some(expected), mode, read_settings)
+    atomic_replace(path, bytes, Some(expected), mode, read_settings)
 }
 fn atomic_replace(
     path: &Path,
-    value: &Object,
+    bytes: &[u8],
     expected: Option<&[u8]>,
     mode: u32,
     current: fn(&Path) -> Result<Vec<u8>>,
 ) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
     if bytes.len() > MAX_PLAN {
         return Err("settings_too_large".into());
     }
@@ -281,7 +284,7 @@ fn atomic_replace(
             .mode(0o600)
             .open(&temporary)?;
         file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         if let Some(expected) = expected {
             if current(path)? != expected {
@@ -306,8 +309,11 @@ fn atomic_replace(
 }
 
 /// Plan contains hashes/scope and ownership only, never a settings backup (which
-/// could contain provider secrets). Removal restores JSON semantics, not spacing.
+/// could contain provider secrets). Removal restores the layout `ordered` keeps.
 pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> {
+    plan_for(state, settings_path, plan_path, &std::env::current_exe()?)
+}
+pub fn plan_for(state: &Path, settings_path: &Path, plan_path: &Path, exe: &Path) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err("linux_only".into());
     }
@@ -322,10 +328,7 @@ pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> 
         return Err("separate_registration_paths_required".into());
     }
     let _lock = lock(state, false)?;
-    let (raw, doc) = settings(settings_path)?;
-    if String::from_utf8_lossy(&raw).contains("observer_hook") {
-        return Err("python_observer_registered".into());
-    }
+    let (raw, doc) = registrable(settings_path)?;
     let store = Store::open(state, None)?;
     if !crate::installation(&store.config) {
         let repo = Path::new(text(&store.config, "repository")?);
@@ -333,13 +336,8 @@ pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> 
             return Err("canonical_repository_required".into());
         }
     }
-    let exe = std::env::current_exe()?;
-    let (current, digest) = executable(&exe)?;
+    let (current, digest) = executable(exe)?;
     let expected = entry(plan_path, exe.to_str().ok_or("invalid_path")?)?;
-    // Do not stack registrations or silently take over another Rust adapter.
-    if String::from_utf8_lossy(&raw).contains(" claude-hook ") {
-        return Err("already_registered".into());
-    }
     let absent: Vec<_> = EVENTS
         .iter()
         .filter(|e| doc.get("hooks").and_then(|h| h.get(**e)).is_none())
@@ -357,6 +355,56 @@ pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> 
     file.sync_all()?;
     File::open(plan_path.parent().ok_or("invalid_path")?)?.sync_all()?;
     remember(state, &current)
+}
+fn registrable(settings_path: &Path) -> Result<(Vec<u8>, Object)> {
+    let (raw, doc) = settings(settings_path)?;
+    refusal(&raw)?;
+    Ok((raw, doc))
+}
+fn refusal(raw: &[u8]) -> Result<()> {
+    if String::from_utf8_lossy(raw).contains("observer_hook") {
+        return Err("python_observer_registered".into());
+    }
+    // Do not stack registrations or silently take over another Rust adapter.
+    if String::from_utf8_lossy(raw).contains(" claude-hook ") {
+        return Err("already_registered".into());
+    }
+    Ok(())
+}
+fn preflight_code(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    match e.downcast_ref::<std::io::Error>() {
+        _ if e.is::<serde_json::Error>() => "invalid_settings".into(),
+        Some(io) if io.kind() == std::io::ErrorKind::NotFound => "settings_missing".into(),
+        _ => e,
+    }
+}
+pub fn preflight(settings_path: &Path) -> Result<()> {
+    registrable(settings_path)
+        .map(|_| ())
+        .map_err(preflight_code)
+}
+/// The refusals a fresh plan would give once `plan_path`'s entries are gone,
+/// checked before anything is removed.
+pub fn preflight_replacing(plan_path: &Path) -> Result<()> {
+    let p = load(plan_path)?;
+    let (raw, doc) = settings(Path::new(text(&p, "settings")?)).map_err(preflight_code)?;
+    if owned(&doc, &p["entry"]).is_err() {
+        return refusal(&raw);
+    }
+    refusal(&without(&p, &raw)?)
+}
+pub fn entries(plan_path: &Path) -> Result<Vec<String>> {
+    let p = load(plan_path)?;
+    lines(&p["entry"])
+}
+pub fn entry_lines(plan_path: &Path, exe: &Path) -> Result<Vec<String>> {
+    lines(&entry(plan_path, exe.to_str().ok_or("invalid_path")?)?)
+}
+fn lines(entry: &Value) -> Result<Vec<String>> {
+    let command = entry["hooks"][0]["command"]
+        .as_str()
+        .ok_or("invalid_entry")?;
+    Ok(EVENTS.iter().map(|e| format!("{e}: {command}")).collect())
 }
 fn load(plan_path: &Path) -> Result<Object> {
     let raw = read(plan_path)?;
@@ -490,7 +538,13 @@ fn save_manifest(plan: &Path, m: &Object) -> Result<()> {
     } else {
         None
     };
-    atomic_replace(&path, m, old.as_deref(), 0o600, read)
+    atomic_replace(
+        &path,
+        &serde_json::to_vec_pretty(m)?,
+        old.as_deref(),
+        0o600,
+        read,
+    )
 }
 
 #[cfg(test)]
@@ -518,7 +572,7 @@ pub fn apply(plan_path: &Path) -> Result<()> {
     let p = load(plan_path)?;
     let path = Path::new(text(&p, "settings")?);
     let _lock = lock(Path::new(text(&p, "state")?), false)?;
-    let (raw, mut doc) = settings(path)?;
+    let (raw, doc) = settings(path)?;
     if owned(&doc, &p["entry"]).is_ok() {
         let mut m = manifest(plan_path, &p)?;
         if !["prepared", "installed"].contains(&text(&m, "status")?) {
@@ -546,25 +600,21 @@ pub fn apply(plan_path: &Path) -> Result<()> {
     let mut m = object(&serde_json::to_vec(&json!({
         "plan_sha256": hash(&serde_json::to_vec(&p)?), "status": "prepared"
     }))?)?;
-    let hooks = doc
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or("invalid_hooks")?;
+    let mut ordered = ordered::parse(&raw)?;
+    let hooks = ordered.entry("hooks", Json::Object(vec![]))?;
     for event in EVENTS {
-        hooks
-            .entry(event)
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .ok_or("invalid_hooks")?
-            .push(p["entry"].clone());
+        match hooks.entry(event, Json::Array(vec![]))? {
+            Json::Array(items) => items.push(Json::from_value(&p["entry"])),
+            _ => return Err("invalid_hooks".into()),
+        }
     }
-    if serde_json::to_vec_pretty(&doc)?.len() > MAX_PLAN {
+    let bytes = ordered::render(&ordered, &raw)?;
+    if bytes.len() > MAX_PLAN {
         return Err("settings_too_large".into());
     }
     save_manifest(plan_path, &m)?;
     checkpoint("prepared")?;
-    replace(path, &doc, &raw)?;
+    replace(path, &bytes, &raw)?;
     checkpoint("applied_settings")?;
     m.insert("status".into(), json!("installed"));
     save_manifest(plan_path, &m)
@@ -605,7 +655,7 @@ pub fn remove(plan_path: &Path) -> Result<()> {
         None
     };
     let mut m = manifest(plan_path, &p)?;
-    let (raw, mut doc) = settings(path)?;
+    let (raw, doc) = settings(path)?;
     let status = text(&m, "status")?;
     if status == "removed" {
         // Do not re-remove or rewrite later customer edits.
@@ -625,39 +675,37 @@ pub fn remove(plan_path: &Path) -> Result<()> {
     }
     // Removal must remain possible after executable upgrades or spool failure.
     owned(&doc, &p["entry"])?;
-    let hooks = doc
-        .get_mut("hooks")
-        .and_then(Value::as_object_mut)
-        .ok_or("invalid_hooks")?;
-    let absent = p
-        .get("absent_events")
-        .and_then(Value::as_array)
-        .ok_or("invalid_plan")?;
-    for event in EVENTS {
-        let items = hooks
-            .get_mut(event)
-            .and_then(Value::as_array_mut)
-            .ok_or("invalid_hooks")?;
-        items.retain(|e| e != &p["entry"]);
-        if items.is_empty() && absent.contains(&json!(event)) {
-            hooks.remove(event);
-        }
-    }
-    if hooks.is_empty() && p.get("absent_hooks") == Some(&Value::Bool(true)) {
-        doc.remove("hooks");
-    }
+    let bytes = without(&p, &raw)?;
     m.insert("status".into(), json!("removing"));
-    m.insert(
-        "removed_sha256".into(),
-        json!(hash(&serde_json::to_vec_pretty(&doc)?)),
-    );
+    m.insert("removed_sha256".into(), json!(hash(&bytes)));
     save_manifest(plan_path, &m)?;
     checkpoint("removing")?;
-    replace(path, &doc, &raw)?;
+    replace(path, &bytes, &raw)?;
     checkpoint("removed_settings")?;
     m.insert("status".into(), json!("removed"));
     save_manifest(plan_path, &m)?;
     checkpoint("removed")
+}
+fn without(p: &Object, raw: &[u8]) -> Result<Vec<u8>> {
+    let absent = p
+        .get("absent_events")
+        .and_then(Value::as_array)
+        .ok_or("invalid_plan")?;
+    let mut ordered = ordered::parse(raw)?;
+    let hooks = ordered.get_mut("hooks").ok_or("invalid_hooks")?;
+    for event in EVENTS {
+        let Some(Json::Array(items)) = hooks.get_mut(event) else {
+            return Err("invalid_hooks".into());
+        };
+        items.retain(|e| !e.matches(&p["entry"]));
+        if items.is_empty() && absent.contains(&json!(event)) {
+            hooks.remove(event);
+        }
+    }
+    if hooks.is_empty_container() && p.get("absent_hooks") == Some(&Value::Bool(true)) {
+        ordered.remove("hooks");
+    }
+    ordered::render(&ordered, raw)
 }
 
 const HOOK_FIELDS: [&str; 11] = [
@@ -963,7 +1011,8 @@ fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
         "spool_full" => "spool_full",
         "observation_conflict" => "observation_conflict",
         "revoked" => "revoked",
-        "invalid_event" | "invalid_cwd" | "invalid_metadata" | "input_too_large" => "invalid",
+        "invalid_event" | "invalid_cwd" | "invalid_metadata" | "input_too_large"
+        | "reserved_session" => "invalid",
         "owned_entry_missing"
         | "owned_entry_changed"
         | "executable_changed"
@@ -1011,7 +1060,12 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
         .get("scope")
         .and_then(Value::as_object)
         .ok_or("invalid_scope")?;
-    let (mut row, gitdir) = normalize(data, scope, state)?;
+    let session = text(data, "session_id")?;
+    let normalized = if session.starts_with(SELF_TEST) {
+        None
+    } else {
+        Some(normalize(data, scope, state)?)
+    };
     trusted_executable(p, state)?;
     let _lock = lock(state, true)?;
     active(plan_path, p)?;
@@ -1021,6 +1075,9 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
     if *scope != store.config {
         return Err("scope_changed".into());
     }
+    let Some((mut row, gitdir)) = normalized else {
+        return store.self_test(session);
+    };
     if let Some(gitdir) = gitdir {
         bracket(&store, state, &mut row, &gitdir)?;
     }
@@ -1098,7 +1155,12 @@ mod recovery_tests {
                     // Preserve edits made by the customer after installation.
                     let (raw, mut doc) = settings(&settings_path).unwrap();
                     doc.insert("later".into(), json!(true));
-                    replace(&settings_path, &doc, &raw).unwrap();
+                    replace(
+                        &settings_path,
+                        &serde_json::to_vec_pretty(&doc).unwrap(),
+                        &raw,
+                    )
+                    .unwrap();
                     INTERRUPT.with(|point| point.set(Some(stage)));
                     assert!(remove(&plan).is_err());
                 }
@@ -1152,6 +1214,33 @@ mod recovery_tests {
     }
 
     #[test]
+    fn apply_keeps_key_order_and_layout_so_removal_restores_the_original_bytes() {
+        let (dir, plan) = fixture(json!({}));
+        let path = dir.path().join("settings.json");
+        let original = b"{\n    \"model\": \"opus\",\n    \"hooks\": {\n        \"UserPromptSubmit\": [\n            {\n                \"hooks\": [\n                    {\n                        \"type\": \"command\",\n                        \"command\": \"codegraph prompt\"\n                    }\n                ]\n            }\n        ]\n    },\n    \"env\": {\n        \"B\": 1.5,\n        \"A\": [\n            true,\n            null\n        ]\n    }\n}\n";
+        fs::write(&path, original).unwrap();
+        let mut p = load(&plan).unwrap();
+        p.insert("settings_sha256".into(), json!(hash(original)));
+        p.insert(
+            "absent_events".into(),
+            json!(
+                EVENTS
+                    .iter()
+                    .filter(|e| **e != "UserPromptSubmit")
+                    .collect::<Vec<_>>()
+            ),
+        );
+        p.insert("absent_hooks".into(), json!(false));
+        fs::write(&plan, serde_json::to_vec(&p).unwrap()).unwrap();
+        apply(&plan).unwrap();
+        let applied = String::from_utf8(read_settings(&path).unwrap()).unwrap();
+        assert!(applied.starts_with("{\n    \"model\": \"opus\",\n    \"hooks\": {\n        \"UserPromptSubmit\": [\n            {\n                \"hooks\": [\n                    {\n                        \"type\": \"command\",\n                        \"command\": \"codegraph prompt\""));
+        assert!(applied.ends_with("}\n"));
+        remove(&plan).unwrap();
+        assert_eq!(read_settings(&path).unwrap(), original);
+    }
+
+    #[test]
     fn removal_retry_refuses_ambiguous_post_replace_edits() {
         let (dir, plan) = fixture(json!({"hooks":{"Stop":[]}}));
         apply(&plan).unwrap();
@@ -1161,7 +1250,7 @@ mod recovery_tests {
         let path = dir.path().join("settings.json");
         let (raw, mut doc) = settings(&path).unwrap();
         doc.insert("later".into(), json!(true));
-        replace(&path, &doc, &raw).unwrap();
+        replace(&path, &serde_json::to_vec_pretty(&doc).unwrap(), &raw).unwrap();
         let before = read(&path).unwrap();
         let receipt = read(&manifest_path(&plan)).unwrap();
         assert!(remove(&plan).is_err());

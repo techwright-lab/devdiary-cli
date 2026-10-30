@@ -84,8 +84,8 @@ command succeeded, sync exit 1 means pending evidence remains, and exit 2 is a
 private/generic local error. These control commands are **not host-failure-neutral**;
 never register `collect` as a vendor hook. Only `claude-hook` has the separate
 silent deadline/exit contract below. No daemon, live host qualification, surveillance,
-stock-tool qualification, native Windows support, signing/update/installer or
-Python retirement is included. Rails and human-minute attribution are unchanged.
+stock-tool qualification, native Windows support, signing or Python retirement is
+included; the optional user timer is described under one-command install. Rails and human-minute attribution are unchanged.
 
 Reproduce Linux checks (Rust 1.98.1, Python >=3.11):
 
@@ -203,6 +203,87 @@ scope/actor changes are rejected. Disposable plan/apply/remove preserves setting
 This is **fixture-driven application interoperability**, not live stock-Claude
 qualification. The stricter qualification harness below remains blocked, unchanged.
 
+## One-command install (Linux, systemd user timer)
+
+`install` runs the browser pairing, plan, consent and apply steps above in one
+command for an installation-scope connection, then delivers the spool from a
+systemd user timer. The hook contract does not change: it stays silent, exits 0
+and never performs HTTP.
+
+```sh
+cargo build --release --locked --manifest-path collector-rs/Cargo.toml
+collector-rs/target/release/devdiary-collector install \
+  [--settings ~/.claude/settings.json] [--record-orchestrated-outside-repos] \
+  [--origin ORIGIN --trust-origin] [--yes] [--no-browser] [--new-pair]
+devdiary-collector doctor
+devdiary-collector upgrade [--yes]
+devdiary-collector uninstall
+```
+
+`install` does these steps in order, and stops at the first failure:
+
+1. Refuses at once (`consent_required`) when stdin is not a terminal and `--yes`
+   is absent, and refuses a relative `--settings` path (`unsupported_path`), a
+   missing settings file (`settings_missing`), settings that are not valid JSON
+   (`invalid_settings`), already hold a collector hook or register the Python
+   observer. An alternate `--origin` without `--trust-origin` is refused, as for
+   `setup`. A saved connection that the server revoked is refused
+   (`connection_revoked`); `--new-pair` renames it to `connection-revoked-<time>`
+   (its pending rows stay there) and pairs again. `--new-pair` never replaces a
+   connection that was not revoked (`connection_active`). Nothing is paired or
+   changed.
+2. `setup` without a repository into `~/.local/share/devdiary/collector/connection`.
+   This path is fixed under `$HOME`; `$XDG_DATA_HOME` is not used, so every shell
+   finds the same install. `--new-pair` is passed on, for a pairing that was
+   interrupted.
+3. Copies the running binary to `~/.local/share/devdiary/collector/VERSION/` (0700),
+   so the registered hook survives rebuilds and `cargo clean`.
+4. `setup-plan` for that copy, prints the 9 hook entries, and asks `[y/N]` on the
+   terminal (or takes `--yes`). Declining removes the plan and changes nothing.
+5. `claude-apply`. Settings edited after the plan give `stale_plan` and are left
+   exactly as they are; run `install` again.
+6. Writes `devdiary-collector-sync.service` and `.timer` under
+   `~/.config/systemd/user/` (`$XDG_CONFIG_HOME` when set), then
+   `systemctl --user daemon-reload` and `enable --now` the timer. The timer runs
+   `timer-sync` 30 s after it starts and then 2 min after each run
+   (`RandomizedDelaySec=30`, `Nice=10`).
+7. A local self-test: the installed hook receives a `SessionStart` whose session id
+   starts with `devdiary-selftest-`. The hook records it only in a local
+   `self_test` table, which sync never reads; the outbox refuses such ids.
+
+`timer-sync` runs `connection-sync DIR 100` at most 10 times and stops at the first
+batch that a 401/403, 429, 5xx or network failure stops, when no full batch is
+left, or once it has visited every row that was pending when it started. Rows the
+server rejects (other 4xx, invalid receipts) stay pending and are sent at most once
+per run. Server refusals and rejections end the run with exit 0 and are kept for
+`doctor` as `last_sync_error` (for example `http_422`); local failures fail the
+unit.
+
+`doctor` prints the registration state, `systemctl --user is-enabled/is-active` for
+the timer, pending and delivered counts, drops, the last receipt and
+`last_sync_error`. `upgrade` first checks that the settings would accept a fresh
+plan once the old entries are gone and that the connection was not revoked, prints
+the 9 new entries and asks once; only then does it remove the old registration, copy
+the new binary over the pinned one and install the fresh plan. Declining leaves the
+running hooks and their pinned binary untouched. The install
+record is replaced only on success, so after a failed upgrade `uninstall` still
+finds and disables the timer. `uninstall` disables and deletes the timer units,
+then runs `claude-remove`. Without a user systemd bus it still deletes the unit
+files and removes the hooks, then exits 2 with `timer_unconfirmed`. Leftover units
+without an install record are also disabled and deleted. A second `uninstall` is a
+no-op. Settings keep their key order and their compact or pretty-printed layout;
+string escapes and number spellings come back in canonical JSON form (`\u00e9`
+returns as `é`, `1.50` as `1.5`), so such files keep their meaning but not their
+sha256. The connection
+and any pending rows stay; revoke the connection in the browser to retire the
+credential. Headless machines need `loginctl enable-linger` for the timer to run
+while logged out.
+
+Verification: `python3 collector-rs/tests/install_test.py -v` (temp HOME, a mock
+pairing/ingest server and a fake systemctl; debug builds only honour
+`DEVDIARY_COLLECTOR_SYSTEMCTL`; release builds run the first of `/usr/bin/systemctl`,
+`/bin/systemctl` and `/run/current-system/sw/bin/systemctl`, never a `PATH` lookup).
+
 ## Rust Claude raw-hook adapter: Linux fixture-qualified only
 
 This is a distinct `claude-hook PLAN` command, not registration of the normalized
@@ -279,8 +360,10 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   without reinstalling hooks. A prepared-but-unapplied registration can be removed.
   If settings change after an interrupted removal's rename, recovery fails closed
   for inspection rather than guessing ownership. A private temporary file can
-  survive a killed writer. Unrelated values/hooks survive removal; restoration is
-  JSON-semantic, not original whitespace/order. The private plan, hash-only receipt,
+  survive a killed writer. Unrelated values/hooks survive removal. Apply keeps the
+  file's key order, indentation and trailing newline and appends new keys last, so
+  removal restores the original bytes for files written as `JSON.stringify(v, null,
+  indent)` (Claude's own format); other layouts are restored as the same JSON. The private plan, hash-only receipt,
   lock and collected outbox are intentionally retained. Deterministic test-only
   interruption seams cover durable transitions; no production fault switches exist.
 - The raw allowlist is applied before persistence. Only validated session,
