@@ -16,11 +16,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
-const VERIFY: &str = "/phoenix/settings/collector";
+// The server names its approval page, but only from this fixed set.
+const VERIFY: [&str; 2] = ["/settings/collector", "/phoenix/settings/collector"];
 const START: &str = "/ingest/v1/collector_pairings";
 const EXCHANGE: &str = "/ingest/v1/collector_pairings/exchange";
 pub const DEFAULT_ORIGIN: &str = "https://devdiary.me";
 
+fn verification_path(value: &serde_json::Value) -> Result<&'static str> {
+    VERIFY
+        .into_iter()
+        .find(|p| value.as_str() == Some(*p))
+        .ok_or_else(|| "invalid_pairing_response".into())
+}
 pub fn origin(s: &str, trusted: bool) -> Result<String> {
     if !trusted && s != DEFAULT_ORIGIN {
         return Err("trust_origin_required".into());
@@ -188,8 +195,8 @@ fn secret(s: &str, prefix: &str) -> bool {
 }
 fn response(r: reqwest::blocking::Response) -> Result<Object> {
     let mut raw = Vec::new();
-    r.take(16385).read_to_end(&mut raw)?;
-    if raw.len() > 16384 {
+    r.take(65537).read_to_end(&mut raw)?;
+    if raw.len() > 65536 {
         return Err("invalid_pairing_response".into());
     }
     serde_json::from_slice::<crate::claude::UniqueKeys>(&raw)?;
@@ -198,46 +205,185 @@ fn response(r: reqwest::blocking::Response) -> Result<Object> {
 fn connection(root: &Path) -> Result<Object> {
     private(root, true)?;
     let doc = object(&read(&root.join("connection.json"))?)?;
-    if doc.len() != 2 || !secret(text(&doc, "token")?, "dc_live_") {
-        return Err("invalid_connection".into());
-    }
     let config = scope(&serde_json::to_vec(
         doc.get("scope").ok_or("invalid_connection")?,
     )?)?;
-    let installation = object(&read(&root.join("installation.json"))?)?;
-    for key in ["installation_id", "repository", "repository_ref"] {
-        if config.get(key) != installation.get(key) {
-            return Err("frozen_scope_conflict".into());
-        }
+    let installation = crate::installation(&config);
+    if doc.len() != 2 + usize::from(installation) || !secret(text(&doc, "token")?, "dc_live_") {
+        return Err("invalid_connection".into());
     }
-    if text(&config, "endpoint")?
-        != format!("{}/ingest/v1/observations", text(&installation, "origin")?)
-    {
+    if installation {
+        crate::store::repository_refs(doc.get("repository_refs").ok_or("invalid_connection")?)?;
+    }
+    let saved = object(&read(&root.join("installation.json"))?)?;
+    let frozen: &[&str] = if installation {
+        &[
+            "installation_id",
+            "scope_kind",
+            "record_orchestrated_outside_repos",
+        ]
+    } else {
+        &["installation_id", "repository", "repository_ref"]
+    };
+    if frozen.iter().any(|key| config.get(*key) != saved.get(*key)) {
+        return Err("frozen_scope_conflict".into());
+    }
+    if text(&config, "endpoint")? != format!("{}/ingest/v1/observations", text(&saved, "origin")?) {
         return Err("frozen_scope_conflict".into());
     }
     Ok(doc)
 }
 fn initialize(root: &Path, doc: &Object) -> Result<()> {
-    directory(&root.join("outbox"))?;
-    Store::open(
-        &root.join("outbox"),
-        Some(&serde_json::to_vec(&doc["scope"])?),
-    )?;
+    let outbox = root.join("outbox");
+    directory(&outbox)?;
+    Store::open(&outbox, Some(&serde_json::to_vec(&doc["scope"])?))?;
+    if let Some(refs) = doc.get("repository_refs")
+        && !crate::store::has_refs(&outbox)
+    {
+        crate::store::seed_refs(&outbox, &crate::store::repository_refs(refs)?)?;
+    }
     Ok(())
 }
 
 pub struct Options<'a> {
     pub root: &'a Path,
-    pub repository: &'a Path,
+    pub repository: Option<&'a Path>,
     pub remote: Option<&'a str>,
     pub origin: &'a str,
     pub trust_origin: bool,
     pub browser: bool,
     pub new_pair: bool,
+    pub record_orchestrated_outside_repos: bool,
+}
+enum Target {
+    Repository { path: String, reference: String },
+    Installation { record_outside: bool },
+}
+impl Target {
+    fn new(o: &Options<'_>) -> Result<Self> {
+        match o.repository {
+            Some(_) if o.record_orchestrated_outside_repos => Err("invalid_command".into()),
+            Some(path) => {
+                let (path, reference) = repository(path, o.remote)?;
+                Ok(Self::Repository { path, reference })
+            }
+            None if o.remote.is_some() => Err("invalid_command".into()),
+            None => Ok(Self::Installation {
+                record_outside: o.record_orchestrated_outside_repos,
+            }),
+        }
+    }
+    fn installation_record(&self, origin: &str, remote: Option<&str>) -> serde_json::Value {
+        let id = Uuid::new_v4().to_string();
+        match self {
+            Self::Repository { path, reference } => {
+                json!({"installation_id":id, "origin":origin, "repository":path, "repository_ref":reference, "remote":remote})
+            }
+            Self::Installation { record_outside } => {
+                json!({"installation_id":id, "origin":origin, "scope_kind":"installation", "record_orchestrated_outside_repos":record_outside})
+            }
+        }
+    }
+    fn matches(&self, saved: &Object, origin: &str) -> bool {
+        let same = match self {
+            Self::Repository { path, reference } => {
+                saved.len() == 5
+                    && saved["repository"] == *path
+                    && saved["repository_ref"] == *reference
+            }
+            Self::Installation { record_outside } => {
+                saved.len() == 4
+                    && saved.get("scope_kind") == Some(&json!("installation"))
+                    && saved.get("record_orchestrated_outside_repos")
+                        == Some(&json!(record_outside))
+            }
+        };
+        same && saved.get("origin") == Some(&json!(origin))
+    }
+    fn start(&self, installation_id: &serde_json::Value) -> serde_json::Value {
+        let mut body =
+            json!({"schema_version":1,"installation_id":installation_id,"runtime":"claude-code"});
+        if let Self::Installation { .. } = self {
+            body["scope_kind"] = json!("installation");
+        }
+        body
+    }
+    fn selection(&self) -> String {
+        match self {
+            Self::Repository { reference, .. } => format!("Select repository: {reference}"),
+            Self::Installation { .. } => {
+                "Select: All active repositories (this machine's installation)".into()
+            }
+        }
+    }
+    fn approved(
+        &self,
+        c: &Object,
+        installation: &Object,
+        origin: &str,
+    ) -> Result<serde_json::Value> {
+        let keys = match self {
+            Self::Repository { .. } => 6,
+            Self::Installation { .. } => 9,
+        };
+        if c.len() != keys
+            || c.get("installation_id") != installation.get("installation_id")
+            || c.get("runtime") != Some(&json!("claude-code"))
+            || c.get("endpoint_path") != Some(&json!("/ingest/v1/observations"))
+            || !secret(text(c, "token")?, "dc_live_")
+            || !text(c, "collector_ref")?
+                .strip_prefix("urn:devdiary:collector:")
+                .is_some_and(crate::uuid)
+        {
+            return Err("approved_scope_mismatch".into());
+        }
+        let endpoint = format!("{origin}/ingest/v1/observations");
+        let common = json!({"endpoint":endpoint,"collector_ref":c["collector_ref"],"installation_id":installation["installation_id"]});
+        let (config, refs) = match self {
+            Self::Repository { path, reference } => {
+                if c.get("repository_ref") != Some(&json!(reference)) {
+                    return Err("approved_scope_mismatch".into());
+                }
+                let mut config = common;
+                config["repository"] = json!(path);
+                config["repository_ref"] = json!(reference);
+                (config, None)
+            }
+            Self::Installation { record_outside } => {
+                let versions = c
+                    .get("observation_schema_versions")
+                    .and_then(|v| v.as_array())
+                    .filter(|v| v.iter().all(|n| n.as_u64().is_some()) && v.contains(&json!(1)))
+                    .ok_or("approved_scope_mismatch")?;
+                if c.get("scope_kind") != Some(&json!("installation"))
+                    || c.get("scope_path") != Some(&json!("/ingest/v1/collector/scope"))
+                {
+                    return Err("approved_scope_mismatch".into());
+                }
+                let refs = crate::store::repository_refs(&c["repository_refs"])
+                    .map_err(|_| "approved_scope_mismatch")?;
+                let mut config = common;
+                config["scope_kind"] = json!("installation");
+                config["observation_schema_versions"] = if versions.contains(&json!(2)) {
+                    json!([1, 2])
+                } else {
+                    json!([1])
+                };
+                config["record_orchestrated_outside_repos"] = json!(record_outside);
+                (config, Some(refs))
+            }
+        };
+        scope(&serde_json::to_vec(&config)?)?;
+        let mut saved = json!({"scope":config,"token":c["token"]});
+        if let Some(refs) = refs {
+            saved["repository_refs"] = json!(refs);
+        }
+        Ok(saved)
+    }
 }
 pub fn setup(o: Options<'_>) -> Result<()> {
     let origin = origin(o.origin, o.trust_origin)?;
-    let (repo, repo_ref) = repository(o.repository, o.remote)?;
+    let target = Target::new(&o)?;
     directory(o.root)?;
     let lock_path = o.root.join("setup.lock");
     if !lock_path.exists() {
@@ -254,16 +400,11 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         }
         save_new(
             &installation_path,
-            &serde_json::to_vec(
-                &json!({"installation_id":Uuid::new_v4().to_string(), "origin":origin, "repository":repo, "repository_ref":repo_ref, "remote":o.remote}),
-            )?,
+            &serde_json::to_vec(&target.installation_record(&origin, o.remote))?,
         )?;
     }
     let installation = object(&read(&installation_path)?)?;
-    if installation.len() != 5
-        || installation["origin"] != origin
-        || installation["repository"] != repo
-        || installation["repository_ref"] != repo_ref
+    if !target.matches(&installation, &origin)
         || !crate::uuid(text(&installation, "installation_id")?)
     {
         return Err("frozen_scope_conflict".into());
@@ -302,7 +443,13 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(5))
         .build()?;
-    let r = client.post(format!("{origin}{START}")).header("Content-Type", "application/json").body(serde_json::to_vec(&json!({"schema_version":1,"installation_id":installation["installation_id"],"runtime":"claude-code"}))?).send()?;
+    let r = client
+        .post(format!("{origin}{START}"))
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_vec(
+            &target.start(&installation["installation_id"]),
+        )?)
+        .send()?;
     if r.status().as_u16() == 429 {
         let seconds = r
             .headers()
@@ -334,7 +481,6 @@ pub fn setup(o: Options<'_>) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     if start.len() != 6
         || start["schema_version"] != json!(1)
-        || start["verification_path"] != VERIFY
         || !secret(bearer, "dp_pair_")
         || code.len() != 32
         || !code
@@ -345,15 +491,17 @@ pub fn setup(o: Options<'_>) -> Result<()> {
     {
         return Err("invalid_pairing_response".into());
     }
+    let verify = verification_path(&start["verification_path"])?;
     let deadline = Instant::now() + Duration::from_secs((expiry - now) as u64);
     println!(
-        "Approve at {origin}{VERIFY}\nOne-time code: {code}\nSelect repository: {repo_ref}\nBrowser approval does not install hooks or establish host trust.\nIf interrupted or response is lost: revoke the unused connection in the browser, then repeat with --new-pair. Never reuse a different scope's outbox."
+        "Approve at {origin}{verify}\nOne-time code: {code}\n{}\nBrowser approval does not install hooks or establish host trust.\nIf interrupted or response is lost: revoke the unused connection in the browser, then repeat with --new-pair. Never reuse a different scope's outbox.",
+        target.selection()
     );
     std::io::stdout().flush()?;
     if o.browser {
         // The constant URL is the only argument. No bearer/code in child argv/env.
         let _ = Command::new("/usr/bin/xdg-open")
-            .arg(format!("{origin}{VERIFY}"))
+            .arg(format!("{origin}{verify}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -402,21 +550,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
             .get("connection")
             .and_then(|v| v.as_object())
             .ok_or("repair_new_pair")?;
-        if c.len() != 6
-            || c.get("installation_id") != installation.get("installation_id")
-            || c.get("repository_ref") != Some(&json!(repo_ref))
-            || c.get("runtime") != Some(&json!("claude-code"))
-            || c.get("endpoint_path") != Some(&json!("/ingest/v1/observations"))
-            || !secret(text(c, "token")?, "dc_live_")
-            || !text(c, "collector_ref")?
-                .strip_prefix("urn:devdiary:collector:")
-                .is_some_and(crate::uuid)
-        {
-            return Err("approved_scope_mismatch".into());
-        }
-        let config = json!({"endpoint":format!("{origin}/ingest/v1/observations"),"collector_ref":c["collector_ref"],"installation_id":installation["installation_id"],"repository":repo,"repository_ref":repo_ref});
-        scope(&serde_json::to_vec(&config)?)?;
-        let saved = json!({"scope":config,"token":c["token"]});
+        let saved = target.approved(c, &installation, &origin)?;
         save_new(
             &o.root.join("connection.json"),
             &serde_json::to_vec(&saved)?,
@@ -442,11 +576,13 @@ pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
     let doc = connection(root)?;
     let config = doc["scope"].as_object().ok_or("invalid_connection")?;
     // Revalidate current local remotes at registration, not only at approval.
-    let installation = object(&read(&root.join("installation.json"))?)?;
-    let choice = installation.get("remote").and_then(|v| v.as_str());
-    let (_, remote) = repository(Path::new(text(config, "repository")?), choice)?;
-    if remote != text(config, "repository_ref")? {
-        return Err("approved_scope_mismatch".into());
+    if !crate::installation(config) {
+        let installation = object(&read(&root.join("installation.json"))?)?;
+        let choice = installation.get("remote").and_then(|v| v.as_str());
+        let (_, remote) = repository(Path::new(text(config, "repository")?), choice)?;
+        if remote != text(config, "repository_ref")? {
+            return Err("approved_scope_mismatch".into());
+        }
     }
     initialize(root, &doc)?;
     crate::claude::plan(&root.join("outbox"), settings, plan)?;
@@ -478,9 +614,12 @@ pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
         )?),
         None => json!({"registration":"unknown; provide PLAN for local inspection"}),
     };
+    let refs = crate::store::read_refs(&root.join("outbox"))
+        .map(|r| r.len())
+        .ok();
     println!(
         "{}",
-        json!({"connection":"saved", "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
+        json!({"connection":"saved", "local_repository_refs":refs, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
     );
     Ok(())
 }
@@ -551,6 +690,20 @@ mod tests {
             "https://u:p@devdiary.me",
         ] {
             assert!(origin(s, true).is_err());
+        }
+    }
+    #[test]
+    fn verification_page_is_one_of_the_known_paths() {
+        for path in ["/settings/collector", "/phoenix/settings/collector"] {
+            assert_eq!(verification_path(&json!(path)).unwrap(), path);
+        }
+        for path in [
+            json!("/settings/collector?x=1"),
+            json!("https://evil.test/settings/collector"),
+            json!("/settings/collectors"),
+            json!(null),
+        ] {
+            assert!(verification_path(&path).is_err(), "{path}");
         }
     }
     #[test]

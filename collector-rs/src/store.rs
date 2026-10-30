@@ -13,6 +13,10 @@ const APP_ID: i64 = 1145328177;
 const VERSION: i64 = 2;
 pub(crate) const SETTINGS_LOCK: &str = "claude-settings.lock";
 pub(crate) const FINGERPRINT: &str = "executable-fingerprint";
+const REFS: &str = "repository-refs.json";
+const REFS_NEXT: &str = "repository-refs.json.next";
+const MAX_REFS: u64 = 262144;
+const SCOPE_PATH: &str = "/ingest/v1/collector/scope";
 // Delivered IDs are kept so a late duplicate hook firing is still deduplicated
 // instead of being resent as a conflicting observation.
 const TOMBSTONES: i64 = 4000;
@@ -108,6 +112,8 @@ fn state_check(state: &Path) -> Result<()> {
             "sync.lock",
             SETTINGS_LOCK,
             FINGERPRINT,
+            REFS,
+            REFS_NEXT,
             drops::LOG,
             drops::FOLDING,
         ]
@@ -374,6 +380,70 @@ fn migrate(db: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn repository_refs(value: &serde_json::Value) -> Result<Vec<String>> {
+    let refs: Vec<String> = value
+        .as_array()
+        .ok_or("invalid_repository_refs")?
+        .iter()
+        .map(|r| {
+            r.as_str()
+                .filter(|r| crate::repository_ref(r))
+                .map(str::to_owned)
+                .ok_or("invalid_repository_refs")
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let unique: std::collections::HashSet<_> =
+        refs.iter().map(|r| r.to_ascii_lowercase()).collect();
+    if unique.len() != refs.len() {
+        return Err("invalid_repository_refs".into());
+    }
+    Ok(refs)
+}
+pub(crate) fn read_refs(state: &Path) -> Result<Vec<String>> {
+    let path = state.join(REFS);
+    private(&path, false)?;
+    let mut raw = Vec::new();
+    File::open(path)?.take(MAX_REFS + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_REFS {
+        return Err("invalid_repository_refs".into());
+    }
+    repository_refs(&serde_json::from_slice(&raw)?)
+}
+pub(crate) fn has_refs(state: &Path) -> bool {
+    state.join(REFS).exists()
+}
+// Callers hold sync.lock, so the fixed staging name has one writer.
+fn replace_refs(state: &Path, refs: &[String]) -> Result<()> {
+    let raw = serde_json::to_vec(refs)?;
+    if raw.len() as u64 > MAX_REFS {
+        return Err("invalid_repository_refs".into());
+    }
+    let next = state.join(REFS_NEXT);
+    match fs::remove_file(&next) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&next)?;
+    std::io::Write::write_all(&mut file, &raw)?;
+    file.sync_all()?;
+    fs::rename(&next, state.join(REFS))?;
+    File::open(state)?.sync_all()?;
+    Ok(())
+}
+pub(crate) fn seed_refs(state: &Path, refs: &[String]) -> Result<()> {
+    let lock = create_private(&state.join("sync.lock"))?;
+    lock.lock()?;
+    if has_refs(state) {
+        return Ok(());
+    }
+    replace_refs(state, refs)
+}
+
 fn credential(path: &Path) -> Result<String> {
     private(path, false)?;
     let mut raw = String::new();
@@ -438,6 +508,9 @@ pub(crate) fn sync_key(
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(5))
         .build()?;
+    if crate::installation(&store.config) {
+        refresh_refs(&client, &store, state, key, revoked)?;
+    }
     for (seq, payload) in store.batch(limit)? {
         // Autocommit FULL before any HTTP. Lost response or process death cannot
         // erase frozen bytes or pin the next invocation to a poison row.
@@ -470,6 +543,81 @@ pub(crate) fn sync_key(
     }
     store.compact()?;
     store.counts()
+}
+// A refresh that fails for any reason but revocation or a server-requested
+// wait keeps the last good list; delivery of spooled rows still proceeds.
+fn refresh_refs(
+    client: &reqwest::blocking::Client,
+    store: &Store,
+    state: &Path,
+    key: &str,
+    revoked: Option<&Path>,
+) -> Result<()> {
+    let mut url = reqwest::Url::parse(
+        store.config["endpoint"]
+            .as_str()
+            .ok_or("invalid_endpoint")?,
+    )?;
+    url.set_path(SCOPE_PATH);
+    let Ok(response) = client
+        .get(url)
+        .bearer_auth(key)
+        .header("Accept", "application/json")
+        .send()
+    else {
+        return Ok(());
+    };
+    let status = response.status().as_u16();
+    if matches!(status, 401 | 403) {
+        if let Some(marker) = revoked {
+            create_private(marker)?;
+        }
+        return Err("revoked".into());
+    }
+    if status == 429 {
+        let wait = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| retry_after(v, now().ok()?))
+            .unwrap_or(60);
+        store.db.execute(
+            "UPDATE scope SET retry_after=? WHERE singleton=1",
+            [now()? + wait],
+        )?;
+        return Err("sync_rate_limited".into());
+    }
+    let mut raw = Vec::new();
+    if status != 200
+        || response.take(MAX_REFS + 1).read_to_end(&mut raw).is_err()
+        || raw.len() as u64 > MAX_REFS
+    {
+        return Ok(());
+    }
+    if let Ok(refs) = scope_refs(&raw, &store.config) {
+        replace_refs(state, &refs)?;
+    }
+    Ok(())
+}
+fn scope_refs(raw: &[u8], config: &Object) -> Result<Vec<String>> {
+    serde_json::from_slice::<crate::claude::UniqueKeys>(raw)?;
+    let doc = crate::object(raw)?;
+    let keys = [
+        "schema_version",
+        "collector_ref",
+        "scope_kind",
+        "repository_refs",
+        "observation_schema_versions",
+    ];
+    if doc.len() != keys.len()
+        || keys.iter().any(|k| !doc.contains_key(*k))
+        || doc["schema_version"] != serde_json::json!(1)
+        || doc.get("collector_ref") != config.get("collector_ref")
+        || doc["scope_kind"] != serde_json::json!("installation")
+    {
+        return Err("invalid_scope_response".into());
+    }
+    repository_refs(&doc["repository_refs"])
 }
 const MAX_RETRY_AFTER: i64 = 86400;
 fn retry_after(value: &str, now: i64) -> Option<i64> {

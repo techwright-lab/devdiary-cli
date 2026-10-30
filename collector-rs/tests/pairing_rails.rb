@@ -40,10 +40,11 @@ workspace = user.current_team.workspace || FactoryBot.create(:workspace, owner: 
 repo = FactoryBot.create(:repository, full_name: "fixture/pairing")
 link = WorkspaceRepository.create!(workspace: workspace, repository: repo, active: true)
 before = [WorkSession.count, SessionEvent.count, Attribution.count]
-state = {drop_pair: false, drop_ingest: false, bearer: nil, requests: []}
+state = {drop_pair: false, drop_ingest: false, bearer: nil, requests: [], scope_reads: 0}
 app = lambda do |env|
   path = env.fetch("PATH_INFO")
   state[:bearer] = env["HTTP_AUTHORIZATION"] if path.end_with?("/exchange")
+  state[:scope_reads] += 1 if path == "/ingest/v1/collector/scope"
   if path == "/ingest/v1/observations"
     body = env["rack.input"].read
     env["rack.input"].rewind
@@ -69,16 +70,17 @@ repository = root.join("repo").to_s
 connection = root.join("connection").to_s
 http = Net::HTTP.new("127.0.0.1", port, nil)
 http.open_timeout = http.read_timeout = 10
-browser = lambda do |code|
+routes = Rails.application.routes.url_helpers
+browser = lambda do |code, selection|
   login_as(user, scope: :user)
-  get = http.get("/phoenix/settings/collector")
+  get = http.get(routes.phoenix_settings_collector_path)
   raise "browser GET #{get.code}" unless get.code == "200"
   doc = Nokogiri::HTML(get.body)
   csrf = doc.at_css('meta[name="csrf-token"]')&.[]("content") || doc.at_css('input[name="authenticity_token"]')&.[]("value")
   raise "real CSRF missing" unless csrf
   cookie = get.get_fields("set-cookie").map { |c| c.split(";", 2).first }.join("; ")
-  values = {user_code: code, workspace_id: workspace.id, workspace_repository_id: link.id}
-  post = Net::HTTP::Post.new("/phoenix/settings/collector/approve")
+  values = {user_code: code, workspace_id: workspace.id, workspace_repository_id: selection, bind_interactive: "1"}
+  post = Net::HTTP::Post.new(routes.approve_phoenix_settings_collector_path)
   post["Cookie"] = cookie
   post.set_form_data(values)
   denied = http.request(post)
@@ -95,18 +97,18 @@ command = lambda do |args, data = "", expected = 0|
   raise "secret output" if (out + err).match?(/dc_live_|dp_pair_/)
   out
 end
-pair = lambda do |extra, expected|
-  Open3.popen3(exe, "setup", connection, repository, "--origin", origin, "--trust-origin", "--no-browser", *extra) do |stdin, stdout, stderr, waiter|
+pair = lambda do |extra, expected, target: [connection, repository], selection: link.id|
+  Open3.popen3(exe, "setup", *target, "--origin", origin, "--trust-origin", "--no-browser", *extra) do |stdin, stdout, stderr, waiter|
     stdin.close
     output = +""
     Timeout.timeout(25) do
       code = nil
       until code
-        line = stdout.gets || raise("no approval code")
+        line = stdout.gets || raise("no approval code: #{stderr.read.strip}")
         output << line
         code = line[/One-time code: ([a-f0-9]{32})/, 1]
       end
-      browser.call(code)
+      browser.call(code, selection)
       output << stdout.read
       output << stderr.read
       raise "setup result" unless waiter.value.exitstatus == expected
@@ -165,10 +167,41 @@ begin
     rejected = http.request(request)
     raise "scope rejected with unexpected status #{changes.keys.join(',')}: #{rejected.code}" unless rejected.code == "403"
   end
+  raise "repository scope did not send v1" unless payload["schema_version"] == 1
+  installation = root.join("installation-connection").to_s
+  pair.call([], 0, target: [installation], selection: "all")
+  saved = JSON.parse(File.read(File.join(installation, "connection.json")))
+  raise "installation scope" unless saved.dig("scope", "scope_kind") == "installation" &&
+    saved.dig("scope", "observation_schema_versions") == [1, 2] && saved["repository_refs"] == %w[https://github.com/fixture/other https://github.com/fixture/pairing]
+  credential = CollectorCredential.authenticate(saved.fetch("token"))
+  raise "installation credential" unless credential.installation_scope? && credential.owner_user_id == user.id && credential.bind_interactive
+  hook_settings = root.join("installation-settings.json")
+  hook_settings.write("{}")
+  hook_settings.chmod(0o600)
+  hook_plan = root.join("installation-plan.json").to_s
+  command.call(["setup-plan", installation, hook_settings.to_s, hook_plan])
+  command.call(["claude-apply", hook_plan, "--consent"])
+  agent = SecureRandom.uuid
+  [[{"PAPERCLIP_AGENT_ID" => agent, "PAPERCLIP_API_KEY" => "SENTINELSECRET"}, "PostToolUse"], [{}, "SessionStart"]].each do |env, event|
+    hook_input = JSON.generate({hook_event_name: event, session_id: "fixture-installation", cwd: repository, tool_use_id: "toolu_fixture", tool_name: "Bash"})
+    out, err, status = Open3.capture3(env, exe, "claude-hook", hook_plan, stdin_data: hook_input)
+    raise "hook not silent" unless status.success? && out.empty? && err.empty?
+  end
+  sent = state[:requests].size
+  raise "installation sync" unless JSON.parse(command.call(["connection-sync", installation, "10"])) == {"pending" => 0, "delivered" => 2}
+  wire = state[:requests][sent..].map { |body| JSON.parse(body) }
+  raise "installation scope did not send v2" unless wire.all? { |row| row["schema_version"] == 2 && !row.key?("actor_ref") } &&
+    wire.map { |row| row["orchestrator"] }.sort == %w[none paperclip]
+  raise "secret on the wire" if state[:requests].join.include?("SENTINELSECRET")
+  raise "scope endpoint not read" unless state[:scope_reads].positive?
+  rows = CollectorObservation.where(collector_credential: credential).to_a
+  raise "v2 rows not stored" unless rows.size == 2 && rows.all? { |row| row.repository_id == repo.id && row.metadata["schema_version"] == 2 }
+  raise "agent ref" unless rows.map { |row| row.metadata["orchestrator_agent_ref"] }.compact == [agent]
+  command.call(["claude-remove", hook_plan, "--consent"])
   raise "authorship changed" unless before == [WorkSession.count, SessionEvent.count, Attribution.count]
   raise "identity invented" unless CollectorObservation.first.metadata["attribution_basis"] == "unknown"
   guard.verify_application!
-  report.merge!({"passed" => true, "browser_real_csrf" => true, "lost_pairing_response_new_pair" => true, "consumed_replay_rejected" => true, "exact_ingest_replay" => true, "scoped_rejections" => 4, "unknown_authorship" => true, "plan_apply_remove_preserved_settings" => true, "record_id" => record_id, "observation_id" => observation[:observation_id]})
+  report.merge!({"passed" => true, "browser_real_csrf" => true, "lost_pairing_response_new_pair" => true, "consumed_replay_rejected" => true, "exact_ingest_replay" => true, "scoped_rejections" => 4, "unknown_authorship" => true, "plan_apply_remove_preserved_settings" => true, "repository_scope_v1" => true, "installation_scope_v2" => true, "record_id" => record_id, "observation_id" => observation[:observation_id]})
 ensure
   QualificationCleanup.run(report, {
     "revoke" => -> {
