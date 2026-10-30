@@ -334,6 +334,7 @@ fn ask_orchestrators(outbox: &Path) -> Result<()> {
     for line in orchestrators::describe(&entries) {
         println!("  {line}");
     }
+    show_changes(outbox, &entries);
     if entries.is_empty() {
         println!("  (none: the hook would stop reading orchestrator names)");
     }
@@ -346,13 +347,36 @@ fn ask_orchestrators(outbox: &Path) -> Result<()> {
     println!("Approved.");
     Ok(())
 }
+fn show_changes(outbox: &Path, entries: &[Value]) {
+    let Ok(old) = orchestrators::approved(outbox) else {
+        println!("The saved approved list cannot be read. Approving replaces it.");
+        return;
+    };
+    if old.is_empty() {
+        return;
+    }
+    let (added, removed) = orchestrators::changes(&old, entries);
+    if added.is_empty() && removed.is_empty() {
+        println!("Only the order changed. The first entry that matches wins.");
+    }
+    for line in added {
+        println!("  added {line}");
+    }
+    for line in removed {
+        println!("  removed {line}");
+    }
+}
 // `--yes` covers the hook entries the person chose to skip reviewing. It cannot
 // cover names the server picks later, so only a terminal answer approves them.
 fn offer_orchestrators(data: &Path) -> Result<()> {
     let root = connection(data);
     let outbox = root.join("outbox");
     let _ = pairing::refresh_scope(&root);
-    if !orchestrators::waiting(&outbox)? {
+    if orchestrators::offer_unreadable(&outbox) {
+        println!("The saved orchestrator offer cannot be read. The next sync replaces it.");
+        return Ok(());
+    }
+    if !orchestrators::waiting(&outbox) {
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
@@ -379,7 +403,8 @@ pub fn approve_orchestrators(root: Option<&Path>) -> Result<()> {
         Some(root) => root.join("outbox"),
         None => connection(&data_dir()?).join("outbox"),
     };
-    if !orchestrators::waiting(&outbox)? {
+    orchestrators::pending(&outbox)?;
+    if !orchestrators::waiting(&outbox) {
         println!("No orchestrator change waits for approval.");
         return Ok(());
     }
@@ -426,6 +451,10 @@ pub fn doctor(runner: &dyn Runner) -> Result<()> {
         .map(|raw| serde_json::from_slice::<Value>(&raw))
         .transpose()?;
     let status = load(&connection(&data).join(SYNC_STATUS))?;
+    let orchestrators = orchestrators::summary(&outbox);
+    if let Some(notice) = orchestrators["notice"].as_str() {
+        eprintln!("{notice}");
+    }
     println!(
         "{}",
         json!({
@@ -436,7 +465,7 @@ pub fn doctor(runner: &dyn Runner) -> Result<()> {
             "pending": pending,
             "delivered": delivered,
             "drops": drops::counts(&store, &outbox)?,
-            "orchestrators": orchestrators::summary(&outbox)?,
+            "orchestrators": orchestrators,
             "revoked": connection(&data).join("revoked").exists(),
             "last_receipt": receipt,
             "last_sync_error": status.and_then(|s| s.get("last_sync_error").cloned()),

@@ -19,15 +19,27 @@ const MAX_FILE: u64 = 65536;
 const MAX_ORCHESTRATORS: usize = 8;
 const MAX_NAMES: usize = 8;
 const MAX_NAME: usize = 64;
-const SECRET_WORDS: [&str; 8] = [
+const UNREADABLE: &str = "offered_list_unreadable";
+const UNAPPROVED: &str = "unapproved";
+const SECRET_WORDS: [&str; 14] = [
     "SECRET",
-    "TOKEN",
     "KEY",
-    "PASSWORD",
-    "PASSWD",
-    "CREDENTIAL",
     "AUTH",
     "COOKIE",
+    "PASS",
+    "PWD",
+    "CRED",
+    "TOK",
+    "DSN",
+    "BEARER",
+    "JWT",
+    "PRIVATE",
+    "SESSION",
+    "DATABASE_URL",
+];
+const ALWAYS_SET: [&str; 11] = [
+    "HOME", "PATH", "USER", "LOGNAME", "PWD", "OLDPWD", "SHELL", "TERM", "LANG", "HOSTNAME",
+    "TMPDIR",
 ];
 const REFS: [(&str, &str); 3] = [
     ("agent_ref", "orchestrator_agent_ref"),
@@ -41,7 +53,10 @@ fn allowed_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
-    shaped && !SECRET_WORDS.iter().any(|word| name.contains(word))
+    shaped
+        && !ALWAYS_SET.contains(&name)
+        && !SECRET_WORDS.iter().any(|word| name.contains(word))
+        && !name.split('_').any(|segment| segment == "PAT")
 }
 fn env_names(env: &Object) -> Option<Vec<&str>> {
     let mut names = Vec::new();
@@ -66,12 +81,13 @@ fn valid(entry: &Value) -> bool {
     };
     let names = env_names(env).unwrap_or_default();
     entry.as_object().is_some_and(|o| o.len() == 2)
-        && entry["key"].as_str().is_some_and(orchestrator_key)
+        && entry["key"]
+            .as_str()
+            .is_some_and(|key| orchestrator_key(key) && key != UNAPPROVED)
         && (1..=MAX_NAMES).contains(&names.len())
         && names.iter().all(|name| allowed_name(name))
         && REFS.iter().any(|(field, _)| env.contains_key(*field))
 }
-/// One bad name refuses its whole entry; a list that cannot be read is refused whole.
 pub(crate) fn offer(list: &Value) -> Value {
     let Some(entries) = list.as_array().filter(|l| l.len() <= MAX_ORCHESTRATORS) else {
         let refused = list.as_array().map_or(1, Vec::len);
@@ -104,13 +120,17 @@ fn list(offer: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 fn offered(state: &Path) -> Result<Option<Value>> {
-    let Some(saved) = read(&state.join(OFFERED))? else {
+    let Some(saved) = read(&state.join(OFFERED)).map_err(|_| UNREADABLE)? else {
         return Ok(None);
     };
-    let checked = offer(&saved["orchestrators"]);
-    Ok(Some(
-        json!({"orchestrators": checked["orchestrators"], "refused": saved["refused"]}),
-    ))
+    let stored = saved.get("orchestrators").filter(|l| l.is_array());
+    let earlier = saved.get("refused").and_then(Value::as_u64);
+    let (Some(stored), Some(earlier)) = (stored, earlier) else {
+        return Err(UNREADABLE.into());
+    };
+    let mut checked = offer(stored);
+    checked["refused"] = json!(checked["refused"].as_u64().unwrap_or(0) + earlier);
+    Ok(Some(checked))
 }
 /// Rereads the rules on every load, so a list saved by any other means is no wider.
 pub fn approved(state: &Path) -> Result<Vec<Value>> {
@@ -126,11 +146,17 @@ pub fn approved(state: &Path) -> Result<Vec<Value>> {
 pub(crate) fn save_offer(state: &Path, offer: &Value) -> Result<()> {
     store::replace(state, OFFERED, &serde_json::to_vec(offer)?)
 }
-pub fn waiting(state: &Path) -> Result<bool> {
+pub fn waiting(state: &Path) -> bool {
     let Ok(approved) = approved(state) else {
-        return Ok(true);
+        return true;
     };
-    Ok(offered(state)?.is_some_and(|offer| list(&offer) != approved))
+    offered(state)
+        .ok()
+        .flatten()
+        .is_some_and(|offer| list(&offer) != approved)
+}
+pub fn offer_unreadable(state: &Path) -> bool {
+    offered(state).is_err()
 }
 /// What approval would save, as read once: approving never takes a later offer.
 pub(crate) fn pending(state: &Path) -> Result<(Vec<Value>, u64)> {
@@ -145,37 +171,119 @@ pub(crate) fn approve(state: &Path, entries: &[Value]) -> Result<()> {
 fn keys(entries: &[Value]) -> Vec<&Value> {
     entries.iter().map(|entry| &entry["key"]).collect()
 }
-pub fn summary(state: &Path) -> Result<Value> {
+fn notice(offered: &[Value], approved: &[Value]) -> Option<String> {
+    let outcome = if approved.is_empty() {
+        "stay unknown"
+    } else {
+        "may look interactive"
+    };
+    let known = keys(approved);
+    let missing: Vec<&str> = keys(offered)
+        .into_iter()
+        .filter(|key| !known.contains(key))
+        .filter_map(Value::as_str)
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "Runs of {} {outcome} until approved. In a terminal run: devdiary-collector orchestrators approve",
+            missing.join(", ")
+        )
+    })
+}
+pub fn summary(state: &Path) -> Value {
     let saved = approved(state);
-    let unreadable = saved.is_err();
+    let approved_unreadable = saved.is_err();
     let approved = saved.unwrap_or_default();
-    let offer = offered(state)?.unwrap_or_else(|| json!({}));
+    let stored = offered(state);
+    let offered_unreadable = stored.is_err();
+    let offer = stored.ok().flatten().unwrap_or_else(|| json!({}));
     let offered = list(&offer);
-    Ok(json!({
+    json!({
         "approved": keys(&approved),
-        "approved_list_unreadable": unreadable,
+        "approved_list_unreadable": approved_unreadable,
         "offered": keys(&offered),
-        "waiting_for_approval": waiting(state)?,
+        "offered_list_unreadable": offered_unreadable,
+        "waiting_for_approval": waiting(state),
         "refused": offer["refused"].as_u64().unwrap_or(0),
-    }))
+        "notice": notice(&offered, &approved),
+    })
+}
+fn field_names(entry: &Value, fields: &[&str]) -> Vec<String> {
+    fields
+        .iter()
+        .filter_map(|field| entry["env"].get(*field))
+        .flat_map(|value| match value {
+            Value::Array(list) => list.clone(),
+            other => vec![other.clone()],
+        })
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect()
 }
 pub(crate) fn describe(entries: &[Value]) -> Vec<String> {
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let key = entry["key"].as_str()?;
-            let names = env_names(entry["env"].as_object()?)?;
-            Some(format!("{key}: {}", names.join(", ")))
-        })
-        .collect()
+    let mut lines = Vec::new();
+    for entry in entries {
+        lines.push(entry["key"].as_str().unwrap_or_default().to_owned());
+        let refs = field_names(entry, &["agent_ref", "run_ref", "task_ref"]);
+        lines.push(format!("  refs: {}", refs.join(", ")));
+        let paths = field_names(entry, &["checkout_path"]);
+        if !paths.is_empty() {
+            lines.push(format!(
+                "  checkout paths (used here only): {}",
+                paths.join(", ")
+            ));
+        }
+    }
+    lines
+}
+fn fields(entries: &[Value]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in entries {
+        let key = entry["key"].as_str().unwrap_or_default();
+        for field in ["agent_ref", "checkout_path", "run_ref", "task_ref"] {
+            for name in field_names(entry, &[field]) {
+                lines.push(format!("{key} {field} {name}"));
+            }
+        }
+    }
+    lines
+}
+pub(crate) fn changes(old: &[Value], new: &[Value]) -> (Vec<String>, Vec<String>) {
+    let (old, new) = (fields(old), fields(new));
+    let missing = |from: &[String], other: &[String]| -> Vec<String> {
+        from.iter()
+            .filter(|l| !other.contains(l))
+            .cloned()
+            .collect()
+    };
+    (missing(&new, &old), missing(&old, &new))
 }
 
 pub(crate) struct Declared {
     pub(crate) row: Object,
     pub(crate) checkout: Vec<String>,
+    pub(crate) named: bool,
 }
-pub(crate) fn declared(entries: &[Value]) -> Option<Declared> {
-    entries.iter().find_map(declare)
+fn offer_unanswered(state: &Path) -> bool {
+    match offered(state) {
+        Ok(Some(offer)) => !list(&offer).is_empty() || offer["refused"] != json!(0),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+// An agent run must never read as the machine owner's, so an offer nobody has
+// answered marks every row, and no env name is read until a person approves.
+pub(crate) fn declared(state: &Path) -> Result<Option<Declared>> {
+    let approved = approved(state);
+    if approved.as_ref().map_or(true, Vec::is_empty) && offer_unanswered(state) {
+        let mut row = Object::new();
+        row.insert("orchestrator".into(), UNAPPROVED.into());
+        return Ok(Some(Declared {
+            row,
+            checkout: Vec::new(),
+            named: false,
+        }));
+    }
+    Ok(approved?.iter().find_map(declare))
 }
 // Any id, even malformed, marks the run orchestrated: leaving the key out would
 // let the server bind someone else's run to the machine owner.
@@ -210,7 +318,11 @@ fn declare(entry: &Value) -> Option<Declared> {
         .flatten()
         .filter_map(|name| std::env::var(name.as_str()?).ok())
         .collect();
-    Some(Declared { row, checkout })
+    Some(Declared {
+        row,
+        checkout,
+        named: true,
+    })
 }
 
 #[cfg(test)]
@@ -252,13 +364,86 @@ mod tests {
 
     #[test]
     fn a_name_holding_a_secret_word_is_refused_wherever_the_word_sits() {
-        for word in SECRET_WORDS {
+        for word in SECRET_WORDS
+            .iter()
+            .chain(&["TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL"])
+        {
             for name in [word.to_string(), format!("A_{word}_B"), format!("X{word}")] {
                 assert!(!allowed_name(&name), "{name}");
             }
         }
         assert!(!allowed_name("MONKEY_ID"));
         assert!(!allowed_name("OAUTH_ID"));
+    }
+
+    #[test]
+    fn short_secret_spellings_are_refused() {
+        for name in [
+            "GH_PAT",
+            "PAT_VALUE",
+            "MY_PAT_ID",
+            "PGPASS",
+            "MYSQL_PWD",
+            "API_TOK",
+            "DB_CREDS",
+            "SENTRY_DSN",
+            "OIDC_BEARER",
+            "CI_JWT",
+            "SSH_PRIVATE_FILE",
+            "TERM_SESSION_ID",
+            "DATABASE_URL",
+            "PRIMARY_DATABASE_URL",
+        ] {
+            assert!(!allowed_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn pat_counts_only_as_a_whole_segment() {
+        for name in ["WORK_PATH", "PATH_HINT", "PATCH_ID", "SPAT_ID"] {
+            assert!(allowed_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn names_set_in_every_shell_are_refused_exactly() {
+        for name in [
+            "HOME", "PATH", "USER", "LOGNAME", "PWD", "OLDPWD", "SHELL", "TERM", "LANG",
+            "HOSTNAME", "TMPDIR",
+        ] {
+            assert!(!allowed_name(name), "{name}");
+        }
+        for name in ["HOME_DIR", "USER_ID", "TERM_ID", "MY_SHELL"] {
+            assert!(allowed_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_contract_preset_names_all_pass() {
+        for name in [
+            "PAPERCLIP_AGENT_ID",
+            "PAPERCLIP_RUN_ID",
+            "PAPERCLIP_TASK_ID",
+            "PAPERCLIP_WORKSPACE_WORKTREE_PATH",
+            "PAPERCLIP_WORKSPACE_CWD",
+        ] {
+            assert!(allowed_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn changes_name_the_field_that_moved() {
+        let old = json!([{"key": "a", "env": {"agent_ref": "ONE", "run_ref": "TWO"}}]);
+        let new = json!([
+            {"key": "a", "env": {"agent_ref": "TWO", "checkout_path": ["DIR"]}},
+            {"key": "b", "env": {"run_ref": "THREE"}},
+        ]);
+        let (added, removed) = changes(old.as_array().unwrap(), new.as_array().unwrap());
+        assert_eq!(
+            added,
+            ["a agent_ref TWO", "a checkout_path DIR", "b run_ref THREE"]
+        );
+        assert_eq!(removed, ["a agent_ref ONE", "a run_ref TWO"]);
     }
 
     #[test]
@@ -297,6 +482,7 @@ mod tests {
             json!({"key": "a", "env": {"run_ref": "R", "checkout_path": "P"}}),
             json!({"key": "a", "env": {"run_ref": "R", "checkout_path": [1]}}),
             entry("none", "R"),
+            entry("unapproved", "R"),
             entry("Upper", "R"),
             entry("has space", "R"),
             entry("", "R"),
@@ -331,7 +517,9 @@ mod tests {
         assert_eq!(
             describe(&[preset]),
             [
-                "paperclip: PAPERCLIP_AGENT_ID, PAPERCLIP_WORKSPACE_WORKTREE_PATH, PAPERCLIP_WORKSPACE_CWD, PAPERCLIP_RUN_ID, PAPERCLIP_TASK_ID"
+                "paperclip",
+                "  refs: PAPERCLIP_AGENT_ID, PAPERCLIP_RUN_ID, PAPERCLIP_TASK_ID",
+                "  checkout paths (used here only): PAPERCLIP_WORKSPACE_WORKTREE_PATH, PAPERCLIP_WORKSPACE_CWD",
             ]
         );
     }

@@ -811,9 +811,10 @@ fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<(Object, Opti
         let row = json!({"schema_version": 1, "repository": config["repository"]});
         return Ok((object(&serde_json::to_vec(&row)?)?, None));
     }
-    let run = orchestrators::declared(&orchestrators::approved(state)?);
+    let run = orchestrators::declared(state)?;
     let mut gitdir = None;
-    let located = locate(cwd, config, state, run.as_ref())?;
+    let named = run.as_ref().filter(|run| run.named);
+    let located = locate(cwd, config, state, named)?;
     let mut row = run.map(|run| run.row).unwrap_or_default();
     if let Some((reference, found)) = located {
         row.insert("repository_ref".into(), reference.into());

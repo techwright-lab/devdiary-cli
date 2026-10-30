@@ -297,27 +297,41 @@ names, for example `PAPERCLIP_AGENT_ID` for the `paperclip` preset:
 ```
 
 Every scope refresh stores this list as `orchestrators-offered.json` (0600) in the
-outbox. The hook never reads it. The hook reads only the names in
-`orchestrators-approved.json` (0600), and the only command that writes that file is:
+outbox. The hook takes no names from it. The hook reads only the names in
+`orchestrators-approved.json` (0600). Three commands write that file, always after
+the same prompt on a terminal: `install`, `upgrade` and:
 
 ```sh
 devdiary-collector orchestrators approve [CONNECTION_DIR]
 ```
 
-It prints the keys and names, asks `[y/N]`, and saves what it printed. Without a
-terminal it refuses with `approval_required`, and it has no `--yes`. So a server
-cannot widen what the hook reads unless a person agrees. `upgrade` also fetches the
-offer and asks.
+The prompt prints each key with its refs and its checkout paths as separate groups.
+When an approved list already exists it also prints what was added and removed. It
+asks `[y/N]` and saves what it printed. Without a terminal `orchestrators approve`
+refuses with `approval_required`, and it has no `--yes`. `install` and `upgrade`
+finish without a terminal and leave the change waiting; their `--yes` covers only the
+hook entries. So a server cannot widen what the hook reads unless a person agrees.
 
 When the offer changes, the approved list keeps working unchanged, also when the
 offer gets smaller. `doctor` (`orchestrators`), `connection-status`
 (`local_orchestrators`) and `status` (`orchestrators_waiting`, only when true) report
-that a change waits for approval. `refused` counts entries that were refused.
+that a change waits for approval. `refused` counts entries that were refused. When a
+preset is offered and not approved, `doctor` prints a line on stderr, and `notice`
+holds the same text.
+
+A bad offered file stops no command. `doctor` and `connection-status` report
+`offered_list_unreadable` and `status` reports `orchestrators_offered_unreadable`;
+the next scope reply that has the field replaces the file. `orchestrators approve`
+refuses with `offered_list_unreadable` until then. A file with the wrong owner or mode
+is different: as for all state, every command refuses until it is fixed.
 
 The collector refuses a whole entry if one name does not match
-`^[A-Z][A-Z0-9_]{0,63}$` or contains `SECRET`, `TOKEN`, `KEY`, `PASSWORD`, `PASSWD`,
-`CREDENTIAL`, `AUTH` or `COOKIE`. It also refuses an entry with more than 8 names or
-without a ref, and a list with more than 8 entries. The approved file is checked
+`^[A-Z][A-Z0-9_]{0,63}$`, or contains `SECRET`, `KEY`, `AUTH`, `COOKIE`, `PASS`, `PWD`,
+`CRED`, `TOK`, `DSN`, `BEARER`, `JWT`, `PRIVATE`, `SESSION` or `DATABASE_URL`, or has
+`PAT` as a whole `_`-separated segment (`GH_PAT`, not `WORK_PATH`), or is exactly one
+of `HOME`, `PATH`, `USER`, `LOGNAME`, `PWD`, `OLDPWD`, `SHELL`, `TERM`, `LANG`,
+`HOSTNAME` or `TMPDIR`, which are set in every shell. It also refuses an entry with
+more than 8 names or without a ref, and a list with more than 8 entries. The approved file is checked
 again on each read: if it fails, the hook reads no names and drops the row (`error`).
 
 If two approved entries match the environment, the first in the list wins. Values
@@ -327,8 +341,18 @@ with the preset key, so the server does not treat it as the machine owner's own 
 Rows from other runs have no `orchestrator` field. `checkout_path` values are local
 hints used when `cwd` is not a repository; they never leave the machine.
 
-Until a person approves, runs of that control plane look like ordinary runs. After
-a first upgrade, run `doctor` to check for a waiting change.
+An offer nobody answered fails closed. While the approved list is empty or unreadable
+and the offer has an entry, a refused entry or cannot be read, every row carries
+`orchestrator: "unapproved"`. The hook reads no environment name for these rows, so
+they have no refs and use no checkout path. The server keeps them with binding
+unknown, so an agent run never reads as the machine owner's work, and `doctor` says
+runs stay unknown until approved. Outside a repository such a row is dropped
+(`outside_scope`), also with `--record-orchestrated-outside-repos`. `unapproved` is
+reserved and cannot be a preset key. With an unreadable approved list and no offer the
+hook drops the row, as above.
+
+Once an approved list exists, a preset added to the offer is not read until approved.
+Its runs can look like ordinary runs, and `doctor` says so.
 
 Verification: `python3 collector-rs/tests/install_test.py -v` (temp HOME, a mock
 pairing/ingest server and a fake systemctl; debug builds only honour

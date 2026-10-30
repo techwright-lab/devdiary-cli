@@ -617,9 +617,18 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         for name in [*PAPERCLIP["env"].values()][:3]:
             self.assertIn(name.encode(), out)
-        self.assertIn(b"PAPERCLIP_WORKSPACE_CWD", out)
+        self.assertIn(
+            b"refs: PAPERCLIP_AGENT_ID, PAPERCLIP_RUN_ID, PAPERCLIP_TASK_ID", out
+        )
+        self.assertIn(
+            b"checkout paths (used here only): PAPERCLIP_WORKSPACE_WORKTREE_PATH, "
+            b"PAPERCLIP_WORKSPACE_CWD",
+            out,
+        )
+        self.assertNotIn(b"added ", out)
         self.assertEqual(self.approved(), [PAPERCLIP])
         self.assertFalse(self.waiting()["waiting_for_approval"])
+        self.assertIsNone(self.waiting()["notice"])
 
     def test_declining_the_names_keeps_the_hooks_and_leaves_the_change_waiting(self):
         self.orchestrators = [PAPERCLIP]
@@ -675,9 +684,45 @@ class InstallTest(unittest.TestCase):
         args = [str(BIN), "orchestrators", "approve"]
         code, out, err = self.converse(args, [b"n\n"])
         self.assertEqual(code, 2)
-        self.assertIn(b"CRON_RUN", out)
+        self.assertIn(b"added cron run_ref CRON_RUN", out)
+        self.assertIn(b"removed paperclip agent_ref PAPERCLIP_AGENT_ID", out)
         self.assertIn(b"consent_declined", err)
         self.assertEqual(self.approved(), [PAPERCLIP])
+
+    def test_doctor_warns_that_unapproved_runs_may_look_interactive(self):
+        self.orchestrators = [PAPERCLIP]
+        self.install("--yes")
+        result = self.run_collector("doctor")
+        self.assertIn(b"stay unknown until approved", result.stderr)
+        self.assertIn("paperclip", json.loads(result.stdout)["orchestrators"]["notice"])
+
+    def test_doctor_says_nothing_when_no_name_is_offered(self):
+        self.install("--yes")
+        result = self.run_collector("doctor")
+        self.assertNotIn(b"until approved", result.stderr)
+        self.assertIsNone(json.loads(result.stdout)["orchestrators"]["notice"])
+
+    def spoil_offer(self):
+        offered = self.data / "connection/outbox/orchestrators-offered.json"
+        offered.write_text("not json")
+        offered.chmod(0o600)
+
+    def test_a_bad_offered_file_stops_neither_doctor_nor_upgrade(self):
+        self.install("--yes")
+        self.spoil_offer()
+        self.assertTrue(self.waiting()["offered_list_unreadable"])
+        out = self.run_collector("upgrade", "--yes").stdout
+        self.assertIn(b"Self-test passed", out)
+        self.assertIn(b"next sync replaces it", out)
+
+    def test_orchestrators_approve_names_a_bad_offered_file(self):
+        self.install("--yes")
+        self.spoil_offer()
+        args = [str(BIN), "orchestrators", "approve"]
+        code, _, err = self.converse(args, [])
+        self.assertEqual(code, 2)
+        self.assertIn(b"offered_list_unreadable", err)
+        self.assertIn(b"next sync replaces it", err)
 
     def test_orchestrators_approve_with_nothing_waiting_asks_nothing(self):
         self.install("--yes")

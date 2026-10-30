@@ -650,7 +650,7 @@ pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     let refs = crate::store::read_refs(&root.join("outbox"))
         .map(|r| r.len())
         .ok();
-    let orchestrators = crate::orchestrators::summary(&root.join("outbox"))?;
+    let orchestrators = crate::orchestrators::summary(&root.join("outbox"));
     println!(
         "{}",
         json!({"connection":"saved", "local_repository_refs":refs, "local_orchestrators":orchestrators, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})

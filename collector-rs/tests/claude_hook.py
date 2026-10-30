@@ -1146,17 +1146,101 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.assertFalse((self.outbox / "orchestrators-approved.json").exists())
         self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
         (row,) = self.rows()
-        self.assertFalse({"orchestrator", "orchestrator_agent_ref"} & row.keys())
+        self.assertEqual(row["orchestrator"], "unapproved")
+        self.assertNotIn("orchestrator_agent_ref", row)
         self.assertEqual(
             self.status(),
             {
                 "approved": [],
                 "approved_list_unreadable": False,
                 "offered": ["paperclip"],
+                "offered_list_unreadable": False,
                 "waiting_for_approval": True,
                 "refused": 0,
+                "notice": "Runs of paperclip stay unknown until approved. "
+                "In a terminal run: devdiary-collector orchestrators approve",
             },
         )
+
+    def test_an_unanswered_offer_marks_every_row_even_with_no_variable_set(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect(approved=None)
+        self.sync()
+        self.hook(self.main, tool_use_id="plain")
+        self.hook(self.main, tool_use_id="run", PAPERCLIP_RUN_ID=RUN)
+        rows = self.rows()
+        self.assertEqual([r["orchestrator"] for r in rows], ["unapproved"] * 2)
+        self.assertNotIn("orchestrator_run_ref", rows[1])
+        self.sync()
+        self.assertNotIn(RUN.encode(), b"".join(self.received))
+
+    def test_the_marker_uses_no_checkout_hint_and_records_nothing_outside_a_repo(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        tree = self.root / "hint-tree"
+        git("-C", self.main, "worktree", "add", "-q", tree)
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect(opt_in=True, approved=None)
+        self.sync()
+        self.hook(plain, PAPERCLIP_AGENT_ID=AGENT, PAPERCLIP_WORKSPACE_CWD=str(tree))
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"outside_scope": 1})
+
+    def test_an_empty_approved_list_with_an_offer_marks_rows(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect(approved=[])
+        self.sync()
+        self.hook(self.main)
+        self.assertEqual(self.rows()[0]["orchestrator"], "unapproved")
+
+    def test_an_unreadable_approved_list_with_an_offer_marks_rows(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect()
+        self.sync()
+        (self.outbox / "orchestrators-approved.json").write_text("not json")
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        (row,) = self.rows()
+        self.assertEqual(row["orchestrator"], "unapproved")
+        self.assertEqual(self.drops(), {})
+
+    def test_an_offer_that_was_all_refused_marks_rows(self):
+        self.served_orchestrators = [
+            {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
+        ]
+        self.connect(approved=None)
+        self.sync()
+        self.hook(self.main, AWS_SECRET_ACCESS_KEY=AGENT)
+        (row,) = self.rows()
+        self.assertEqual(row["orchestrator"], "unapproved")
+        self.assertNotIn("orchestrator_agent_ref", row)
+
+    def test_an_unreadable_offer_with_nothing_approved_marks_rows(self):
+        self.connect(approved=None)
+        offered = self.outbox / "orchestrators-offered.json"
+        offered.write_text("not json")
+        offered.chmod(0o600)
+        self.hook(self.main)
+        self.assertEqual(self.rows()[0]["orchestrator"], "unapproved")
+
+    def test_with_nothing_offered_rows_stay_plain(self):
+        self.served_orchestrators = []
+        self.connect(approved=None)
+        self.hook(self.main, tool_use_id="before")
+        self.sync()
+        self.hook(self.main, tool_use_id="after")
+        for row in self.rows():
+            self.assertNotIn("orchestrator", row)
+
+    def test_approving_ends_the_marker(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect(approved=None)
+        self.sync()
+        self.approve([PAPERCLIP])
+        self.hook(self.main, tool_use_id="plain")
+        self.hook(self.main, tool_use_id="run", PAPERCLIP_AGENT_ID=AGENT)
+        rows = self.rows()
+        self.assertNotIn("orchestrator", rows[0])
+        self.assertEqual(rows[1]["orchestrator"], "paperclip")
 
     def test_the_offered_list_is_stored_privately(self):
         self.served_orchestrators = [PAPERCLIP]
@@ -1177,6 +1261,7 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.assertEqual(rows[0]["orchestrator"], "paperclip")
         self.assertNotIn("orchestrator", rows[1])
         self.assertTrue(self.status()["waiting_for_approval"])
+        self.assertIn("may look interactive", self.status()["notice"])
 
     def test_a_server_that_drops_the_offer_cannot_narrow_the_approved_list(self):
         self.served_orchestrators = []
@@ -1185,6 +1270,34 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
         self.assertEqual(self.rows()[0]["orchestrator"], "paperclip")
         self.assertTrue(self.status()["waiting_for_approval"])
+
+    def test_a_bad_offered_file_is_reported_and_replaced_by_the_next_offer(self):
+        self.connect()
+        offered = self.outbox / "orchestrators-offered.json"
+        for bad in ("not json", "[1]", '{"orchestrators": 3, "refused": 0}'):
+            offered.write_text(bad)
+            offered.chmod(0o600)
+            self.assertTrue(self.status()["offered_list_unreadable"], bad)
+            self.assertFalse(self.status()["waiting_for_approval"], bad)
+        plain = json.loads(self.run_collector("status", self.outbox).stdout)
+        self.assertTrue(plain["orchestrators_offered_unreadable"])
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        self.assertEqual(self.rows()[0]["orchestrator"], "paperclip")
+        self.served_orchestrators = [PAPERCLIP]
+        self.sync()
+        self.assertFalse(self.status()["offered_list_unreadable"])
+
+    def test_a_refused_entry_left_in_an_old_offer_counts_as_refused(self):
+        self.connect()
+        self.write(
+            self.outbox / "orchestrators-offered.json",
+            {
+                "orchestrators": [{"key": "old", "env": {"run_ref": "SENTRY_DSN"}}],
+                "refused": 1,
+            },
+        )
+        status = self.status()
+        self.assertEqual((status["offered"], status["refused"]), ([], 2))
 
     def test_a_scope_reply_without_the_field_keeps_the_stored_offer(self):
         self.served_orchestrators = [PAPERCLIP]

@@ -14,8 +14,9 @@ const REPORTED: [&str; 5] = [
     "stale_plan",
     "repair_required",
 ];
-const INSTALL_REPORTED: [&str; 18] = [
+const INSTALL_REPORTED: [&str; 19] = [
     "approval_required",
+    "offered_list_unreadable",
     "connection_revoked",
     "connection_active",
     "consent_required",
@@ -38,6 +39,9 @@ fn install_hint(code: &str) -> &'static str {
     match code {
         "approval_required" => {
             "Approving orchestrator names needs a person at a terminal. No flag replaces this. Run this command in a terminal."
+        }
+        "offered_list_unreadable" => {
+            "The saved orchestrator offer cannot be read. The next sync replaces it; run this command again after that."
         }
         "consent_required" => {
             "Run install in a terminal to review the hook entries, or pass --yes."
@@ -264,13 +268,18 @@ fn run() -> Result<i32> {
             let store = Store::open(state, None)?;
             let (pending, delivered) = store.counts()?;
             let drops = serde_json::to_string(&drops::counts(&store, state)?)?;
-            let waiting = if orchestrators::waiting(state)? {
+            let waiting = if orchestrators::waiting(state) {
                 ",\"orchestrators_waiting\":true"
             } else {
                 ""
             };
+            let unreadable = if orchestrators::offer_unreadable(state) {
+                ",\"orchestrators_offered_unreadable\":true"
+            } else {
+                ""
+            };
             println!(
-                "{{\"pending\":{pending},\"delivered\":{delivered},\"drops\":{drops}{waiting}}}"
+                "{{\"pending\":{pending},\"delivered\":{delivered},\"drops\":{drops}{waiting}{unreadable}}}"
             );
             return Ok(0);
         }
