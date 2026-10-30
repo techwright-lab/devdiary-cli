@@ -711,6 +711,15 @@ class ClaudeHookTest(unittest.TestCase):
         self.assertEqual(len(self.rows()), 2)
         self.assertEqual(self.drops(), {"stale_plan": 1})
 
+    def test_unrelated_revoked_entry_beside_a_plain_state_is_ignored(self):
+        (self.root / "revoked").write_text("unrelated")
+        self.hook()
+        (self.root / "revoked").unlink()
+        (self.root / "revoked").mkdir()
+        self.hook(dict(self.raw, tool_use_id="beside-directory"))
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(self.drops(), {})
+
     def test_large_tool_payload_is_skipped_up_to_four_mebibytes(self):
         self.hook(dict(self.raw, tool_response="PRIVATE_SENTINEL" * 200_000))
         self.assertEqual(len(self.rows()), 1)
@@ -766,7 +775,9 @@ class ClaudeHookTest(unittest.TestCase):
             key = self.root / "synthetic-key"
             key.write_text("dc_live_SYNTHETIC_ONLY")
             key.chmod(0o600)
+            (self.state / "executable-fingerprint").unlink()
             self.command("sync", self.state, key, "10")
+            self.assertTrue((self.state / "executable-fingerprint").exists())
             self.assertEqual(received, spooled)
             self.assertEqual(self.rows(), [])
             self.assertEqual(

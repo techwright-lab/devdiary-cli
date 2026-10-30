@@ -1,12 +1,14 @@
 """Parent pairing harness cleanup, without PostgreSQL/Rails/vendor execution."""
 
 import contextlib
+import email.utils
 import io
 import json
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -220,6 +222,32 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
         self.assertIn(b"Retry-After", result.stderr)
         self.assertEqual(len(self.requests), 1)
         self.assertFalse((self.connection / "revoked").exists())
+
+    def test_sync_resumes_once_retry_after_has_passed(self):
+        self.hook("first")
+        self.status, self.headers = 429, {"Retry-After": "1"}
+        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.status, self.headers = 201, {}
+        self.run_collector("connection-sync", self.connection, "10", code=2)
+        time.sleep(1.1)
+        self.run_collector("connection-sync", self.connection, "10")
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.health()["local_pending"], 0)
+
+    def test_http_date_retry_after_blocks_the_next_sync(self):
+        self.hook("first")
+        later = email.utils.formatdate(time.time() + 3600, usegmt=True)
+        self.status, self.headers = 429, {"Retry-After": later}
+        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.status, self.headers = 201, {}
+        self.run_collector("connection-sync", self.connection, "10", code=2)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_forbidden_is_treated_as_revocation(self):
+        self.hook("first")
+        self.status = 403
+        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.assertTrue((self.connection / "revoked").exists())
 
 
 if __name__ == "__main__":

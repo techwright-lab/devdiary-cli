@@ -430,6 +430,14 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         return Ok(());
     }
 }
+// Only a paired outbox has a revocation marker. A plain state's parent is an
+// arbitrary user directory whose entries say nothing about this connection.
+pub(crate) fn revoked(state: &Path) -> bool {
+    state.file_name().is_some_and(|name| name == "outbox")
+        && state.parent().is_some_and(|root| {
+            root.join("connection.json").is_file() && root.join("revoked").exists()
+        })
+}
 pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
     let doc = connection(root)?;
     let config = doc["scope"].as_object().ok_or("invalid_connection")?;

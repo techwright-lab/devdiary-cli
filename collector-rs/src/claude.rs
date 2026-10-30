@@ -122,6 +122,18 @@ fn remember(state: &Path, fingerprint: &str) -> Result<()> {
     file.set_len(fingerprint.len() as u64)?;
     Ok(())
 }
+// The syncing binary is normally the registered one, so hashing it here keeps
+// the full hash out of the next hook's deadline. Any other binary's stat
+// fingerprint never matches the registered path and the hook re-hashes.
+pub(crate) fn rehash(state: &Path) -> Result<()> {
+    match executable(&std::env::current_exe()?) {
+        Ok((current, _)) => remember(state, &current),
+        Err(_) => match fs::remove_file(state.join(FINGERPRINT)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        },
+    }
+}
 // A matching stat fingerprint stands in for the full hash; any replacement,
 // write or chmod changes ino, size, mtime or ctime and forces a re-hash.
 fn trusted_executable(p: &Object, state: &Path) -> Result<()> {
@@ -830,15 +842,16 @@ pub fn hook(plan_path: &Path, raw: Result<Vec<u8>>) -> Result<()> {
     }
     outcome
 }
-fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<()> {
+fn active(plan_path: &Path, p: &Object) -> Result<()> {
     let m = manifest(plan_path, p)?;
     if !["prepared", "installed"].contains(&text(&m, "status")?) {
         return Err("registration_not_active".into());
     }
-    if state
-        .parent()
-        .is_some_and(|connection| connection.join("revoked").exists())
-    {
+    Ok(())
+}
+fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<()> {
+    active(plan_path, p)?;
+    if crate::pairing::revoked(state) {
         return Err("revoked".into());
     }
     let scope = p
@@ -848,6 +861,7 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
     let normalized = normalize(data, scope)?;
     trusted_executable(p, state)?;
     let _lock = lock(state, true)?;
+    active(plan_path, p)?;
     let (_, doc) = settings(Path::new(text(p, "settings")?))?;
     owned(&doc, &p["entry"])?;
     let mut store = Store::open(state, None)?;

@@ -22,6 +22,7 @@ const SCHEMA: &str = "
 const ADDED_TABLES: &str = "
     CREATE TABLE delivered (observation_id TEXT PRIMARY KEY, digest BLOB NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TABLE drops (reason TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at INTEGER NOT NULL) WITHOUT ROWID;";
+const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INTEGER PRIMARY KEY CHECK(singleton=1), inode INTEGER NOT NULL);";
 
 fn trusted_ancestors(path: &Path) -> Result<()> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -190,6 +191,7 @@ impl Store {
         {
             return Err("frozen_scope_conflict".into());
         }
+        tx.execute_batch(FOLD_TABLE)?;
         tx.commit()?;
         File::open(state)?.sync_all()?;
         Ok(Self { db, config })
@@ -420,12 +422,7 @@ pub(crate) fn sync_key(
     if retry_after > now()? {
         return Err("sync_rate_limited".into());
     }
-    // Each sync forces the next hook to re-hash the registered executable.
-    if let Err(e) = fs::remove_file(state.join(FINGERPRINT))
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(e.into());
-    }
+    crate::claude::rehash(state)?;
     let url = store.config["endpoint"]
         .as_str()
         .ok_or("invalid_endpoint")?
@@ -474,6 +471,19 @@ pub(crate) fn sync_key(
     store.compact()?;
     store.counts()
 }
+const MAX_RETRY_AFTER: i64 = 86400;
+fn retry_after(value: &str, now: i64) -> Option<i64> {
+    let value = value.trim();
+    let seconds = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        value.parse::<i64>().unwrap_or(MAX_RETRY_AFTER)
+    } else {
+        let until = chrono::DateTime::parse_from_rfc2822(value)
+            .ok()?
+            .timestamp();
+        until.saturating_sub(now).max(0)
+    };
+    Some(seconds.min(MAX_RETRY_AFTER))
+}
 struct Failure {
     code: String,
     stop: bool,
@@ -511,8 +521,8 @@ fn post(
             .headers()
             .get("Retry-After")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<i64>().ok())
-            .filter(|n| status == 429 && (0..=86400).contains(n));
+            .filter(|_| status == 429)
+            .and_then(|v| retry_after(v, now().ok()?));
         return Err(Failure {
             code: format!("http_{status}"),
             stop: matches!(status, 401 | 403 | 429 | 500..=599),
@@ -531,4 +541,26 @@ fn post(
         revoked: false,
         retry_after: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_seconds_beyond_a_day_are_clamped() {
+        assert_eq!(retry_after("172800", 0), Some(86400));
+        assert_eq!(retry_after("30", 0), Some(30));
+        assert_eq!(retry_after("-1", 0), None);
+        assert_eq!(retry_after("soon", 0), None);
+    }
+
+    #[test]
+    fn retry_after_http_dates_wait_until_that_time() {
+        let at = 1792567680;
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        assert_eq!(retry_after(date, at - 90), Some(90));
+        assert_eq!(retry_after(date, at + 90), Some(0));
+        assert_eq!(retry_after(date, at - 172800), Some(86400));
+    }
 }
