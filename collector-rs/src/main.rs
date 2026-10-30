@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use devdiary_collector::{
     MAX_INPUT, Result,
-    store::{Store, sync},
+    store::{Store, repair, sync},
 };
 use std::{io::Read, path::Path, sync::mpsc, time::Duration};
 
@@ -84,7 +84,7 @@ fn run() -> Result<i32> {
             "setup PRIVATE_CONNECTION_DIR REPOSITORY [--remote NAME] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
         );
         println!(
-            "Experimental Linux collector; Claude adapter runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
+            "Experimental Linux collector; Claude adapter runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nrepair STATE (migrates an older spool; pending rows keep their bytes)\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
         );
         return Ok(0);
     }
@@ -120,6 +120,10 @@ fn run() -> Result<i32> {
         }
         Some("sync") if args.len() == 5 => sync(state, Path::new(&args[3]), args[4].parse()?)?,
         Some("status") if args.len() == 3 => Store::open(state, None)?.counts()?,
+        Some("repair") if args.len() == 3 => {
+            repair(state)?;
+            Store::open(state, None)?.counts()?
+        }
         _ => return Err("invalid_command".into()),
     };
     println!("{{\"pending\":{},\"delivered\":{}}}", counts.0, counts.1);

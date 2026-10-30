@@ -232,20 +232,18 @@ class CollectorTest(unittest.TestCase):
         self.mode = "ok"
         for remaining in range(count, 0, -100):
             self.call("sync", self.key, 100, code=int(remaining > 100))
-        self.call("status")  # another process/reopen after full drain
-        self.call(
-            "collect", data=row, code=2
-        )  # delivered evidence still reserves capacity
-        self.collect(0, **large)  # an exact retry remains idempotent at capacity
-        rows = db.execute(
-            "SELECT observation_id,payload,delivered,receipt,failure FROM outbox"
-        ).fetchall()
-        self.assertEqual(len(rows), count)
-        for observation_id, payload, delivered, raw_receipt, failure in rows:
-            self.assertEqual(payload, accepted[observation_id])
-            self.assertEqual(delivered, 1)
-            self.assertIsNone(failure)
-            observer_upload.receipt(raw_receipt, payload, self.config["collector_ref"])
+        status = json.loads(self.call("status").stdout)
+        self.assertEqual((status["pending"], status["delivered"]), (0, count))
+        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
+        self.collect(0, **large)  # an exact retry of a delivered row stays deduplicated
+        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
+        self.call("collect", data=row)  # delivered rows no longer reserve capacity
+        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 1)
+        (raw_receipt,) = db.execute("SELECT last_receipt FROM scope").fetchone()
+        last = json.loads(raw_receipt)["observation_id"]
+        observer_upload.receipt(
+            raw_receipt, accepted[last], self.config["collector_ref"]
+        )
         self.assertLessEqual(db.execute("PRAGMA page_count").fetchone()[0], 4096)
         self.assertLessEqual(
             (self.state / "collector-rust-v1.sqlite3").stat().st_size, 16 * 1024 * 1024
@@ -266,11 +264,9 @@ class CollectorTest(unittest.TestCase):
         self.call("sync", self.key, 1)
         self.assertEqual(self.requests[0][0], self.requests[1][0])
         self.assertEqual(
-            self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 1
+            self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 0
         )
-        self.assertEqual(
-            self.db().execute("SELECT delivered FROM outbox").fetchone()[0], 1
-        )
+        self.assertEqual(json.loads(self.call("status").stdout)["delivered"], 1)
 
     def test_poison_fairness_and_global_failure_cursor(self):
         self.collect()
@@ -283,9 +279,10 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(json.loads(self.requests[-1][0])["session_id"], "session-2")
         self.call("sync", self.key, 100, code=1)
         self.assertEqual(
-            self.db().execute("SELECT delivered FROM outbox ORDER BY seq").fetchall(),
-            [(0,), (1,)],
+            self.db().execute("SELECT observation_id FROM outbox").fetchall(),
+            [("00000002-2222-4222-8222-222222222222",)],
         )
+        self.assertEqual(json.loads(self.call("status").stdout)["delivered"], 1)
 
     def test_crash_after_server_acceptance_keeps_bytes_and_cursor(self):
         self.collect()
@@ -319,7 +316,7 @@ class CollectorTest(unittest.TestCase):
             self.call("sync", self.key, 100, code=1)
             self.assertEqual(len(self.requests), before + 1)
             self.assertEqual(
-                self.db().execute("SELECT delivered FROM outbox").fetchone()[0], 0
+                self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 1
             )
         self.key.write_text("dc_live_ROTATED_SYNTHETIC")
         self.mode = "ok"
@@ -409,8 +406,8 @@ class CollectorTest(unittest.TestCase):
             self.collect()
             self.call("sync", self.key, 1, code=1)
             self.assertEqual(
-                self.db().execute("SELECT failure,delivered FROM outbox").fetchone(),
-                ("network_failure", 0),
+                self.db().execute("SELECT failure FROM outbox").fetchone(),
+                ("network_failure",),
             )
         finally:
             server.shutdown()
@@ -428,9 +425,9 @@ class CollectorTest(unittest.TestCase):
         self.call("init", data=self.config, code=2)
         db = self.db()
         with db:
-            db.execute("PRAGMA user_version=2")
+            db.execute("PRAGMA user_version=3")
         self.call("status", code=2)
-        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
         self.assertEqual(self.requests, [])
 
     def test_collection_continues_during_exclusive_sync(self):
@@ -449,9 +446,8 @@ class CollectorTest(unittest.TestCase):
             self.release.set()
             process.communicate(timeout=8)
         self.assertEqual(len(self.requests), 1)
-        self.assertEqual(
-            self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 2
-        )
+        status = json.loads(self.call("status").stdout)
+        self.assertEqual((status["pending"], status["delivered"]), (1, 1))
 
     def test_blocked_and_oversize_stdin_and_network_deadlines(self):
         self.call("collect", data=b" " * 65537, code=2)

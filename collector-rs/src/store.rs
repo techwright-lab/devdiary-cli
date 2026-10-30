@@ -1,18 +1,29 @@
-use crate::{MAX_WIRE, Object, Result, endpoint, freeze, receipt, scope};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use crate::{MAX_WIRE, Object, Result, drops, endpoint, freeze, receipt, scope};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 const DB: &str = "collector-rust-v1.sqlite3";
 const APP_ID: i64 = 1145328177;
+const VERSION: i64 = 2;
+pub(crate) const SETTINGS_LOCK: &str = "claude-settings.lock";
+pub(crate) const FINGERPRINT: &str = "executable-fingerprint";
+// Delivered IDs are kept so a late duplicate hook firing is still deduplicated
+// instead of being resent as a conflicting observation.
+const TOMBSTONES: i64 = 4000;
+const SCHEMA: &str = "
+    CREATE TABLE scope (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json BLOB NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, delivered INTEGER NOT NULL DEFAULT 0, last_receipt BLOB, retry_after INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE outbox (seq INTEGER PRIMARY KEY, observation_id TEXT UNIQUE NOT NULL, payload BLOB NOT NULL, failure TEXT);";
+const ADDED_TABLES: &str = "
+    CREATE TABLE delivered (observation_id TEXT PRIMARY KEY, digest BLOB NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE TABLE drops (reason TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at INTEGER NOT NULL) WITHOUT ROWID;";
 
-// The same UID is trusted, as in the Python reference. Never follow symlink
-// ancestors; reject shared permissions/hardlinks rather than repairing them.
-pub fn private(path: &Path, directory: bool) -> Result<()> {
+fn trusted_ancestors(path: &Path) -> Result<()> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("absolute_private_path_required".into());
     }
@@ -28,20 +39,38 @@ pub fn private(path: &Path, directory: bool) -> Result<()> {
             return Err("unsafe_ancestor".into());
         }
     }
-    let m = fs::metadata(path)?;
-    if m.uid() != rustix::process::geteuid().as_raw()
-        || m.mode() & 0o077 != 0
-        || if directory {
-            !m.is_dir()
-        } else {
-            !m.is_file() || m.nlink() != 1
-        }
-    {
+    Ok(())
+}
+fn owned_by_us(path: &Path, directory: bool, forbidden_mode: u32) -> bool {
+    fs::metadata(path).is_ok_and(|m| {
+        m.uid() == rustix::process::geteuid().as_raw()
+            && m.mode() & forbidden_mode == 0
+            && if directory {
+                m.is_dir()
+            } else {
+                m.is_file() && m.nlink() == 1
+            }
+    })
+}
+// The same UID is trusted, as in the Python reference. Never follow symlink
+// ancestors; reject shared permissions/hardlinks rather than repairing them.
+pub fn private(path: &Path, directory: bool) -> Result<()> {
+    trusted_ancestors(path)?;
+    if !owned_by_us(path, directory, 0o077) {
         return Err("private_state_required".into());
     }
     Ok(())
 }
-fn create_private(path: &Path) -> Result<File> {
+// Customer settings stay readable by others (0644 under 0755); only writes by
+// anyone but the owner, hardlinks and symlinks are refused.
+pub fn owner_writable(path: &Path, directory: bool) -> Result<()> {
+    trusted_ancestors(path)?;
+    if !owned_by_us(path, directory, 0o022) {
+        return Err("unsafe_settings".into());
+    }
+    Ok(())
+}
+pub(crate) fn create_private(path: &Path) -> Result<File> {
     match OpenOptions::new()
         .read(true)
         .write(true)
@@ -61,8 +90,12 @@ fn create_private(path: &Path) -> Result<File> {
         Err(e) => Err(e.into()),
     }
 }
+pub(crate) fn now() -> Result<i64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
+}
 fn state_check(state: &Path) -> Result<()> {
     private(state, true)?;
+    let persistent = [DB, "sync.lock", SETTINGS_LOCK];
     for entry in fs::read_dir(state)? {
         let e = entry?;
         let name = e.file_name();
@@ -72,17 +105,21 @@ fn state_check(state: &Path) -> Result<()> {
             "collector-rust-v1.sqlite3-wal",
             "collector-rust-v1.sqlite3-shm",
             "sync.lock",
+            SETTINGS_LOCK,
+            FINGERPRINT,
+            drops::LOG,
+            drops::FOLDING,
         ]
         .iter()
         .any(|n| name == *n)
         {
             return Err("separate_empty_rust_state_required".into());
         }
-        // SQLite can unlink a rollback journal between readdir and stat.
-        // Only a missing transient sidecar is harmless; never ignore ownership,
-        // symlink, permissions or missing persistent database/lock failures.
+        // Journals, the fingerprint and drop logs can be unlinked between readdir
+        // and stat. Only a missing transient file is harmless; never ignore
+        // ownership, symlink, permissions or a missing database/lock.
         if let Err(error) = private(&e.path(), false) {
-            let transient = name != DB && name != "sync.lock";
+            let transient = !persistent.iter().any(|n| name == *n);
             let missing = error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
@@ -92,6 +129,25 @@ fn state_check(state: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+fn connect(path: &Path, page_limit: bool) -> Result<Connection> {
+    let db = Connection::open(path)?;
+    db.busy_timeout(Duration::from_millis(250))?;
+    db.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE;")?;
+    if page_limit {
+        db.execute_batch("PRAGMA max_page_count=4096;")?;
+    }
+    let page_size: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    if page_size != 4096 {
+        return Err("incompatible_spool".into());
+    }
+    Ok(db)
+}
+fn pragma(db: &Connection, name: &str) -> Result<i64> {
+    Ok(db.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?)
+}
+fn digest(payload: &[u8]) -> Vec<u8> {
+    Sha256::digest(payload).to_vec()
 }
 
 pub struct Store {
@@ -111,35 +167,20 @@ impl Store {
         if fs::metadata(&path)?.len() > 16 * 1024 * 1024 {
             return Err("spool_full".into());
         }
-        let mut db = Connection::open(&path)?;
-        db.busy_timeout(Duration::from_millis(250))?;
-        db.execute_batch(
-            "PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE; PRAGMA max_page_count=4096;",
-        )?;
-        let page_size: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-        if page_size != 4096 {
-            return Err("incompatible_spool".into());
+        let mut db = connect(&path, true)?;
+        // Only an empty file accepts this; it must precede the first table.
+        if initial.is_some() && fs::metadata(&path)?.len() == 0 {
+            db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let id: i64 = tx.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let id = pragma(&tx, "application_id")?;
+        let version = pragma(&tx, "user_version")?;
         if id == 0 && version == 0 && initial.is_some() {
-            let tables: i64 =
-                tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-            if tables != 0 {
-                return Err("foreign_spool".into());
-            }
-            tx.execute_batch("PRAGMA application_id=1145328177; PRAGMA user_version=1;
-                CREATE TABLE scope (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json BLOB NOT NULL, cursor INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE outbox (seq INTEGER PRIMARY KEY, observation_id TEXT UNIQUE NOT NULL, payload BLOB NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, receipt BLOB, failure TEXT);
-                CREATE INDEX pending ON outbox(delivered, seq);")?;
-            let config = scope(initial.ok_or("scope_required")?)?;
-            tx.execute(
-                "INSERT INTO scope(singleton,json) VALUES(1,?)",
-                [serde_json::to_vec(&config)?],
-            )?;
-        } else if id != APP_ID || version != 1 {
+            create(&tx, initial.ok_or("scope_required")?)?;
+        } else if id != APP_ID || !(1..=VERSION).contains(&version) {
             return Err("incompatible_spool".into());
+        } else if version != VERSION || pragma(&tx, "auto_vacuum")? != 2 {
+            return Err("repair_required".into());
         }
         let saved: Vec<u8> =
             tx.query_row("SELECT json FROM scope WHERE singleton=1", [], |r| r.get(0))?;
@@ -160,15 +201,22 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let old: Option<Vec<u8>> = tx
+        let pending: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT payload FROM outbox WHERE observation_id=?",
                 [id],
                 |r| r.get(0),
             )
             .optional()?;
-        if let Some(old) = old {
-            if old != payload {
+        let delivered: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT digest FROM delivered WHERE observation_id=?",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(old) = pending.map(|p| digest(&p)).or(delivered) {
+            if old != digest(&payload) {
                 return Err("observation_conflict".into());
             }
         } else {
@@ -180,18 +228,15 @@ impl Store {
                 "INSERT INTO outbox(observation_id,payload) VALUES(?,?)",
                 params![id, payload],
             )?;
-            // Reserve the entire retained spool's worst-case geometry, not just
-            // today's compact rows. Receipt/failure updates can split leaves or
-            // create overflow pages even when the added bytes are small.
-            // Each of the table and its two indexes needs at most one leaf and
-            // one interior page per row. Overflow pages carry 4092 bytes; 1024
-            // extra bytes bound the ID, record header, exact receipt (collector
-            // <=200 ASCII bytes, two UUIDs, u64 ID), and bounded failure code.
-            // The 32-page fixed allowance covers scope/schema and transient
-            // balancing/cursor growth. This deliberately conservative reservation
-            // counts delivered rows too: acknowledgement is not pruning.
+            // Reserve every pending row's worst-case geometry: failure updates can
+            // split leaves or create overflow pages even when the added bytes are
+            // small. The table and its unique index each need at most one leaf
+            // and one interior page per row. Overflow pages carry 4092 bytes; 1024
+            // extra bytes bound the ID, record header and bounded failure code.
+            // 32 fixed pages cover scope, schema, drops and balancing; 160 more
+            // cover the capped delivered-ID tombstones.
             let reserved: i64 = tx.query_row(
-                "SELECT 32 + coalesce(sum(6 + (length(payload)+1024+4091)/4092),0) FROM outbox",
+                "SELECT 192 + coalesce(sum(4 + (length(payload)+1024+4091)/4092),0) FROM outbox",
                 [],
                 |r| r.get(0),
             )?;
@@ -204,10 +249,15 @@ impl Store {
     }
     pub fn counts(&self) -> Result<(i64, i64)> {
         Ok(self.db.query_row(
-            "SELECT count(*)-coalesce(sum(delivered),0),coalesce(sum(delivered),0) FROM outbox",
+            "SELECT (SELECT count(*) FROM outbox), delivered FROM scope WHERE singleton=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
+    }
+    pub fn last_receipt(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .query_row("SELECT last_receipt FROM scope", [], |r| r.get(0))?)
     }
     fn batch(&self, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
         let cursor: i64 = self
@@ -215,7 +265,9 @@ impl Store {
             .query_row("SELECT cursor FROM scope", [], |r| r.get(0))?;
         let mut result = Vec::new();
         for comparison in [">", "<="] {
-            let mut statement = self.db.prepare(&format!("SELECT seq,payload FROM outbox WHERE delivered=0 AND seq {comparison} ? ORDER BY seq LIMIT ?"))?;
+            let mut statement = self.db.prepare(&format!(
+                "SELECT seq,payload FROM outbox WHERE seq {comparison} ? ORDER BY seq LIMIT ?"
+            ))?;
             let rows = statement
                 .query_map(params![cursor, (limit - result.len()) as i64], |r| {
                     Ok((r.get(0)?, r.get(1)?))
@@ -226,7 +278,104 @@ impl Store {
         }
         Ok(result)
     }
+    // The row, its tombstone and the counter change together, so a crash
+    // either keeps the row pending or records it delivered, never neither.
+    fn deliver(&mut self, seq: i64, payload: &[u8], receipt: &[u8]) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO delivered(observation_id,digest,at) SELECT observation_id,?,? FROM outbox WHERE seq=?",
+            params![digest(payload), now()?, seq],
+        )?;
+        tx.execute("DELETE FROM outbox WHERE seq=?", [seq])?;
+        tx.execute(
+            "UPDATE scope SET delivered=delivered+1,last_receipt=? WHERE singleton=1",
+            [receipt],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn compact(&self) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM delivered WHERE observation_id IN (SELECT observation_id FROM delivered ORDER BY at DESC, observation_id LIMIT -1 OFFSET ?)",
+            [TOMBSTONES],
+        )?;
+        self.db.execute_batch("PRAGMA incremental_vacuum;")?;
+        Ok(())
+    }
 }
+fn create(tx: &Transaction, initial: &[u8]) -> Result<()> {
+    let tables: i64 = tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+    if tables != 0 {
+        return Err("foreign_spool".into());
+    }
+    tx.execute_batch(&format!(
+        "PRAGMA application_id={APP_ID}; PRAGMA user_version={VERSION}; {SCHEMA} {ADDED_TABLES}"
+    ))?;
+    tx.execute(
+        "INSERT INTO scope(singleton,json) VALUES(1,?)",
+        [serde_json::to_vec(&scope(initial)?)?],
+    )?;
+    Ok(())
+}
+
+/// Migrates a version 1 spool in place: delivered rows become tombstones and a
+/// counter, pending rows keep their exact bytes. Safe to re-run after a crash.
+pub fn repair(state: &Path) -> Result<()> {
+    state_check(state)?;
+    let lock = create_private(&state.join("sync.lock"))?;
+    lock.try_lock()?;
+    let path = state.join(DB);
+    private(&path, false)?;
+    let mut db = connect(&path, false)?;
+    if pragma(&db, "application_id")? != APP_ID {
+        return Err("incompatible_spool".into());
+    }
+    match pragma(&db, "user_version")? {
+        1 => migrate(&mut db)?,
+        VERSION => {}
+        _ => return Err("incompatible_spool".into()),
+    }
+    if pragma(&db, "auto_vacuum")? != 2 {
+        db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+    }
+    Ok(())
+}
+fn migrate(db: &mut Connection) -> Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(&format!(
+        "ALTER TABLE scope ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE scope ADD COLUMN last_receipt BLOB;
+         ALTER TABLE scope ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0;
+         {ADDED_TABLES}"
+    ))?;
+    let delivered: Vec<(String, Vec<u8>)> = tx
+        .prepare(
+            "SELECT observation_id,payload FROM outbox WHERE delivered=1 ORDER BY seq DESC LIMIT ?",
+        )?
+        .query_map([TOMBSTONES], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let at = now()?;
+    for (id, payload) in delivered {
+        tx.execute(
+            "INSERT INTO delivered(observation_id,digest,at) VALUES(?,?,?)",
+            params![id, digest(&payload), at],
+        )?;
+    }
+    tx.execute_batch(&format!(
+        "UPDATE scope SET delivered=(SELECT count(*) FROM outbox WHERE delivered=1),
+            last_receipt=(SELECT receipt FROM outbox WHERE delivered=1 ORDER BY seq DESC LIMIT 1);
+         DELETE FROM outbox WHERE delivered=1;
+         DROP INDEX pending;
+         ALTER TABLE outbox DROP COLUMN delivered;
+         ALTER TABLE outbox DROP COLUMN receipt;
+         PRAGMA user_version={VERSION};"
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn credential(path: &Path) -> Result<String> {
     private(path, false)?;
     let mut raw = String::new();
@@ -250,23 +399,46 @@ pub fn sync(state: &Path, key_path: &Path, limit: usize) -> Result<(i64, i64)> {
     if key_path.starts_with(state) {
         return Err("separate_credential_required".into());
     }
-    sync_key(state, &credential(key_path)?, limit)
+    sync_key(state, &credential(key_path)?, limit, None)
 }
-pub(crate) fn sync_key(state: &Path, key: &str, limit: usize) -> Result<(i64, i64)> {
+pub(crate) fn sync_key(
+    state: &Path,
+    key: &str,
+    limit: usize,
+    revoked: Option<&Path>,
+) -> Result<(i64, i64)> {
     if !(1..=100).contains(&limit) {
         return Err("invalid_limit".into());
     }
     state_check(state)?;
     let lock = create_private(&state.join("sync.lock"))?;
     lock.try_lock()?;
-    let store = Store::open(state, None)?;
+    let mut store = Store::open(state, None)?;
+    drops::fold(&store, state)?;
+    if revoked.is_some_and(Path::exists) {
+        return Err("revoked".into());
+    }
+    let retry_after: i64 = store
+        .db
+        .query_row("SELECT retry_after FROM scope", [], |r| r.get(0))?;
+    if retry_after > now()? {
+        return Err("sync_rate_limited".into());
+    }
+    // Each sync forces the next hook to re-hash the registered executable.
+    if let Err(e) = fs::remove_file(state.join(FINGERPRINT))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e.into());
+    }
     let url = store.config["endpoint"]
         .as_str()
-        .ok_or("invalid_endpoint")?;
-    endpoint(url)?;
+        .ok_or("invalid_endpoint")?
+        .to_owned();
+    endpoint(&url)?;
     let collector = store.config["collector_ref"]
         .as_str()
-        .ok_or("invalid_collector")?;
+        .ok_or("invalid_collector")?
+        .to_owned();
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -279,26 +451,48 @@ pub(crate) fn sync_key(state: &Path, key: &str, limit: usize) -> Result<(i64, i6
         store
             .db
             .execute("UPDATE scope SET cursor=? WHERE singleton=1", [seq])?;
-        let outcome = post(&client, url, key, &payload, collector);
-        match outcome {
-            Ok(r) => {
-                store.db.execute(
-                    "UPDATE outbox SET delivered=1,receipt=?,failure=NULL WHERE seq=?",
-                    params![serde_json::to_vec(&r)?, seq],
-                )?;
-            }
-            Err((failure, stop)) => {
+        match post(&client, &url, key, &payload, &collector) {
+            Ok(r) => store.deliver(seq, &payload, &serde_json::to_vec(&r)?)?,
+            Err(failure) => {
                 store.db.execute(
                     "UPDATE outbox SET failure=? WHERE seq=?",
-                    params![failure, seq],
+                    params![failure.code, seq],
                 )?;
-                if stop {
+                if let Some(seconds) = failure.retry_after {
+                    store.db.execute(
+                        "UPDATE scope SET retry_after=? WHERE singleton=1",
+                        [now()? + seconds],
+                    )?;
+                }
+                if failure.revoked
+                    && let Some(marker) = revoked
+                {
+                    create_private(marker)?;
+                }
+                if failure.stop {
                     break;
                 }
             }
         }
     }
+    store.compact()?;
     store.counts()
+}
+struct Failure {
+    code: String,
+    stop: bool,
+    revoked: bool,
+    retry_after: Option<i64>,
+}
+impl Failure {
+    fn network() -> Self {
+        Self {
+            code: "network_failure".into(),
+            stop: true,
+            revoked: false,
+            retry_after: None,
+        }
+    }
 }
 fn post(
     client: &reqwest::blocking::Client,
@@ -306,7 +500,7 @@ fn post(
     key: &str,
     payload: &[u8],
     collector: &str,
-) -> std::result::Result<Object, (String, bool)> {
+) -> std::result::Result<Object, Failure> {
     let response = client
         .post(url)
         .bearer_auth(key)
@@ -314,18 +508,31 @@ fn post(
         .header("Accept", "application/json")
         .body(payload.to_vec())
         .send()
-        .map_err(|_| ("network_failure".into(), true))?;
+        .map_err(|_| Failure::network())?;
     let status = response.status().as_u16();
     if !matches!(status, 200 | 201) {
-        return Err((
-            format!("http_{status}"),
-            matches!(status, 401 | 403 | 429 | 500..=599),
-        ));
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|n| status == 429 && (0..=86400).contains(n));
+        return Err(Failure {
+            code: format!("http_{status}"),
+            stop: matches!(status, 401 | 403 | 429 | 500..=599),
+            revoked: matches!(status, 401 | 403),
+            retry_after,
+        });
     }
     let mut raw = Vec::new();
     response
         .take((MAX_WIRE + 1) as u64)
         .read_to_end(&mut raw)
-        .map_err(|_| ("network_failure".into(), true))?;
-    receipt(&raw, payload, collector).map_err(|_| ("invalid_receipt".into(), false))
+        .map_err(|_| Failure::network())?;
+    receipt(&raw, payload, collector).map_err(|_| Failure {
+        code: "invalid_receipt".into(),
+        stop: false,
+        revoked: false,
+        retry_after: None,
+    })
 }

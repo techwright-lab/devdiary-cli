@@ -450,7 +450,12 @@ pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
 pub fn sync(root: &Path, limit: usize) -> Result<(i64, i64)> {
     let doc = connection(root)?;
     initialize(root, &doc)?;
-    crate::store::sync_key(&root.join("outbox"), text(&doc, "token")?, limit)
+    crate::store::sync_key(
+        &root.join("outbox"),
+        text(&doc, "token")?,
+        limit,
+        Some(&root.join("revoked")),
+    )
 }
 pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     let doc = connection(root)?;

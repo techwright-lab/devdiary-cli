@@ -600,7 +600,7 @@ class ClaudeHookTest(unittest.TestCase):
         )
         import uuid
 
-        for _ in range(700):
+        for _ in range(1200):
             row["observation_id"] = str(uuid.uuid4())
             result = subprocess.run(
                 [str(self.exe), "collect", str(self.state)],
@@ -663,11 +663,13 @@ class ClaudeHookTest(unittest.TestCase):
             self.command("claude-plan", self.state, self.settings, self.plan)
             self.command("claude-apply", self.plan, "--consent")
             self.hook()
+            spooled = self.rows()
             key = self.root / "synthetic-key"
             key.write_text("dc_live_SYNTHETIC_ONLY")
             key.chmod(0o600)
             self.command("sync", self.state, key, "10")
-            self.assertEqual(received, self.rows())
+            self.assertEqual(received, spooled)
+            self.assertEqual(self.rows(), [])
             self.assertEqual(
                 json.loads(self.command("status", self.state).stdout),
                 {"pending": 0, "delivered": 1},
