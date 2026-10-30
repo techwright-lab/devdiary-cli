@@ -1,4 +1,4 @@
-use crate::{MAX_WIRE, Object, Result, drops, endpoint, freeze, receipt, scope};
+use crate::{MAX_WIRE, Object, Result, drops, endpoint, freeze, receipt, reflog::Mark, scope};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -27,6 +27,9 @@ const ADDED_TABLES: &str = "
     CREATE TABLE delivered (observation_id TEXT PRIMARY KEY, digest BLOB NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TABLE drops (reason TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at INTEGER NOT NULL) WITHOUT ROWID;";
 const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INTEGER PRIMARY KEY CHECK(singleton=1), inode INTEGER NOT NULL);";
+const MARKS_TABLE: &str = "CREATE TABLE IF NOT EXISTS bracket_marks (session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, checkout_key TEXT NOT NULL, offset INTEGER NOT NULL, ino INTEGER NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, PRIMARY KEY(session_id, tool_use_id)) WITHOUT ROWID;";
+const MARK_TTL_NANOS: i64 = 6 * 3_600_000_000_000;
+const MAX_MARKS: i64 = 256;
 
 fn trusted_ancestors(path: &Path) -> Result<()> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -161,6 +164,12 @@ pub struct Store {
     pub db: Connection,
     pub config: Object,
 }
+/// One Bash tool call in one checkout. Local only: never spooled or sent.
+pub struct Bracket<'a> {
+    pub session_id: &'a str,
+    pub tool_use_id: &'a str,
+    pub checkout_key: &'a str,
+}
 impl Store {
     pub fn open(state: &Path, initial: Option<&[u8]>) -> Result<Self> {
         state_check(state)?;
@@ -198,6 +207,7 @@ impl Store {
             return Err("frozen_scope_conflict".into());
         }
         tx.execute_batch(FOLD_TABLE)?;
+        tx.execute_batch(MARKS_TABLE)?;
         tx.commit()?;
         File::open(state)?.sync_all()?;
         Ok(Self { db, config })
@@ -238,9 +248,10 @@ impl Store {
             )?;
             // Worst case per pending row: a leaf and an interior page for the table
             // and its unique index, plus overflow with 1024 bytes of ID/header/failure
-            // slack. 192 fixed pages cover schema, scope, drops and capped tombstones.
+            // slack. 256 fixed pages cover schema, scope, drops, capped tombstones and
+            // capped bracket marks.
             let reserved: i64 = tx.query_row(
-                "SELECT 192 + coalesce(sum(4 + (length(payload)+1024+4091)/4092),0) FROM outbox",
+                "SELECT 256 + coalesce(sum(4 + (length(payload)+1024+4091)/4092),0) FROM outbox",
                 [],
                 |r| r.get(0),
             )?;
@@ -250,6 +261,62 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+    // A repeated PreToolUse keeps the first offset, so the bracket never shrinks.
+    pub fn open_bracket(&self, bracket: &Bracket, mark: Mark, at: i64) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        prune_marks(&tx, at)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO bracket_marks(session_id,tool_use_id,checkout_key,offset,ino,opened_at) VALUES(?,?,?,?,?,?)",
+            params![
+                bracket.session_id,
+                bracket.tool_use_id,
+                bracket.checkout_key,
+                mark.offset as i64,
+                mark.ino as i64,
+                at
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM bracket_marks WHERE (session_id,tool_use_id) IN (SELECT session_id,tool_use_id FROM bracket_marks ORDER BY opened_at DESC LIMIT -1 OFFSET ?)",
+            [MAX_MARKS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Closed marks stay until pruned so a bracket that closes later still
+    /// counts this one as overlapping. Overlap is capped at the wire maximum.
+    pub fn close_bracket(&self, bracket: &Bracket, at: i64) -> Result<Option<(Mark, u64)>> {
+        let tx = self.db.unchecked_transaction()?;
+        prune_marks(&tx, at)?;
+        let open: Option<(String, i64, i64, i64)> = tx
+            .query_row(
+                "SELECT checkout_key,offset,ino,opened_at FROM bracket_marks WHERE session_id=? AND tool_use_id=? AND closed_at IS NULL",
+                params![bracket.session_id, bracket.tool_use_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        tx.execute(
+            "UPDATE bracket_marks SET closed_at=? WHERE session_id=? AND tool_use_id=?",
+            params![at, bracket.session_id, bracket.tool_use_id],
+        )?;
+        let result = match open {
+            Some((key, offset, ino, opened_at)) if key == bracket.checkout_key => {
+                let overlap: i64 = tx.query_row(
+                    "SELECT count(*) FROM bracket_marks WHERE checkout_key=? AND NOT (session_id=? AND tool_use_id=?) AND opened_at<=? AND (closed_at IS NULL OR closed_at>=?)",
+                    params![key, bracket.session_id, bracket.tool_use_id, at, opened_at],
+                    |r| r.get(0),
+                )?;
+                let mark = Mark {
+                    offset: offset as u64,
+                    ino: ino as u64,
+                };
+                Some((mark, overlap.min(64) as u64))
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok(result)
     }
     pub fn counts(&self) -> Result<(i64, i64)> {
         Ok(self.db.query_row(
@@ -308,6 +375,13 @@ impl Store {
         self.db.execute_batch("PRAGMA incremental_vacuum;")?;
         Ok(())
     }
+}
+fn prune_marks(tx: &Transaction, at: i64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM bracket_marks WHERE opened_at<?",
+        [at - MARK_TTL_NANOS],
+    )?;
+    Ok(())
 }
 fn create(tx: &Transaction, initial: &[u8]) -> Result<()> {
     let tables: i64 = tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
@@ -693,7 +767,27 @@ fn post(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reflog::Mark;
     use std::ffi::OsStr;
+
+    const HOUR: i64 = 3_600_000_000_000;
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let scope = include_bytes!("../tests/fixtures/installation-scope.json");
+        let store = Store::open(&state, Some(scope)).unwrap();
+        (dir, store)
+    }
+    fn bracket<'a>(session: &'a str, tool: &'a str, key: &'a str) -> Bracket<'a> {
+        Bracket {
+            session_id: session,
+            tool_use_id: tool,
+            checkout_key: key,
+        }
+    }
+    const MARK: Mark = Mark { offset: 7, ino: 9 };
 
     #[test]
     fn only_a_missing_transient_file_counts_as_vanished() {
@@ -710,6 +804,115 @@ mod tests {
         assert!(!vanished(&held, OsStr::new("held-journal"), &persistent));
         assert!(!vanished(&dir.join("db"), OsStr::new("db"), &persistent));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_closed_bracket_returns_its_mark_once() {
+        let (_dir, store) = store();
+        let own = bracket("s", "t", "k");
+        store.open_bracket(&own, MARK, HOUR).unwrap();
+        store
+            .open_bracket(&own, Mark { offset: 99, ino: 9 }, HOUR + 1)
+            .unwrap();
+        assert_eq!(
+            store.close_bracket(&own, HOUR + 2).unwrap(),
+            Some((MARK, 0))
+        );
+        assert_eq!(store.close_bracket(&own, HOUR + 3).unwrap(), None);
+        assert_eq!(
+            store
+                .close_bracket(&bracket("s", "never", "k"), HOUR)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_post_in_another_checkout_closes_without_a_mark() {
+        let (_dir, store) = store();
+        store
+            .open_bracket(&bracket("s", "t", "k"), MARK, HOUR)
+            .unwrap();
+        assert_eq!(
+            store
+                .close_bracket(&bracket("s", "t", "other"), HOUR + 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .close_bracket(&bracket("s", "t", "k"), HOUR + 2)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn overlap_counts_other_brackets_on_the_same_checkout_that_shared_time() {
+        let (_dir, store) = store();
+        let a = bracket("a", "t", "k");
+        let b = bracket("b", "t", "k");
+        store.open_bracket(&a, MARK, 10).unwrap();
+        store.open_bracket(&b, MARK, 20).unwrap();
+        store
+            .open_bracket(&bracket("c", "t", "sibling"), MARK, 15)
+            .unwrap();
+        store
+            .open_bracket(&bracket("d", "t", "k"), MARK, 1)
+            .unwrap();
+        store.close_bracket(&bracket("d", "t", "k"), 5).unwrap();
+        assert_eq!(store.close_bracket(&a, 30).unwrap(), Some((MARK, 1)));
+        assert_eq!(store.close_bracket(&b, 40).unwrap(), Some((MARK, 1)));
+        store
+            .open_bracket(&bracket("e", "t", "k"), MARK, 50)
+            .unwrap();
+        assert_eq!(
+            store.close_bracket(&bracket("e", "t", "k"), 60).unwrap(),
+            Some((MARK, 0))
+        );
+    }
+
+    #[test]
+    fn marks_older_than_six_hours_are_pruned_without_a_result() {
+        let (_dir, store) = store();
+        store
+            .open_bracket(&bracket("s", "lost", "k"), MARK, HOUR)
+            .unwrap();
+        store
+            .open_bracket(&bracket("s", "next", "k"), MARK, 7 * HOUR + 1)
+            .unwrap();
+        let marks: i64 = store
+            .db
+            .query_row("SELECT count(*) FROM bracket_marks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marks, 1);
+        assert_eq!(
+            store
+                .close_bracket(&bracket("s", "lost", "k"), 7 * HOUR + 2)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn open_marks_are_capped() {
+        let (_dir, store) = store();
+        for i in 0..300 {
+            store
+                .open_bracket(&bracket("s", &format!("t{i}"), "k"), MARK, HOUR + i)
+                .unwrap();
+        }
+        let marks: i64 = store
+            .db
+            .query_row("SELECT count(*) FROM bracket_marks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marks, 256);
+        assert_eq!(
+            store
+                .close_bracket(&bracket("s", "t0", "k"), 2 * HOUR)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
