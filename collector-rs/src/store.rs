@@ -392,12 +392,11 @@ pub fn repository_refs(value: &serde_json::Value) -> Result<Vec<String>> {
                 .ok_or("invalid_repository_refs")
         })
         .collect::<std::result::Result<_, _>>()?;
-    let unique: std::collections::HashSet<_> =
-        refs.iter().map(|r| r.to_ascii_lowercase()).collect();
-    if unique.len() != refs.len() {
-        return Err("invalid_repository_refs".into());
-    }
-    Ok(refs)
+    let mut seen = std::collections::HashSet::new();
+    Ok(refs
+        .into_iter()
+        .filter(|r| seen.insert(r.to_ascii_lowercase()))
+        .collect())
 }
 pub(crate) fn read_refs(state: &Path) -> Result<Vec<String>> {
     let path = state.join(REFS);
@@ -694,6 +693,23 @@ fn post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refs_differing_only_by_case_keep_the_first_spelling() {
+        let refs = repository_refs(&serde_json::json!([
+            "https://github.com/Acme/Demo",
+            "https://github.com/acme/other",
+            "https://github.com/acme/demo",
+        ]))
+        .unwrap();
+        assert_eq!(
+            refs,
+            [
+                "https://github.com/Acme/Demo",
+                "https://github.com/acme/other"
+            ]
+        );
+    }
 
     #[test]
     fn retry_after_seconds_beyond_a_day_are_clamped() {

@@ -1008,6 +1008,20 @@ class InstallationScopeHookTest(unittest.TestCase):
         self.assertEqual(self.rows(), [])
         self.assertEqual(self.drops(), {"unknown_repository": 1})
 
+    def test_a_large_config_with_non_utf8_bytes_still_resolves(self):
+        config = self.main / ".git/config"
+        branches = "".join(
+            f'[branch "f/{i}"]\n\tremote = origin\n\tmerge = refs/heads/f/{i}\n'
+            for i in range(3000)
+        )
+        config.write_bytes(
+            branches.encode() + config.read_bytes() + b"[user]\n\tname = Ren\xe9\n"
+        )
+        self.connect()
+        self.hook(self.main)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {})
+
     def test_repository_refs_match_the_server_spelling(self):
         self.refs = ["https://github.com/Acme/Demo"]
         self.connect()

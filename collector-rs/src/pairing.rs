@@ -364,12 +364,14 @@ impl Target {
                     .map_err(|_| "approved_scope_mismatch")?;
                 let mut config = common;
                 config["scope_kind"] = json!("installation");
-                config["observation_schema_versions"] = if versions.contains(&json!(2)) {
-                    json!([1, 2])
-                } else {
-                    json!([1])
-                };
-                config["record_orchestrated_outside_repos"] = json!(record_outside);
+                let v2 = versions.contains(&json!(2));
+                if *record_outside && !v2 {
+                    eprintln!(
+                        "Server does not accept observation schema v2: --record-orchestrated-outside-repos is not saved."
+                    );
+                }
+                config["observation_schema_versions"] = if v2 { json!([1, 2]) } else { json!([1]) };
+                config["record_orchestrated_outside_repos"] = json!(*record_outside && v2);
                 (config, Some(refs))
             }
         };

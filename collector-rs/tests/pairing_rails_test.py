@@ -417,6 +417,13 @@ class InstallationPairingTest(unittest.TestCase):
         saved = json.loads((self.connection / "connection.json").read_bytes())
         self.assertEqual(saved["scope"]["observation_schema_versions"], [1])
 
+    def test_the_outside_repo_opt_in_is_not_saved_without_v2(self):
+        self.connection_shape = {"observation_schema_versions": [1]}
+        err = self.setup_collector("--record-orchestrated-outside-repos").stderr
+        self.assertIn(b"--record-orchestrated-outside-repos", err)
+        saved = json.loads((self.connection / "connection.json").read_bytes())
+        self.assertFalse(saved["scope"]["record_orchestrated_outside_repos"])
+
     def test_an_exchange_for_another_scope_is_refused(self):
         self.connection_shape = {
             "scope_kind": None,

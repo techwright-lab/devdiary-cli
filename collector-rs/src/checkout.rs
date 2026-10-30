@@ -3,14 +3,14 @@
 use crate::pairing::github_remote;
 use std::{
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{BufRead, BufReader, Read},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
 const MAX_DEPTH: usize = 64;
 const MAX_POINTER: u64 = 4096;
-const MAX_CONFIG: u64 = 65536;
+const MAX_CONFIG: u64 = 16 << 20;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Checkout {
@@ -39,7 +39,7 @@ pub fn resolve(cwd: &Path) -> Checkout {
 
 fn repository(dir: &Path) -> Option<String> {
     let common = common_dir(&git_dir(dir)?)?;
-    remote(&String::from_utf8(read(&common.join("config"), MAX_CONFIG)?).ok()?)
+    remote(regular(&common.join("config"))?)
 }
 
 fn git_dir(dir: &Path) -> Option<PathBuf> {
@@ -72,49 +72,78 @@ fn real_dir(path: &Path) -> Option<PathBuf> {
     m.is_dir().then(|| path.to_path_buf())
 }
 
-fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
+fn regular(path: &Path) -> Option<File> {
     let file: File = OpenOptions::new()
         .read(true)
         .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
         .open(path)
         .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
     let mut raw = Vec::new();
-    file.take(limit + 1).read_to_end(&mut raw).ok()?;
+    regular(path)?.take(limit + 1).read_to_end(&mut raw).ok()?;
     (raw.len() as u64 <= limit).then_some(raw)
 }
 
 // Origin wins; otherwise exactly one remote may name a GitHub repository.
-fn remote(config: &str) -> Option<String> {
-    let mut section: Option<String> = None;
-    let mut urls: Vec<(String, String)> = Vec::new();
-    for line in config.lines() {
-        let line = line.trim();
-        if let Some(header) = line.strip_prefix('[') {
-            section = remote_name(header);
-            continue;
+fn remote(config: File) -> Option<String> {
+    let mut reader = BufReader::new(config.take(MAX_CONFIG + 1));
+    let (mut section, mut urls, mut line, mut total) = (None, Vec::new(), Vec::new(), 0);
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).ok()? {
+            0 => break,
+            n => total += n as u64,
         }
-        let Some(name) = &section else { continue };
-        let Some((key, value)) = line.split_once('=') else {
+        if total > MAX_CONFIG {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let Some((name, url)) = remote_url(text.trim(), &mut section) else {
             continue;
         };
-        if key.trim().eq_ignore_ascii_case("url") && !urls.iter().any(|(n, _)| n == name) {
-            urls.push((name.clone(), value.trim().trim_matches('"').to_owned()));
+        if urls.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if name == "origin"
+            && let Ok(found) = github_remote(&url)
+        {
+            return Some(found);
+        }
+        urls.push((name, url));
+    }
+    let github: Vec<_> = urls
+        .iter()
+        .filter_map(|(_, url)| github_remote(url).ok())
+        .collect();
+    (github.len() == 1).then(|| github[0].clone())
+}
+
+fn remote_url(line: &str, section: &mut Option<String>) -> Option<(String, String)> {
+    if let Some(header) = line.strip_prefix('[') {
+        *section = remote_name(header);
+        return None;
+    }
+    let name = section.as_ref()?;
+    let (key, value) = line.split_once('=')?;
+    key.trim()
+        .eq_ignore_ascii_case("url")
+        .then(|| (name.clone(), config_value(value)))
+}
+
+fn config_value(raw: &str) -> String {
+    let (mut value, mut quoted, mut chars) = (String::new(), false, raw.chars());
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => quoted = !quoted,
+            '\\' => value.extend(chars.next()),
+            ';' | '#' if !quoted => break,
+            _ => value.push(c),
         }
     }
-    let origin = urls
-        .iter()
-        .find(|(name, _)| name == "origin")
-        .and_then(|(_, url)| github_remote(url).ok());
-    origin.or_else(|| {
-        let github: Vec<_> = urls
-            .iter()
-            .filter_map(|(_, url)| github_remote(url).ok())
-            .collect();
-        (github.len() == 1).then(|| github[0].clone())
-    })
+    value.trim().to_owned()
 }
 
 fn remote_name(header: &str) -> Option<String> {
@@ -274,6 +303,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolve(&pointed), Checkout::Unresolved);
+    }
+
+    #[test]
+    fn large_config_with_many_branches_still_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        let branches: String = (0..3000)
+            .map(|i| format!("[branch \"feature/{i}\"]\n\tremote = origin\n\tmerge = refs/heads/feature/{i}\n"))
+            .collect();
+        let body = format!("{branches}{}", origin("git@github.com:acme/big.git"));
+        assert!(body.len() > 150_000);
+        config(&repo.join(".git"), &body);
+        assert_eq!(resolve(&repo), found("acme/big"));
+    }
+
+    #[test]
+    fn non_utf8_bytes_elsewhere_in_config_do_not_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(dir.path(), "git@github.com:acme/demo.git");
+        let mut raw = fs::read(repo.join(".git/config")).unwrap();
+        raw.extend_from_slice(b"[user]\n\tname = Ren\xe9\n");
+        fs::write(repo.join(".git/config"), raw).unwrap();
+        assert_eq!(resolve(&repo), found("acme/demo"));
+    }
+
+    #[test]
+    fn inline_comments_are_stripped_from_the_url() {
+        for url in [
+            "git@github.com:acme/demo.git ; main",
+            "git@github.com:acme/demo.git # main",
+            "\"git@github.com:acme/demo.git\" ; main",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = repo(dir.path(), url);
+            assert_eq!(resolve(&repo), found("acme/demo"), "{url}");
+        }
+    }
+
+    #[test]
+    fn symlinked_commondir_target_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = repo(dir.path(), "git@github.com:acme/secret.git");
+        let admin = dir.path().join("admin");
+        fs::create_dir_all(&admin).unwrap();
+        symlink(other.join(".git"), dir.path().join("common-link")).unwrap();
+        fs::write(
+            admin.join("commondir"),
+            format!("{}\n", dir.path().join("common-link").display()),
+        )
+        .unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert_eq!(resolve(&tree), Checkout::Unresolved);
     }
 
     #[test]
