@@ -668,8 +668,6 @@ const HOOK_FIELDS: [&str; 11] = [
     "reason",
     "tool_name",
 ];
-/// Keeps only the metadata fields; prompts, tool input and responses are skipped
-/// unparsed. Duplicate top-level keys are refused.
 fn fields(raw: &[u8]) -> Result<Object> {
     struct Known;
     impl<'de> serde::de::Visitor<'de> for Known {
@@ -783,9 +781,17 @@ fn normalize(data: &Object, config: &Object) -> Result<Vec<u8>> {
     out.insert("observation_id".into(), id.to_string().into());
     serde_json::to_vec(&out).map_err(Into::into)
 }
-fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
+fn input_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
     if error.is::<serde_json::Error>() {
         return "invalid";
+    }
+    drop_reason(error)
+}
+// Past input parsing, unparseable JSON is registration state: settings, the
+// manifest or the saved scope, never the hook event.
+fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if error.is::<serde_json::Error>() {
+        return "stale_plan";
     }
     if let Some(e) = error.downcast_ref::<rustix::io::Errno>() {
         return if *e == rustix::io::Errno::WOULDBLOCK {
@@ -836,7 +842,8 @@ pub fn hook(plan_path: &Path, raw: Result<Vec<u8>>) -> Result<()> {
     let data = raw.and_then(|raw| fields(&raw));
     let p = load(plan_path)?;
     let state = Path::new(text(&p, "state")?);
-    let outcome = data.and_then(|data| capture(plan_path, &p, state, &data));
+    let data = data.inspect_err(|error| drops::note(state, input_reason(error.as_ref())))?;
+    let outcome = capture(plan_path, &p, state, &data);
     if let Err(error) = &outcome {
         drops::note(state, drop_reason(error.as_ref()));
     }
@@ -958,7 +965,7 @@ mod recovery_tests {
                     assert!(owned(&doc, &p["entry"]).is_err());
                 }
                 if ["removing", "removed_settings", "removed"].contains(&stage) {
-                    // Revocation blocks capture before any store work.
+                    // An inactive registration blocks capture before any store work.
                     let event = json!({"hook_event_name": "Stop", "session_id": "s",
                         "cwd": dir.path().join("repo")});
                     assert_eq!(

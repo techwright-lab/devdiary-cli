@@ -76,7 +76,7 @@ Frozen ASCII allowlisted wire bytes are capped at 16 KiB. Explicit sync attempts
 1–100 rows, commits its rotating cursor before HTTP, retains exact bytes after
 crash/response loss, and acknowledges only the exact Rails receipt. 401/403/429,
 5xx and network failures stop the batch; row failures do not starve later rows.
-An integer `Retry-After` on 429 (at most one day) is saved in the spool, and later
+A `Retry-After` on 429 (seconds or an HTTP date, at most one day) is saved in the spool, and later
 syncs refuse with `sync_rate_limited` before any request until it passes.
 No redirects or ambient proxies; verified TLS except exact loopback HTTP; each
 request has a five-second timeout including the response body. Exit 0 means the
@@ -250,7 +250,8 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   ancestors, shell-quoted paths and a SHA-256 pin verified at plan and apply. The
   hook compares a stat fingerprint (device, inode, size, mtime and ctime in ns)
   saved in STATE after the last full hash; any replacement, write or chmod forces
-  a full re-hash, and every sync discards the fingerprint. Symlinks, hardlinks and
+  a full re-hash. Each sync hashes its own binary and saves that fingerprint (or
+  discards the saved one when hashing fails). Symlinks, hardlinks and
   shared state permissions are refused, not repaired. Settings and their directory
   only need to be owned by you and not group/world-writable, with exactly one link
   and no symlinked ancestor; a replaced settings file keeps its original mode.

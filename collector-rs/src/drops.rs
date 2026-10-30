@@ -3,7 +3,7 @@
 //! sync folds the log into the store's drops table.
 use crate::{
     Result,
-    store::{Store, now, private},
+    store::{Store, private},
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::{
@@ -123,11 +123,11 @@ fn commit(store: &Store, folding: &Path) -> Result<()> {
     let inode = inode(folding)?.ok_or("drops_log_missing")?;
     let mut counts = BTreeMap::new();
     tally(folding, &mut counts)?;
-    let at = now()?;
+    let at = fs::symlink_metadata(folding)?.mtime();
     let tx = Transaction::new_unchecked(&store.db, TransactionBehavior::Immediate)?;
     for (reason, count) in counts {
         tx.execute(
-            "INSERT INTO drops(reason,count,last_at) VALUES(?1,?2,?3) ON CONFLICT(reason) DO UPDATE SET count=count+?2,last_at=?3",
+            "INSERT INTO drops(reason,count,last_at) VALUES(?1,?2,?3) ON CONFLICT(reason) DO UPDATE SET count=count+?2,last_at=MAX(last_at,?3)",
             params![reason, count, at],
         )?;
     }
@@ -205,6 +205,25 @@ mod tests {
             counts(&store, &state).unwrap(),
             BTreeMap::from([("outside_scope".into(), 2)])
         );
+    }
+
+    #[test]
+    fn last_at_is_the_time_of_the_last_drop_not_of_the_fold() {
+        let (_dir, state, store) = spool();
+        write(&state.join(LOG), b"a");
+        let dropped = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        File::options()
+            .write(true)
+            .open(state.join(LOG))
+            .unwrap()
+            .set_modified(dropped)
+            .unwrap();
+        fold(&store, &state).unwrap();
+        let last_at: i64 = store
+            .db
+            .query_row("SELECT last_at FROM drops", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(last_at, 1_700_000_000);
     }
 
     #[test]

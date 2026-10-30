@@ -666,6 +666,7 @@ class ClaudeHookTest(unittest.TestCase):
         self.command("claude-remove", plan, "--consent", code=2)
         alias.unlink()
         self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {"permission": 4})
         linked = self.root / "linked-home"
         linked.symlink_to(home, target_is_directory=True)
         self.command(
@@ -678,6 +679,15 @@ class ClaudeHookTest(unittest.TestCase):
         self.command("claude-remove", plan, "--consent")
         self.assertEqual(json.loads(settings.read_bytes()), self.original)
         self.assertEqual(settings.stat().st_mode & 0o777, 0o644)
+
+    def test_broken_settings_count_as_stale_plan_not_invalid_events(self):
+        text = self.settings.read_text()
+        for broken in ('{"permissions": {}, ' + text[1:], text[:-1]):
+            with self.subTest(broken=broken[:20]):
+                self.settings.write_text(broken)
+                self.hook()
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"stale_plan": 2})
 
     def test_python_observer_registration_is_refused(self):
         self.command("claude-remove", self.plan, "--consent")
