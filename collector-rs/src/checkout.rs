@@ -20,25 +20,33 @@ pub enum Checkout {
 }
 
 pub fn resolve(cwd: &Path) -> Checkout {
+    locate(cwd).0
+}
+
+/// The checkout and, when it resolves, its own git directory: a linked
+/// worktree's admin directory, not the shared common directory.
+pub fn locate(cwd: &Path) -> (Checkout, Option<PathBuf>) {
     let Ok(cwd) = fs::canonicalize(cwd) else {
-        return Checkout::Absent;
+        return (Checkout::Absent, None);
     };
     for dir in cwd.ancestors().take(MAX_DEPTH) {
         match fs::symlink_metadata(dir.join(".git")) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Checkout::Unresolved,
+            Err(_) => return (Checkout::Unresolved, None),
             Ok(_) => {
-                return repository(dir)
-                    .map(Checkout::Repository)
-                    .unwrap_or(Checkout::Unresolved);
+                let gitdir = git_dir(dir);
+                return match gitdir.as_deref().and_then(repository) {
+                    Some(found) => (Checkout::Repository(found), gitdir),
+                    None => (Checkout::Unresolved, None),
+                };
             }
         }
     }
-    Checkout::Absent
+    (Checkout::Absent, None)
 }
 
-fn repository(dir: &Path) -> Option<String> {
-    let common = common_dir(&git_dir(dir)?)?;
+fn repository(gitdir: &Path) -> Option<String> {
+    let common = common_dir(gitdir)?;
     remote(regular(&common.join("config"))?)
 }
 
@@ -257,6 +265,21 @@ mod tests {
             "[remote \"a\"]\n url = git@github.com:acme/a.git\n[remote \"b\"]\n url = git@github.com:acme/b.git\n",
         );
         assert_eq!(resolve(&repo), Checkout::Unresolved);
+    }
+
+    #[test]
+    fn located_gitdir_is_the_worktree_admin_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = repo(dir.path(), "git@github.com:acme/project.git");
+        let admin = main.join(".git/worktrees/feature");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let tree = dir.path().join("feature");
+        fs::create_dir_all(tree.join("src")).unwrap();
+        fs::write(tree.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert_eq!(locate(&tree.join("src")).1, Some(admin));
+        assert_eq!(locate(&main).1, Some(main.join(".git")));
+        assert_eq!(locate(dir.path()), (Checkout::Absent, None));
     }
 
     #[test]

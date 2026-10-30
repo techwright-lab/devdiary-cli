@@ -812,15 +812,23 @@ CANARIES = (
 )
 
 
-def git(*args):
-    subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", *map(str, args)],
-        check=True,
-        capture_output=True,
+GIT_IDENTITY = ("-c", "user.name=t", "-c", "user.email=t@t.invalid")
+
+
+def git(*args, identity=GIT_IDENTITY):
+    return (
+        subprocess.run(
+            ["/usr/bin/git", "-c", "commit.gpgsign=false", *identity, *map(str, args)],
+            check=True,
+            capture_output=True,
+            env={**os.environ, "GIT_EDITOR": "true", "GIT_CONFIG_GLOBAL": "/dev/null"},
+        )
+        .stdout.decode()
+        .strip()
     )
 
 
-class InstallationScopeHookTest(unittest.TestCase):
+class InstallationFixture:
     """An installation-scope connection built locally against a fake ingest server."""
 
     def setUp(self):
@@ -950,13 +958,22 @@ class InstallationScopeHookTest(unittest.TestCase):
         }
         return {**base, **extra}
 
-    def hook(self, cwd, tool_use_id="tool-1", exe=None, **env):
+    def hook(
+        self,
+        cwd,
+        tool_use_id="tool-1",
+        exe=None,
+        event="PostToolUse",
+        session="session-1",
+        tool="Bash",
+        **env,
+    ):
         event = {
-            "hook_event_name": "PostToolUse",
-            "session_id": "session-1",
+            "hook_event_name": event,
+            "session_id": session,
             "cwd": str(cwd),
             "tool_use_id": tool_use_id,
-            "tool_name": "Bash",
+            "tool_name": tool,
             "tool_input": {"command": "PRIVATE_SENTINEL"},
         }
         result = self.run_collector(
@@ -982,6 +999,8 @@ class InstallationScopeHookTest(unittest.TestCase):
     def sync(self, code=0):
         return self.run_collector("connection-sync", self.connection, "100", code=code)
 
+
+class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
     def test_sibling_worktrees_of_an_allowed_repository_are_captured(self):
         self.connect()
         nested = self.main / ".worktrees/x"
@@ -1147,6 +1166,19 @@ class InstallationScopeHookTest(unittest.TestCase):
         self.assertEqual(row["repository_ref"], "https://github.com/acme/demo")
         self.assertFalse({"orchestrator", "orchestrator_agent_ref"} & row.keys())
 
+    def test_a_v1_wire_never_marks_or_links_commits(self):
+        self.connect(versions=(1,))
+        self.hook(self.main, "commit", event="PreToolUse")
+        Path(self.main / "file").write_text("x")
+        git("-C", self.main, "add", "file")
+        git("-C", self.main, "commit", "-q", "-m", "change")
+        self.hook(self.main, "commit")
+        for row in self.rows():
+            self.assertFalse({"commits", "overlap_count", "commit_gap"} & row.keys())
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            (marks,) = db.execute("SELECT count(*) FROM bracket_marks").fetchone()
+        self.assertEqual(marks, 0)
+
     def test_out_of_scope_hook_p99_on_the_release_build(self):
         release = ROOT / "target/release/devdiary-collector"
         if not release.exists():
@@ -1167,6 +1199,359 @@ class InstallationScopeHookTest(unittest.TestCase):
         print(f"out-of-scope hook p99 {p99 * 1000:.1f} ms over {len(timings)} runs")
         self.assertLess(p99, 0.050)
         self.assertEqual(self.rows(), [])
+
+
+BRACKET_FIELDS = {"commits", "overlap_count", "commit_gap"}
+HOUR_NS = 3_600_000_000_000
+
+
+class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
+    """Commits are linked only from one Bash tool call's own checkout reflog."""
+
+    def setUp(self):
+        super().setUp()
+        self.connect()
+
+    def post(self, tool_use_id, session="session-1", event="PostToolUse"):
+        (row,) = [
+            r
+            for r in self.rows()
+            if r["event"] == event
+            and r["tool_use_id"] == tool_use_id
+            and r["session_id"] == session
+        ]
+        return row
+
+    def bracket(self, cwd, tool_use_id, action, session="session-1", **env):
+        self.hook(cwd, tool_use_id, event="PreToolUse", session=session, **env)
+        action()
+        self.hook(cwd, tool_use_id, session=session, **env)
+        return self.post(tool_use_id, session)
+
+    def change(self, cwd=None, name="file", message="change"):
+        cwd = cwd or self.main
+        path = Path(cwd) / name
+        path.write_text(path.read_text() + "x\n" if path.exists() else "x\n")
+        git("-C", cwd, "add", name)
+        git("-C", cwd, "commit", "-q", "-m", message)
+        return self.head(cwd)
+
+    def head(self, cwd=None):
+        return git("-C", cwd or self.main, "rev-parse", "HEAD")
+
+    def assert_captured(self, row, shas, overlap=0):
+        self.assertEqual(row["commits"], shas)
+        self.assertEqual(row["overlap_count"], overlap)
+        self.assertNotIn("commit_gap", row)
+
+    def assert_nothing(self, row):
+        self.assertFalse(BRACKET_FIELDS & row.keys(), row)
+
+    def marks(self):
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            return [r[0] for r in db.execute("SELECT tool_use_id FROM bracket_marks")]
+
+    def test_commit_amend_cherry_pick_and_rebase_pick_emit_their_sha(self):
+        row = self.bracket(self.main, "commit", lambda: self.change())
+        self.assert_captured(row, [self.head()])
+
+        amend = lambda: git("-C", self.main, "commit", "-q", "--amend", "-m", "amended")
+        row = self.bracket(self.main, "amend", amend)
+        self.assert_captured(row, [self.head()])
+
+        git("-C", self.main, "checkout", "-q", "-b", "topic")
+        picked = self.change(name="picked")
+        git("-C", self.main, "checkout", "-q", "-")
+        pick = lambda: git("-C", self.main, "cherry-pick", picked)
+        row = self.bracket(self.main, "cherry-pick", pick)
+        self.assert_captured(row, [self.head()])
+
+        git("-C", self.main, "checkout", "-q", "-b", "rebased", "HEAD~1")
+        self.change(name="rebased")
+        main_branch = git("-C", self.main, "rev-parse", "--abbrev-ref", "@{-1}")
+        rebase = lambda: git("-C", self.main, "rebase", "-q", main_branch)
+        row = self.bracket(self.main, "rebase", rebase)
+        self.assert_captured(row, [self.head()])
+        self.assertEqual(self.drops(), {})
+
+    def test_revert_and_a_non_fast_forward_merge_emit_their_sha(self):
+        self.change()
+        revert = lambda: git("-C", self.main, "revert", "--no-edit", "HEAD")
+        self.assert_captured(self.bracket(self.main, "revert", revert), [self.head()])
+        git("-C", self.main, "checkout", "-q", "-b", "side", "HEAD~1")
+        self.change(name="side")
+        git("-C", self.main, "checkout", "-q", "-")
+        merge = lambda: git(
+            "-C", self.main, "merge", "-q", "--no-ff", "--no-edit", "side"
+        )
+        self.assert_captured(self.bracket(self.main, "merge", merge), [self.head()])
+
+    def test_a_failed_bash_call_still_closes_its_bracket(self):
+        self.hook(self.main, "failed", event="PreToolUse")
+        sha = self.change()
+        self.hook(self.main, "failed", event="PostToolUseFailure")
+        self.assert_captured(self.post("failed", event="PostToolUseFailure"), [sha])
+        self.assertEqual(self.marks(), ["failed"])
+        self.hook(self.main, "failed")
+        self.assert_nothing(self.post("failed"))
+
+    def test_checkout_reset_and_fast_forward_merge_emit_none(self):
+        self.change()
+        git("-C", self.main, "checkout", "-q", "-b", "ahead")
+        self.change(name="ahead")
+        git("-C", self.main, "checkout", "-q", "-")
+        switch = lambda: (
+            git("-C", self.main, "checkout", "-q", "ahead"),
+            git("-C", self.main, "checkout", "-q", "-"),
+        )
+        self.assert_nothing(self.bracket(self.main, "checkout", switch))
+        reset = lambda: git("-C", self.main, "reset", "-q", "--hard", "HEAD~1")
+        self.assert_nothing(self.bracket(self.main, "reset", reset))
+        merge = lambda: git("-C", self.main, "merge", "-q", "--ff-only", "ahead")
+        self.assert_nothing(self.bracket(self.main, "merge", merge))
+        self.assertEqual(self.head(), git("-C", self.main, "rev-parse", "ahead"))
+
+    def test_a_commit_between_tool_calls_emits_nothing(self):
+        self.change()
+        self.assert_nothing(self.bracket(self.main, "after", lambda: None))
+        self.change(name="unbracketed")
+        self.hook(self.main, "post-without-pre")
+        self.assert_nothing(self.post("post-without-pre"))
+
+    def test_a_commit_in_another_checkout_during_the_bracket_emits_nothing(self):
+        sibling = self.root / "sibling"
+        git("-C", self.main, "worktree", "add", "-q", sibling)
+        row = self.bracket(self.main, "elsewhere", lambda: self.change(sibling))
+        self.assert_nothing(row)
+
+    def test_overlapping_brackets_on_one_checkout_are_both_counted(self):
+        self.hook(self.main, "a", event="PreToolUse", session="session-a")
+        self.hook(self.main, "b", event="PreToolUse", session="session-b")
+        first = self.change(name="a")
+        self.hook(self.main, "a", session="session-a")
+        second = self.change(name="b")
+        self.hook(self.main, "b", session="session-b")
+        a, b = self.post("a", "session-a"), self.post("b", "session-b")
+        self.assertEqual(a["commits"], [first])
+        self.assertIn(second, b["commits"])
+        self.assertGreaterEqual(a["overlap_count"], 1)
+        self.assertGreaterEqual(b["overlap_count"], 1)
+
+    def test_parallel_calls_in_one_session_are_not_overlap(self):
+        self.hook(self.main, "status", event="PreToolUse")
+        row = self.bracket(self.main, "commit", lambda: self.change())
+        self.hook(self.main, "status")
+        self.assert_captured(row, [self.head()])
+
+    def end_turn(self, session, event):
+        event = {"hook_event_name": event, "session_id": session, "cwd": str(self.main)}
+        if event["hook_event_name"] != "SessionEnd":
+            event["prompt_id"] = f"{session}-prompt"
+        result = self.run_collector(
+            "claude-hook", self.plan, data=json.dumps(event).encode(), env=self.env()
+        )
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+
+    def age(self, tool_use_id, nanos):
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            db.execute(
+                "UPDATE bracket_marks SET opened_at = opened_at - ? WHERE tool_use_id = ?",
+                (nanos, tool_use_id),
+            )
+
+    def test_a_call_waiting_long_for_permission_still_counts_as_overlap(self):
+        self.hook(self.main, "waiting", event="PreToolUse", session="session-a")
+        self.age("waiting", HOUR_NS // 3)
+        self.hook(self.main, "b", event="PreToolUse", session="session-b")
+        landed = self.change(name="waiting")
+        self.hook(self.main, "b", session="session-b")
+        self.hook(self.main, "waiting", session="session-a")
+        self.assert_captured(self.post("b", "session-b"), [landed], overlap=1)
+        self.assert_captured(self.post("waiting", "session-a"), [landed], overlap=1)
+
+    def test_an_unclosed_call_stops_counting_when_its_session_ends_the_turn(self):
+        for end in ("Stop", "UserPromptSubmit", "SessionEnd"):
+            with self.subTest(end=end):
+                other = f"session-{end}"
+                self.hook(self.main, end, event="PreToolUse", session=other)
+                row = self.bracket(
+                    self.main, f"{end}-soon", lambda name=end: self.change(name=name)
+                )
+                self.assert_captured(row, [self.head()], overlap=1)
+                self.end_turn(other, end)
+                row = self.bracket(
+                    self.main, f"{end}-later", lambda name=end: self.change(name=name)
+                )
+                self.assert_captured(row, [self.head()])
+                self.hook(self.main, end, session=other)
+                self.assert_nothing(self.post(end, other))
+
+    def test_a_non_bash_tool_call_never_marks_or_links(self):
+        for event in ("PreToolUse", "PostToolUse"):
+            self.hook(self.main, "edit", event=event, tool="Edit")
+            if event == "PreToolUse":
+                self.change()
+        self.assertEqual(self.marks(), [])
+        self.assert_nothing(self.post("edit"))
+
+    def test_concurrent_brackets_on_one_checkout_drop_nothing(self):
+        sessions = [f"session-{i}" for i in range(24)]
+        with concurrent.futures.ThreadPoolExecutor(len(sessions)) as pool:
+            for event in ("PreToolUse", "PostToolUse"):
+                calls = [
+                    pool.submit(self.hook, self.main, "t", event=event, session=s)
+                    for s in sessions
+                ]
+                for call in calls:
+                    call.result()
+        self.assertEqual(self.drops(), {})
+        self.assertEqual(len(self.rows()), 2 * len(sessions))
+        self.assertEqual(len(self.marks()), len(sessions))
+
+    def test_sibling_worktrees_each_get_only_their_own_sha(self):
+        left, right = self.root / "left", self.root / "right"
+        git("-C", self.main, "worktree", "add", "-q", left)
+        git("-C", self.main, "worktree", "add", "-q", right)
+        self.hook(left, "l", event="PreToolUse", session="session-l")
+        self.hook(right, "r", event="PreToolUse", session="session-r")
+        left_sha = self.change(left, name="l")
+        right_sha = self.change(right, name="r")
+        self.hook(left, "l", session="session-l")
+        self.hook(right, "r", session="session-r")
+        self.assert_captured(self.post("l", "session-l"), [left_sha])
+        self.assert_captured(self.post("r", "session-r"), [right_sha])
+
+    def test_declared_paperclip_checkout_is_bracketed_when_cwd_has_none(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        tree = self.root / "paperclip-tree"
+        git("-C", self.main, "worktree", "add", "-q", tree)
+        env = {"PAPERCLIP_AGENT_ID": AGENT, "PAPERCLIP_WORKSPACE_CWD": str(tree)}
+        row = self.bracket(plain, "declared", lambda: self.change(tree), **env)
+        self.assert_captured(row, [self.head(tree)])
+
+    def test_truncated_or_rotated_reflog_is_a_rewrite_gap(self):
+        for i in range(5):
+            self.change(name=f"f{i}")
+        log = self.main / ".git/logs/HEAD"
+
+        def truncate():
+            log.write_bytes(b"")
+            self.change(name="after-truncate")
+
+        row = self.bracket(self.main, "truncated", truncate)
+        self.assertEqual(row["commit_gap"], "reflog_rewritten")
+        self.assertFalse({"commits", "overlap_count"} & row.keys())
+
+        def rotate():
+            self.change(name="before-expire")
+            git("-C", self.main, "reflog", "expire", "--expire=now", "--all")
+            self.change(name="after-expire")
+
+        row = self.bracket(self.main, "rotated", rotate)
+        self.assertEqual(row["commit_gap"], "reflog_rewritten")
+        self.assertEqual(self.drops(), {"reflog_rotated": 2})
+
+    def test_more_than_64_kib_or_20_commits_is_an_overflow_gap(self):
+        many = lambda: [self.change(name=f"n{i}") for i in range(21)]
+        row = self.bracket(self.main, "many", many)
+        self.assertEqual(row["commit_gap"], "reflog_overflow")
+        self.assertNotIn("commits", row)
+        huge = lambda: self.change(name="huge", message="s" * 70_000)
+        row = self.bracket(self.main, "huge", huge)
+        self.assertEqual(row["commit_gap"], "reflog_overflow")
+
+    def test_a_missing_post_emits_nothing_and_its_mark_is_pruned_after_6h(self):
+        self.hook(self.main, "lost", event="PreToolUse")
+        self.change()
+        self.assertEqual(self.marks(), ["lost"])
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            db.execute(
+                "UPDATE bracket_marks SET opened_at = opened_at - ?", (7 * HOUR_NS,)
+            )
+        self.hook(self.main, "next", event="PreToolUse")
+        self.assertEqual(self.marks(), ["next"])
+        self.hook(self.main, "lost")
+        self.assert_nothing(self.post("lost"))
+
+    def test_reflog_messages_and_author_emails_never_reach_spool_or_wire(self):
+        identity = (
+            "-c",
+            "user.name=NAMECANARY",
+            "-c",
+            "user.email=canary@author.invalid",
+        )
+
+        def commit():
+            Path(self.main / "secret").write_text("x")
+            git("-C", self.main, "add", "secret")
+            git(
+                "-C",
+                self.main,
+                "commit",
+                "-q",
+                "-m",
+                "MESSAGECANARY",
+                identity=identity,
+            )
+
+        row = self.bracket(self.main, "private", commit)
+        self.assert_captured(row, [self.head()])
+        canaries = [b"MESSAGECANARY", b"NAMECANARY", b"canary@author.invalid"]
+        for file in self.outbox.iterdir():
+            raw = file.read_bytes()
+            for canary in canaries:
+                self.assertNotIn(canary, raw, file.name)
+        self.sync()
+        wire = b"".join(self.received)
+        self.assertIn(self.head().encode(), wire)
+        for canary in canaries:
+            self.assertNotIn(canary, wire)
+
+    def test_a_10k_line_reflog_keeps_the_debug_hook_under_700_ms(self):
+        # Real SHAs and a current date: git's auto maintenance rewrites a
+        # reflog holding stale or dangling entries, which reads as a gap.
+        head, now = self.head(), int(time.time())
+        line = (
+            f"{head} {head} t <t@t.invalid> {now} +0000\tcheckout: moving from a to b\n"
+        )
+        with open(self.main / ".git/logs/HEAD", "a") as log:
+            log.write(line * 10_000)
+        timings = []
+
+        def timed(**kwargs):
+            start = time.perf_counter()
+            self.hook(self.main, "slow", **kwargs)
+            timings.append(time.perf_counter() - start)
+
+        timed(event="PreToolUse")
+        sha = self.change()
+        timed()
+        self.assert_captured(self.post("slow"), [sha])
+        print(
+            f"bracket hook latency with a 10k-line reflog: {max(timings) * 1000:.1f} ms"
+        )
+        self.assertLess(max(timings), 0.700)
+
+    def test_nearly_64_kib_appended_inside_the_bracket_stays_under_700_ms(self):
+        head, now = self.head(), int(time.time())
+        line = (
+            f"{head} {head} t <t@t.invalid> {now} +0000\tcheckout: moving from a to b\n"
+        )
+
+        def busy():
+            with open(self.main / ".git/logs/HEAD", "a") as log:
+                log.write(line * ((63 * 1024) // len(line)))
+            return self.change()
+
+        self.hook(self.main, "busy", event="PreToolUse")
+        sha = busy()
+        before = time.perf_counter()
+        self.hook(self.main, "busy")
+        elapsed = time.perf_counter() - before
+        self.assert_captured(self.post("busy"), [sha])
+        print(f"bracket hook latency reading ~63 KiB appended: {elapsed * 1000:.1f} ms")
+        self.assertLess(elapsed, 0.700)
 
 
 if __name__ == "__main__":
