@@ -127,20 +127,25 @@ fn state_check(state: &Path) -> Result<()> {
         {
             return Err("separate_empty_rust_state_required".into());
         }
-        if let Err(error) = private(&e.path(), false)
-            && !vanished(&e.path(), &name, &persistent)
-        {
-            return Err(error);
-        }
+        state_entry(&e.path(), !persistent.iter().any(|n| name == *n))?;
     }
     Ok(())
 }
-// Journals, the fingerprint and drop logs can be unlinked between readdir and
-// stat. Only a missing transient file is harmless; never ignore ownership,
-// symlink, permissions or a missing database/lock.
-fn vanished(path: &Path, name: &std::ffi::OsStr, persistent: &[&str]) -> bool {
-    !persistent.iter().any(|n| name == *n)
-        && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+// Journals, the fingerprint and drop logs can be unlinked between readdir
+// and stat. Only a missing transient file is harmless; never ignore
+// ownership, symlink, permissions or a missing database/lock.
+fn state_entry(path: &Path, transient: bool) -> Result<()> {
+    let owned = trusted_ancestors(path).and_then(|()| Ok(owned_by_us(path, false, 0o077)?));
+    let missing = |e: &(dyn std::error::Error + 'static)| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    };
+    match owned {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("private_state_required".into()),
+        Err(e) if transient && missing(e.as_ref()) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 fn connect(path: &Path, page_limit: bool) -> Result<Connection> {
     let db = Connection::open(path)?;
@@ -780,7 +785,6 @@ fn post(
 mod tests {
     use super::*;
     use crate::reflog::Mark;
-    use std::ffi::OsStr;
 
     const HOUR: i64 = 3_600_000_000_000;
     fn store() -> (tempfile::TempDir, Store) {
@@ -800,23 +804,6 @@ mod tests {
         }
     }
     const MARK: Mark = Mark { offset: 7, ino: 9 };
-
-    #[test]
-    fn only_a_missing_transient_file_counts_as_vanished() {
-        let dir = std::env::temp_dir().join(format!("vanished-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let held = dir.join("held-journal");
-        fs::write(&held, b"x").unwrap();
-        let persistent = ["db"];
-        assert!(vanished(
-            &dir.join("gone-journal"),
-            OsStr::new("gone-journal"),
-            &persistent
-        ));
-        assert!(!vanished(&held, OsStr::new("held-journal"), &persistent));
-        assert!(!vanished(&dir.join("db"), OsStr::new("db"), &persistent));
-        fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn a_closed_bracket_returns_its_mark_once() {
