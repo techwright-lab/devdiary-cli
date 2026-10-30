@@ -225,12 +225,52 @@ fn v2_refuses_identity_claims_and_malformed_capture() {
 }
 
 #[test]
+fn v2_commit_fields_ride_only_on_a_bash_post_tool_row() {
+    let config = installation();
+    let failure = serde_json::json!({"event": "PostToolUseFailure"});
+    assert!(frozen(&config, &merged(failure)).is_some());
+    for change in [
+        serde_json::json!({"event": "SessionStart"}),
+        serde_json::json!({"event": "UserPromptSubmit"}),
+        serde_json::json!({"event": "Stop"}),
+        serde_json::json!({"event": "PreToolUse"}),
+        serde_json::json!({"tool_name": "Edit"}),
+        serde_json::json!({"tool_name": null}),
+        serde_json::json!({"tool_use_id": null}),
+        serde_json::json!({"overlap_count": null}),
+    ] {
+        assert!(
+            frozen(&config, &merged(change.clone())).is_none(),
+            "{change}"
+        );
+        let mut gap = merged(change.clone());
+        gap.as_object_mut().unwrap().remove("commits");
+        gap["commit_gap"] = "reflog_rewritten".into();
+        if change.get("overlap_count").is_none() {
+            assert!(frozen(&config, &gap).is_none(), "gap {change}");
+        }
+    }
+}
+
+fn merged(change: serde_json::Value) -> serde_json::Value {
+    let mut row = local_v2();
+    for (key, value) in change.as_object().unwrap() {
+        row[key.as_str()] = value.clone();
+    }
+    row
+}
+
+#[test]
 fn v2_repository_is_optional_only_for_opted_in_paperclip_rows() {
     let mut row = local_v2();
     row.as_object_mut().unwrap().remove("repository_ref");
-    assert!(frozen(&installation(), &row).is_none());
     let mut config = installation();
     config.insert("record_orchestrated_outside_repos".into(), true.into());
+    assert!(frozen(&config, &row).is_none(), "repo-less commits");
+    for key in ["commits", "overlap_count"] {
+        row.as_object_mut().unwrap().remove(key);
+    }
+    assert!(frozen(&installation(), &row).is_none());
     let wire = frozen(&config, &row).unwrap();
     assert!(wire.get("repository_ref").is_none());
     row["orchestrator"] = "none".into();

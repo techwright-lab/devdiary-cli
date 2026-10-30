@@ -423,6 +423,25 @@ class InstallationPairingTest(unittest.TestCase):
         self.assertIn(b"--record-orchestrated-outside-repos", err)
         saved = json.loads((self.connection / "connection.json").read_bytes())
         self.assertFalse(saved["scope"]["record_orchestrated_outside_repos"])
+        self.run_collector("connection-status", self.connection)
+        self.run_collector("connection-sync", self.connection, "10")
+        self.setup_collector("--record-orchestrated-outside-repos")
+        settings, plan = self.root / "settings.json", self.root / "plan.json"
+        settings.write_text("{}")
+        settings.chmod(0o600)
+        self.run_collector("setup-plan", self.connection, settings, plan)
+
+    def test_an_outside_repo_opt_in_cannot_be_widened_after_pairing(self):
+        self.connection_shape = {"observation_schema_versions": [1]}
+        self.setup_collector("--record-orchestrated-outside-repos")
+        path = self.connection / "connection.json"
+        saved = json.loads(path.read_bytes())
+        saved["scope"]["record_orchestrated_outside_repos"] = True
+        path.write_text(json.dumps(saved))
+        self.run_collector("connection-status", self.connection, code=2)
+        saved["scope"]["observation_schema_versions"] = [1, 2]
+        path.write_text(json.dumps(saved))
+        self.run_collector("connection-status", self.connection, code=2)
 
     def test_an_exchange_for_another_scope_is_refused(self):
         self.connection_shape = {

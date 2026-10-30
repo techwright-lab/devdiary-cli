@@ -217,21 +217,26 @@ fn connection(root: &Path) -> Result<Object> {
     }
     let saved = object(&read(&root.join("installation.json"))?)?;
     let frozen: &[&str] = if installation {
-        &[
-            "installation_id",
-            "scope_kind",
-            "record_orchestrated_outside_repos",
-        ]
+        &["installation_id", "scope_kind"]
     } else {
         &["installation_id", "repository", "repository_ref"]
     };
-    if frozen.iter().any(|key| config.get(*key) != saved.get(*key)) {
+    if frozen.iter().any(|key| config.get(*key) != saved.get(*key))
+        || (installation && config["record_orchestrated_outside_repos"] != outside(&saved, &config))
+    {
         return Err("frozen_scope_conflict".into());
     }
     if text(&config, "endpoint")? != format!("{}/ingest/v1/observations", text(&saved, "origin")?) {
         return Err("frozen_scope_conflict".into());
     }
     Ok(doc)
+}
+// The saved request only takes effect on a server that accepts schema v2.
+fn outside(installation: &Object, config: &Object) -> serde_json::Value {
+    json!(
+        installation.get("record_orchestrated_outside_repos") == Some(&json!(true))
+            && crate::wire_version(config) == 2
+    )
 }
 fn initialize(root: &Path, doc: &Object) -> Result<()> {
     let outbox = root.join("outbox");

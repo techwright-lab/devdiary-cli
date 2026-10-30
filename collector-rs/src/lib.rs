@@ -317,7 +317,22 @@ fn orchestrated(out: &Object) -> Result<()> {
     }
     Ok(())
 }
+// SHAs are claimable only from one Bash bracket inside a known repository.
 fn captured(out: &Object) -> Result<()> {
+    let fields = ["commits", "overlap_count", "commit_gap"];
+    if fields.iter().any(|k| out.contains_key(*k))
+        && !(matches!(
+            out.get("event").and_then(Value::as_str),
+            Some("PostToolUse" | "PostToolUseFailure")
+        ) && out.get("tool_name") == Some(&json!("Bash"))
+            && out.contains_key("tool_use_id")
+            && out.contains_key("repository_ref"))
+    {
+        return Err("invalid_commits".into());
+    }
+    if out.contains_key("commits") && !out.contains_key("overlap_count") {
+        return Err("invalid_commits".into());
+    }
     if let Some(commits) = out.get("commits") {
         let valid = commits.as_array().is_some_and(|shas| {
             (1..=20).contains(&shas.len())
