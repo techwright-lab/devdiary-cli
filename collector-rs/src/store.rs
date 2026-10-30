@@ -122,20 +122,20 @@ fn state_check(state: &Path) -> Result<()> {
         {
             return Err("separate_empty_rust_state_required".into());
         }
-        // Journals, the fingerprint and drop logs can be unlinked between readdir
-        // and stat. Only a missing transient file is harmless; never ignore
-        // ownership, symlink, permissions or a missing database/lock.
-        if let Err(error) = private(&e.path(), false) {
-            let transient = !persistent.iter().any(|n| name == *n);
-            let missing = error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-            if !transient || !missing {
-                return Err(error);
-            }
+        if let Err(error) = private(&e.path(), false)
+            && !vanished(&e.path(), &name, &persistent)
+        {
+            return Err(error);
         }
     }
     Ok(())
+}
+// Journals, the fingerprint and drop logs can be unlinked between readdir and
+// stat. Only a missing transient file is harmless; never ignore ownership,
+// symlink, permissions or a missing database/lock.
+fn vanished(path: &Path, name: &std::ffi::OsStr, persistent: &[&str]) -> bool {
+    !persistent.iter().any(|n| name == *n)
+        && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 fn connect(path: &Path, page_limit: bool) -> Result<Connection> {
     let db = Connection::open(path)?;
@@ -693,6 +693,24 @@ fn post(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_a_missing_transient_file_counts_as_vanished() {
+        let dir = std::env::temp_dir().join(format!("vanished-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("held-journal");
+        fs::write(&held, b"x").unwrap();
+        let persistent = ["db"];
+        assert!(vanished(
+            &dir.join("gone-journal"),
+            OsStr::new("gone-journal"),
+            &persistent
+        ));
+        assert!(!vanished(&held, OsStr::new("held-journal"), &persistent));
+        assert!(!vanished(&dir.join("db"), OsStr::new("db"), &persistent));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn refs_differing_only_by_case_keep_the_first_spelling() {
