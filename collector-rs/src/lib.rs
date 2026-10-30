@@ -6,6 +6,7 @@ pub mod checkout;
 pub mod claude;
 pub mod drops;
 pub mod pairing;
+pub mod reflog;
 pub mod store;
 use chrono::{DateTime, Datelike, Utc};
 use serde::de::{MapAccess, Visitor};
