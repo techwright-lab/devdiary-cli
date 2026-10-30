@@ -804,6 +804,22 @@ class ClaudeHookTest(unittest.TestCase):
 AGENT = "22c99d01-c3ee-4041-9066-0a83f34bd2e2"
 RUN = "66666666-6666-4666-8666-666666666666"
 TASK = "77777777-7777-4777-8777-777777777777"
+PAPERCLIP = {
+    "key": "paperclip",
+    "env": {
+        "agent_ref": "PAPERCLIP_AGENT_ID",
+        "run_ref": "PAPERCLIP_RUN_ID",
+        "task_ref": "PAPERCLIP_TASK_ID",
+        "checkout_path": [
+            "PAPERCLIP_WORKSPACE_WORKTREE_PATH",
+            "PAPERCLIP_WORKSPACE_CWD",
+        ],
+    },
+}
+CRON = {
+    "key": "cron",
+    "env": {"agent_ref": "CRONTOOL_AGENT", "run_ref": "CRONTOOL_RUN"},
+}
 CANARIES = (
     "PAPERCLIP_API_KEY",
     "PAPERCLIP_AGENT_PRIVATE_KEY",
@@ -842,6 +858,7 @@ class InstallationFixture:
         self.refs = ["https://github.com/acme/demo"]
         self.received = []
         self.served_refs = list(self.refs)
+        self.served_orchestrators = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -858,16 +875,16 @@ class InstallationFixture:
             def do_GET(self):
                 if self.path != "/ingest/v1/collector/scope":
                     return self.reply(404, {})
-                self.reply(
-                    200,
-                    {
-                        "schema_version": 1,
-                        "collector_ref": owner.collector_ref,
-                        "scope_kind": "installation",
-                        "repository_refs": owner.served_refs,
-                        "observation_schema_versions": [1, 2],
-                    },
-                )
+                reply = {
+                    "schema_version": 1,
+                    "collector_ref": owner.collector_ref,
+                    "scope_kind": "installation",
+                    "repository_refs": owner.served_refs,
+                    "observation_schema_versions": [1, 2],
+                }
+                if owner.served_orchestrators is not None:
+                    reply["orchestrators"] = owner.served_orchestrators
+                self.reply(200, reply)
 
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
@@ -901,7 +918,7 @@ class InstallationFixture:
         git("-C", path, "commit", "-q", "--allow-empty", "-m", "init")
         return path
 
-    def connect(self, opt_in=False, versions=(1, 2)):
+    def connect(self, opt_in=False, versions=(1, 2), approved=(PAPERCLIP,)):
         self.connection = self.root / "connection"
         self.connection.mkdir(mode=0o700)
         installation = {
@@ -933,6 +950,19 @@ class InstallationFixture:
         self.run_collector("setup-plan", self.connection, self.settings, self.plan)
         self.run_collector("claude-apply", self.plan, "--consent")
         self.outbox = self.connection / "outbox"
+        if approved is not None:
+            self.approve(list(approved))
+
+    def approve(self, entries):
+        self.write(self.outbox / "orchestrators-approved.json", entries)
+
+    def offered(self):
+        return json.loads((self.outbox / "orchestrators-offered.json").read_bytes())
+
+    def status(self):
+        return json.loads(
+            self.run_collector("connection-status", self.connection).stdout
+        )["local_orchestrators"]
 
     def write(self, path, value):
         path.write_text(json.dumps(value))
@@ -1015,7 +1045,7 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         for row in rows:
             self.assertEqual(row["repository_ref"], "https://github.com/acme/demo")
             self.assertEqual(row["schema_version"], 2)
-            self.assertEqual(row["orchestrator"], "none")
+            self.assertNotIn("orchestrator", row)
             self.assertNotIn("actor_ref", row)
             self.assertNotIn("repository", row)
         self.assertEqual(self.drops(), {})
@@ -1107,6 +1137,120 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.assertEqual([r["orchestrator"] for r in rows], ["paperclip", "paperclip"])
         self.assertNotIn("orchestrator_agent_ref", rows[0])
         self.assertEqual(rows[1]["orchestrator_run_ref"], RUN)
+
+    def test_unapproved_names_are_never_read(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect(approved=None)
+        self.sync()
+        self.assertEqual(self.offered()["orchestrators"], [PAPERCLIP])
+        self.assertFalse((self.outbox / "orchestrators-approved.json").exists())
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        (row,) = self.rows()
+        self.assertFalse({"orchestrator", "orchestrator_agent_ref"} & row.keys())
+        self.assertEqual(
+            self.status(),
+            {
+                "approved": [],
+                "approved_list_unreadable": False,
+                "offered": ["paperclip"],
+                "waiting_for_approval": True,
+                "refused": 0,
+            },
+        )
+
+    def test_the_offered_list_is_stored_privately(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect()
+        self.sync()
+        mode = (self.outbox / "orchestrators-offered.json").stat().st_mode
+        self.assertEqual(mode & 0o777, 0o600)
+        self.assertFalse(self.status()["waiting_for_approval"])
+
+    def test_a_changed_offer_keeps_the_approved_list_and_says_so(self):
+        self.served_orchestrators = [CRON]
+        self.connect()
+        self.sync()
+        self.assertEqual(self.offered()["orchestrators"], [CRON])
+        self.hook(self.main, tool_use_id="old", PAPERCLIP_AGENT_ID=AGENT)
+        self.hook(self.main, tool_use_id="new", CRONTOOL_AGENT=AGENT)
+        rows = self.rows()
+        self.assertEqual(rows[0]["orchestrator"], "paperclip")
+        self.assertNotIn("orchestrator", rows[1])
+        self.assertTrue(self.status()["waiting_for_approval"])
+
+    def test_a_server_that_drops_the_offer_cannot_narrow_the_approved_list(self):
+        self.served_orchestrators = []
+        self.connect()
+        self.sync()
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        self.assertEqual(self.rows()[0]["orchestrator"], "paperclip")
+        self.assertTrue(self.status()["waiting_for_approval"])
+
+    def test_a_scope_reply_without_the_field_keeps_the_stored_offer(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect()
+        self.sync()
+        self.served_orchestrators = None
+        self.sync()
+        self.assertEqual(self.offered()["orchestrators"], [PAPERCLIP])
+
+    def test_a_server_offering_a_secret_name_cannot_cause_it_to_be_read(self):
+        evil = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
+        self.served_orchestrators = [evil, PAPERCLIP]
+        self.connect(approved=None)
+        self.sync()
+        self.assertEqual(self.offered(), {"orchestrators": [PAPERCLIP], "refused": 1})
+        self.approve(self.offered()["orchestrators"])
+        self.hook(self.main, AWS_SECRET_ACCESS_KEY=AGENT)
+        (row,) = self.rows()
+        self.assertNotIn("orchestrator", row)
+        self.assertEqual(self.status()["refused"], 1)
+        self.sync()
+        self.assertNotIn(AGENT.encode(), b"".join(self.received))
+
+    def test_a_refused_name_in_the_approved_file_stops_the_row_unread(self):
+        self.connect()
+        self.approve([{"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}])
+        self.hook(self.main, AWS_SECRET_ACCESS_KEY=AGENT)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"error": 1})
+        status = self.status()
+        self.assertTrue(status["approved_list_unreadable"])
+        self.assertTrue(status["waiting_for_approval"])
+
+    def test_the_first_approved_entry_that_matches_wins(self):
+        self.connect(approved=[CRON, PAPERCLIP])
+        self.hook(self.main, CRONTOOL_RUN=RUN, PAPERCLIP_AGENT_ID=AGENT)
+        (row,) = self.rows()
+        self.assertEqual(row["orchestrator"], "cron")
+        self.assertEqual(row["orchestrator_run_ref"], RUN)
+        self.assertNotIn("orchestrator_agent_ref", row)
+
+    def test_a_new_preset_works_with_no_collector_change(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        tree = self.root / "other-tree"
+        git("-C", self.main, "worktree", "add", "-q", tree)
+        tool = {
+            "key": "acme-run",
+            "env": {"run_ref": "ACME_RUN", "checkout_path": ["ACME_DIR"]},
+        }
+        self.connect(approved=[tool])
+        self.hook(plain, ACME_RUN="malformed", ACME_DIR=str(tree))
+        (row,) = self.rows()
+        self.assertEqual(row["orchestrator"], "acme-run")
+        self.assertEqual(row["repository_ref"], "https://github.com/acme/demo")
+        self.assertNotIn("orchestrator_run_ref", row)
+
+    def test_only_the_matched_entry_gives_checkout_hints(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        tree = self.root / "unused-tree"
+        git("-C", self.main, "worktree", "add", "-q", tree)
+        self.connect(approved=[CRON, PAPERCLIP])
+        self.hook(plain, CRONTOOL_AGENT=AGENT, PAPERCLIP_WORKSPACE_CWD=str(tree))
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"outside_scope": 1})
 
     def test_secret_environment_never_reaches_spool_or_wire(self):
         plain = self.root / "plain"

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 use devdiary_collector::{
-    MAX_HOOK_INPUT, MAX_INPUT, Result, drops, install,
+    MAX_HOOK_INPUT, MAX_INPUT, Result, drops, install, orchestrators,
     store::{Store, repair, sync},
     systemd::Systemctl,
 };
@@ -14,7 +14,8 @@ const REPORTED: [&str; 5] = [
     "stale_plan",
     "repair_required",
 ];
-const INSTALL_REPORTED: [&str; 17] = [
+const INSTALL_REPORTED: [&str; 18] = [
+    "approval_required",
     "connection_revoked",
     "connection_active",
     "consent_required",
@@ -35,6 +36,9 @@ const INSTALL_REPORTED: [&str; 17] = [
 ];
 fn install_hint(code: &str) -> &'static str {
     match code {
+        "approval_required" => {
+            "Approving orchestrator names needs a person at a terminal. No flag replaces this. Run this command in a terminal."
+        }
         "consent_required" => {
             "Run install in a terminal to review the hook entries, or pass --yes."
         }
@@ -121,6 +125,11 @@ fn lifecycle(args: &[String]) -> Result<Option<i32>> {
         Some("uninstall") if rest.is_empty() => install::uninstall(&Systemctl)?,
         Some("doctor") if rest.is_empty() => install::doctor(&Systemctl)?,
         Some("timer-sync") if rest.len() == 1 => install::timer_sync(Path::new(&rest[0]))?,
+        Some("orchestrators") if rest.first().is_some_and(|c| c == "approve") => match &rest[1..] {
+            [] => install::approve_orchestrators(None)?,
+            [dir] if dir.starts_with('/') => install::approve_orchestrators(Some(Path::new(dir)))?,
+            _ => return Err("invalid_command".into()),
+        },
         _ => return Ok(None),
     }
     Ok(Some(0))
@@ -210,7 +219,7 @@ fn run() -> Result<i32> {
     }
     if args.len() == 2 && args[1] == "--help" {
         println!(
-            "install [--origin ORIGIN --trust-origin] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--yes] [--no-browser] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the 9 hook entries, then enables a systemd user timer that syncs every 2 minutes.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)"
+            "install [--origin ORIGIN --trust-origin] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--yes] [--no-browser] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the 9 hook entries, then enables a systemd user timer that syncs every 2 minutes.\n  --yes never approves orchestrator names.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)\norchestrators approve [CONNECTION_DIR]\n  Shows the environment names the server offers and asks. Needs a terminal."
         );
         println!(
             "setup PRIVATE_CONNECTION_DIR [REPOSITORY [--remote NAME]] [--record-orchestrated-outside-repos] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\n  Without REPOSITORY the connection covers every active repository of the workspace (installation scope).\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
@@ -255,7 +264,14 @@ fn run() -> Result<i32> {
             let store = Store::open(state, None)?;
             let (pending, delivered) = store.counts()?;
             let drops = serde_json::to_string(&drops::counts(&store, state)?)?;
-            println!("{{\"pending\":{pending},\"delivered\":{delivered},\"drops\":{drops}}}");
+            let waiting = if orchestrators::waiting(state)? {
+                ",\"orchestrators_waiting\":true"
+            } else {
+                ""
+            };
+            println!(
+                "{{\"pending\":{pending},\"delivered\":{delivered},\"drops\":{drops}{waiting}}}"
+            );
             return Ok(0);
         }
         Some("repair") if args.len() == 3 => {
@@ -304,7 +320,14 @@ fn main() {
         Err(error) => {
             let command = std::env::args().nth(1).unwrap_or_default();
             let code = error.to_string();
-            let lifecycle = ["install", "upgrade", "uninstall", "doctor", "timer-sync"];
+            let lifecycle = [
+                "install",
+                "upgrade",
+                "uninstall",
+                "doctor",
+                "timer-sync",
+                "orchestrators",
+            ];
             if lifecycle.contains(&command.as_str())
                 && let Some(code) = INSTALL_REPORTED
                     .iter()

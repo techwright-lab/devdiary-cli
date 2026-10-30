@@ -5,6 +5,7 @@ use crate::{
     MAX_HOOK_INPUT, Object, Result,
     checkout::{self, Checkout},
     drops, object,
+    orchestrators::{self, Declared},
     ordered::{self, Json},
     reflog::{self, Appended},
     store::{Bracket, FINGERPRINT, SETTINGS_LOCK, Store, create_private, owner_writable, private},
@@ -770,56 +771,23 @@ fn within_repository(cwd: &Path, config: &Object) -> Result<()> {
     }
     Ok(())
 }
-const PAPERCLIP: [(&str, &str); 3] = [
-    ("orchestrator_agent_ref", "PAPERCLIP_AGENT_ID"),
-    ("orchestrator_run_ref", "PAPERCLIP_RUN_ID"),
-    ("orchestrator_task_ref", "PAPERCLIP_TASK_ID"),
-];
-const WORKSPACE_HINTS: [&str; 2] = [
-    "PAPERCLIP_WORKSPACE_WORKTREE_PATH",
-    "PAPERCLIP_WORKSPACE_CWD",
-];
-// Any Paperclip id, even malformed, marks the run orchestrated: reporting
-// 'none' would let the server bind someone else's run to the machine owner.
-fn orchestrator() -> Object {
-    let mut out = Object::new();
-    let mut paperclip = false;
-    for (field, name) in PAPERCLIP {
-        match std::env::var(name) {
-            Ok(value) => {
-                paperclip = true;
-                let value = value.to_ascii_lowercase();
-                if crate::is_uuid(&value) {
-                    out.insert(field.into(), value.into());
-                }
-            }
-            Err(std::env::VarError::NotUnicode(_)) => paperclip = true,
-            Err(std::env::VarError::NotPresent) => {}
-        }
-    }
-    out.insert(
-        "orchestrator".into(),
-        if paperclip { "paperclip" } else { "none" }.into(),
-    );
-    out
-}
-fn workspace_checkout(cwd: &Path, paperclip: bool) -> (Checkout, Option<PathBuf>) {
+fn workspace_checkout(cwd: &Path, hints: &[String]) -> (Checkout, Option<PathBuf>) {
     let found = checkout::locate(cwd);
-    if found.0 != Checkout::Absent || !paperclip {
+    if found.0 != Checkout::Absent {
         return found;
     }
-    WORKSPACE_HINTS
+    hints
         .iter()
-        .filter_map(|name| std::env::var(name).ok())
         .filter(|hint| hint.len() <= 4096 && Path::new(hint).is_absolute())
-        .map(|hint| checkout::locate(Path::new(&hint)))
+        .map(|hint| checkout::locate(Path::new(hint)))
         .find(|c| c.0 != Checkout::Absent)
         .unwrap_or((Checkout::Absent, None))
 }
 type Located = Option<(String, Option<PathBuf>)>;
 // The stamped ref is the server's spelling; GitHub names are case-insensitive.
-fn locate(cwd: &Path, config: &Object, state: &Path, paperclip: bool) -> Result<Located> {
-    let (found, gitdir) = workspace_checkout(cwd, paperclip);
+fn locate(cwd: &Path, config: &Object, state: &Path, run: Option<&Declared>) -> Result<Located> {
+    let hints = run.map_or(&[][..], |run| &run.checkout);
+    let (found, gitdir) = workspace_checkout(cwd, hints);
     match found {
         Checkout::Repository(found) => crate::store::read_refs(state)?
             .into_iter()
@@ -828,7 +796,7 @@ fn locate(cwd: &Path, config: &Object, state: &Path, paperclip: bool) -> Result<
             .ok_or_else(|| "unknown_repository".into()),
         Checkout::Unresolved => Err("unknown_repository".into()),
         Checkout::Absent
-            if paperclip
+            if run.is_some()
                 && crate::wire_version(config) == 2
                 && config["record_orchestrated_outside_repos"] == json!(true) =>
         {
@@ -843,10 +811,11 @@ fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<(Object, Opti
         let row = json!({"schema_version": 1, "repository": config["repository"]});
         return Ok((object(&serde_json::to_vec(&row)?)?, None));
     }
-    let mut row = orchestrator();
-    let paperclip = row["orchestrator"] == json!("paperclip");
+    let run = orchestrators::declared(&orchestrators::approved(state)?);
     let mut gitdir = None;
-    if let Some((reference, found)) = locate(cwd, config, state, paperclip)? {
+    let located = locate(cwd, config, state, run.as_ref())?;
+    let mut row = run.map(|run| run.row).unwrap_or_default();
+    if let Some((reference, found)) = located {
         row.insert("repository_ref".into(), reference.into());
         gitdir = found;
     }

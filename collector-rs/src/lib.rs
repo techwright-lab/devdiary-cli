@@ -6,6 +6,7 @@ pub mod checkout;
 pub mod claude;
 pub mod drops;
 pub mod install;
+pub mod orchestrators;
 mod ordered;
 pub mod pairing;
 pub mod reflog;
@@ -170,6 +171,13 @@ pub fn repository_ref(s: &str) -> bool {
 pub(crate) fn is_uuid(s: &str) -> bool {
     uuid(s)
 }
+pub(crate) fn orchestrator_key(s: &str) -> bool {
+    s != "none"
+        && s.len() <= 64
+        && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+}
 
 const V1_FIELDS: [&str; 17] = [
     "schema_version",
@@ -299,7 +307,7 @@ fn located(out: &Object, config: &Object, version: u64) -> Result<()> {
         Some(r) if r.as_str().is_some_and(repository) => Ok(()),
         None if version == 2
             && config["record_orchestrated_outside_repos"] == json!(true)
-            && out.get("orchestrator") == Some(&json!("paperclip")) =>
+            && out.contains_key("orchestrator") =>
         {
             Ok(())
         }
@@ -307,14 +315,13 @@ fn located(out: &Object, config: &Object, version: u64) -> Result<()> {
     }
 }
 fn orchestrated(out: &Object) -> Result<()> {
-    let paperclip = match out.get("orchestrator").and_then(Value::as_str) {
-        Some("paperclip") => true,
-        Some("none") => false,
-        _ => return Err("invalid_orchestrator".into()),
-    };
+    let named = out.get("orchestrator");
+    if named.is_some_and(|key| !key.as_str().is_some_and(orchestrator_key)) {
+        return Err("invalid_orchestrator".into());
+    }
     for key in ORCHESTRATOR_REFS {
         if let Some(v) = out.get(key)
-            && (!paperclip || !v.as_str().is_some_and(uuid))
+            && (named.is_none() || !v.as_str().is_some_and(uuid))
         {
             return Err("invalid_orchestrator".into());
         }

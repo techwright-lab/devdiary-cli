@@ -571,7 +571,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
             return Ok(());
         }
         println!(
-            "Connection saved privately. Hooks remain unchanged. Next: setup-plan CONNECTION_DIR SETTINGS NEW_PLAN, review the plan, then claude-apply NEW_PLAN --consent. Host trust and managed policy remain controlled by Claude; runtime coverage is unverified."
+            "Connection saved privately. Hooks remain unchanged. Next: setup-plan CONNECTION_DIR SETTINGS NEW_PLAN, review the plan, then claude-apply NEW_PLAN --consent. If a control plane starts agents here, after the first connection-sync run orchestrators approve CONNECTION_DIR in a terminal. Host trust and managed policy remain controlled by Claude; runtime coverage is unverified."
         );
         return Ok(());
     }
@@ -626,6 +626,14 @@ pub(crate) fn sync_report(root: &Path, limit: usize) -> Result<crate::store::Rep
         Some(&root.join("revoked")),
     )
 }
+pub(crate) fn refresh_scope(root: &Path) -> Result<()> {
+    let doc = connection(root)?;
+    crate::store::scope_now(
+        &root.join("outbox"),
+        text(&doc, "token")?,
+        Some(&root.join("revoked")),
+    )
+}
 pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     let doc = connection(root)?;
     initialize(root, &doc)?;
@@ -642,9 +650,10 @@ pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     let refs = crate::store::read_refs(&root.join("outbox"))
         .map(|r| r.len())
         .ok();
+    let orchestrators = crate::orchestrators::summary(&root.join("outbox"))?;
     println!(
         "{}",
-        json!({"connection":"saved", "local_repository_refs":refs, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
+        json!({"connection":"saved", "local_repository_refs":refs, "local_orchestrators":orchestrators, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
     );
     Ok(())
 }

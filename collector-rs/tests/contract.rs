@@ -172,7 +172,7 @@ fn v2_refuses_identity_claims_and_malformed_capture() {
     let cases: Vec<(&str, serde_json::Value)> = vec![
         ("actor_ref", "invented".into()),
         ("attribution_basis", "explicit_local_binding".into()),
-        ("orchestrator", "cron".into()),
+        ("orchestrator", "Not A Key".into()),
         ("orchestrator_agent_ref", "agent-7".into()),
         (
             "orchestrator_run_ref",
@@ -204,17 +204,30 @@ fn v2_refuses_identity_claims_and_malformed_capture() {
         row[key] = value;
         assert!(frozen(&config, &row).is_none(), "{key}");
     }
-    let mut none = local_v2();
-    none["orchestrator"] = "none".into();
-    assert!(frozen(&config, &none).is_none(), "refs need paperclip");
+    let mut plain = local_v2();
+    plain.as_object_mut().unwrap().remove("orchestrator");
+    assert!(frozen(&config, &plain).is_none(), "refs need a preset key");
     for key in [
         "orchestrator_agent_ref",
         "orchestrator_run_ref",
         "orchestrator_task_ref",
     ] {
-        none.as_object_mut().unwrap().remove(key);
+        plain.as_object_mut().unwrap().remove(key);
     }
-    assert_eq!(frozen(&config, &none).unwrap()["orchestrator"], "none");
+    assert!(
+        frozen(&config, &plain)
+            .unwrap()
+            .get("orchestrator")
+            .is_none()
+    );
+    let mut other = local_v2();
+    other["orchestrator"] = "cron".into();
+    assert_eq!(frozen(&config, &other).unwrap()["orchestrator"], "cron");
+    for key in ["none", "Upper", "has space", "a/b", ""] {
+        let mut row = local_v2();
+        row["orchestrator"] = key.into();
+        assert!(frozen(&config, &row).is_none(), "{key}");
+    }
     let mut gap = local_v2();
     gap.as_object_mut().unwrap().remove("commits");
     gap["commit_gap"] = "reflog_rewritten".into();
@@ -261,7 +274,7 @@ fn merged(change: serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-fn v2_repository_is_optional_only_for_opted_in_paperclip_rows() {
+fn v2_repository_is_optional_only_for_opted_in_orchestrated_rows() {
     let mut row = local_v2();
     row.as_object_mut().unwrap().remove("repository_ref");
     let mut config = installation();
@@ -273,7 +286,7 @@ fn v2_repository_is_optional_only_for_opted_in_paperclip_rows() {
     assert!(frozen(&installation(), &row).is_none());
     let wire = frozen(&config, &row).unwrap();
     assert!(wire.get("repository_ref").is_none());
-    row["orchestrator"] = "none".into();
+    row.as_object_mut().unwrap().remove("orchestrator");
     for key in [
         "orchestrator_agent_ref",
         "orchestrator_run_ref",

@@ -1,7 +1,7 @@
 //! One-command install: pair, pin a versioned binary, register the hooks only
 //! after consent, then deliver the spool from a systemd user timer.
 use crate::{
-    Object, Result, claude, drops, object, pairing,
+    Object, Result, claude, drops, object, orchestrators, pairing,
     store::{Report, Store, private},
     systemd::{self, Runner},
     text,
@@ -190,7 +190,8 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
         let _ = fs::remove_file(&registration.plan);
         return Err(error);
     }
-    registration.finish(runner)
+    registration.finish(runner)?;
+    offer_orchestrators(&data)
 }
 fn revoked(data: &Path) -> bool {
     pairing::revoked(&connection(data).join("outbox"))
@@ -323,7 +324,66 @@ pub fn upgrade(yes: bool, runner: &dyn Runner) -> Result<()> {
     claude::remove(&old.plan)?;
     pin_binary(&data)?;
     registration.plan()?;
-    registration.finish(runner)
+    registration.finish(runner)?;
+    offer_orchestrators(&data)
+}
+
+fn ask_orchestrators(outbox: &Path) -> Result<()> {
+    let (entries, refused) = orchestrators::pending(outbox)?;
+    println!("Environment names the hook would read to recognise orchestrated runs:");
+    for line in orchestrators::describe(&entries) {
+        println!("  {line}");
+    }
+    if entries.is_empty() {
+        println!("  (none: the hook would stop reading orchestrator names)");
+    }
+    if refused > 0 {
+        println!("{refused} more refused: a name is not allowed or the entry is malformed.");
+    }
+    println!("IDs that are UUIDs are sent to the server. Paths stay on this machine.");
+    consent(false, "Let the hook read these names?")?;
+    orchestrators::approve(outbox, &entries)?;
+    println!("Approved.");
+    Ok(())
+}
+// `--yes` covers the hook entries the person chose to skip reviewing. It cannot
+// cover names the server picks later, so only a terminal answer approves them.
+fn offer_orchestrators(data: &Path) -> Result<()> {
+    let root = connection(data);
+    let outbox = root.join("outbox");
+    let _ = pairing::refresh_scope(&root);
+    if !orchestrators::waiting(&outbox)? {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "Orchestrator names wait for approval. In a terminal run: devdiary-collector orchestrators approve"
+        );
+        return Ok(());
+    }
+    match ask_orchestrators(&outbox) {
+        Err(error) if error.to_string() == "consent_declined" => {
+            println!(
+                "No names approved. Hooks stay registered. Run `devdiary-collector orchestrators approve` to answer again."
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+pub fn approve_orchestrators(root: Option<&Path>) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        return Err("approval_required".into());
+    }
+    let outbox = match root {
+        Some(root) => root.join("outbox"),
+        None => connection(&data_dir()?).join("outbox"),
+    };
+    if !orchestrators::waiting(&outbox)? {
+        println!("No orchestrator change waits for approval.");
+        return Ok(());
+    }
+    ask_orchestrators(&outbox)
 }
 
 pub fn uninstall(runner: &dyn Runner) -> Result<()> {
@@ -376,6 +436,7 @@ pub fn doctor(runner: &dyn Runner) -> Result<()> {
             "pending": pending,
             "delivered": delivered,
             "drops": drops::counts(&store, &outbox)?,
+            "orchestrators": orchestrators::summary(&outbox)?,
             "revoked": connection(&data).join("revoked").exists(),
             "last_receipt": receipt,
             "last_sync_error": status.and_then(|s| s.get("last_sync_error").cloned()),

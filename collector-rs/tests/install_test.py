@@ -30,6 +30,18 @@ EVENTS = [
     "SessionEnd",
 ]
 COLLECTOR_REF = "urn:devdiary:collector:11111111-1111-4111-8111-111111111111"
+PAPERCLIP = {
+    "key": "paperclip",
+    "env": {
+        "agent_ref": "PAPERCLIP_AGENT_ID",
+        "run_ref": "PAPERCLIP_RUN_ID",
+        "task_ref": "PAPERCLIP_TASK_ID",
+        "checkout_path": [
+            "PAPERCLIP_WORKSPACE_WORKTREE_PATH",
+            "PAPERCLIP_WORKSPACE_CWD",
+        ],
+    },
+}
 CODEGRAPH = {"hooks": [{"type": "command", "command": "codegraph hook prompt"}]}
 FAKE_SYSTEMCTL = """#!/bin/sh
 printf '%s\\n' "$*" >> "$(dirname "$0")/systemctl.log"
@@ -70,6 +82,7 @@ class InstallTest(unittest.TestCase):
         self.data = self.home / ".local/share/devdiary/collector"
         self.received = []
         self.observation_status = 201
+        self.orchestrators = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -84,16 +97,16 @@ class InstallTest(unittest.TestCase):
                 self.wfile.write(raw)
 
             def do_GET(self):
-                self.reply(
-                    200,
-                    {
-                        "schema_version": 1,
-                        "collector_ref": COLLECTOR_REF,
-                        "scope_kind": "installation",
-                        "repository_refs": ["https://github.com/acme/demo"],
-                        "observation_schema_versions": [1, 2],
-                    },
-                )
+                reply = {
+                    "schema_version": 1,
+                    "collector_ref": COLLECTOR_REF,
+                    "scope_kind": "installation",
+                    "repository_refs": ["https://github.com/acme/demo"],
+                    "observation_schema_versions": [1, 2],
+                }
+                if owner.orchestrators is not None:
+                    reply["orchestrators"] = owner.orchestrators
+                self.reply(200, reply)
 
             def do_POST(self):
                 data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -567,6 +580,119 @@ class InstallTest(unittest.TestCase):
         os.write(master, answer)
         _, err = process.communicate(timeout=30)
         return process.returncode, err
+
+    def converse(self, args, answers):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        process = subprocess.Popen(
+            args,
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env(),
+        )
+        os.close(slave)
+        seen = b""
+        deadline = time.monotonic() + 30
+        for prompt, answer in enumerate(answers, start=1):
+            while seen.count(b"[y/N]") < prompt and time.monotonic() < deadline:
+                ready, _, _ = select.select([process.stdout], [], [], 0.5)
+                if ready:
+                    seen += os.read(process.stdout.fileno(), 4096)
+            self.assertEqual(seen.count(b"[y/N]"), prompt, seen)
+            os.write(master, answer)
+        out, err = process.communicate(timeout=30)
+        return process.returncode, seen + out, err
+
+    def approved(self):
+        path = self.data / "connection/outbox/orchestrators-approved.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def waiting(self):
+        return json.loads(self.run_collector("doctor").stdout)["orchestrators"]
+
+    def test_install_shows_the_names_and_stores_them_only_on_yes(self):
+        self.orchestrators = [PAPERCLIP]
+        code, out, err = self.converse(self.install_args(), [b"y\n", b"y\n"])
+        self.assertEqual(code, 0, err)
+        for name in [*PAPERCLIP["env"].values()][:3]:
+            self.assertIn(name.encode(), out)
+        self.assertIn(b"PAPERCLIP_WORKSPACE_CWD", out)
+        self.assertEqual(self.approved(), [PAPERCLIP])
+        self.assertFalse(self.waiting()["waiting_for_approval"])
+
+    def test_declining_the_names_keeps_the_hooks_and_leaves_the_change_waiting(self):
+        self.orchestrators = [PAPERCLIP]
+        code, _, err = self.converse(self.install_args(), [b"y\n", b"n\n"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 9)
+        self.assertIsNone(self.approved())
+        self.assertTrue(self.waiting()["waiting_for_approval"])
+
+    def test_yes_never_approves_names_without_a_terminal(self):
+        self.orchestrators = [PAPERCLIP]
+        out = self.install("--yes").stdout
+        self.assertIn(b"orchestrators approve", out)
+        self.assertIsNone(self.approved())
+        self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 9)
+        self.assertTrue(self.waiting()["waiting_for_approval"])
+
+    def test_install_with_nothing_offered_asks_nothing_about_names(self):
+        self.orchestrators = []
+        out = self.install("--yes").stdout
+        self.assertNotIn(b"orchestrators approve", out)
+        self.assertFalse(self.waiting()["waiting_for_approval"])
+
+    def test_orchestrators_approve_without_a_terminal_refuses(self):
+        self.orchestrators = [PAPERCLIP]
+        self.install("--yes")
+        result = self.run_collector("orchestrators", "approve", code=2)
+        self.assertIn(b"approval_required", result.stderr)
+        self.assertIn(b"terminal", result.stderr)
+        self.assertIsNone(self.approved())
+
+    def test_orchestrators_approve_has_no_unattended_flag(self):
+        self.orchestrators = [PAPERCLIP]
+        self.install("--yes")
+        self.run_collector("orchestrators", "approve", "--yes", code=2)
+        self.assertIsNone(self.approved())
+
+    def test_orchestrators_approve_on_a_terminal_shows_and_saves_the_offer(self):
+        self.orchestrators = [PAPERCLIP]
+        self.install("--yes")
+        args = [str(BIN), "orchestrators", "approve"]
+        code, out, err = self.converse(args, [b"y\n"])
+        self.assertEqual(code, 0, err)
+        self.assertIn(b"PAPERCLIP_TASK_ID", out)
+        self.assertEqual(self.approved(), [PAPERCLIP])
+
+    def test_declining_orchestrators_approve_keeps_the_old_list(self):
+        self.orchestrators = [PAPERCLIP]
+        self.converse(self.install_args(), [b"y\n", b"y\n"])
+        self.orchestrators = [{"key": "cron", "env": {"run_ref": "CRON_RUN"}}]
+        self.timer_sync()
+        self.assertTrue(self.waiting()["waiting_for_approval"])
+        args = [str(BIN), "orchestrators", "approve"]
+        code, out, err = self.converse(args, [b"n\n"])
+        self.assertEqual(code, 2)
+        self.assertIn(b"CRON_RUN", out)
+        self.assertIn(b"consent_declined", err)
+        self.assertEqual(self.approved(), [PAPERCLIP])
+
+    def test_orchestrators_approve_with_nothing_waiting_asks_nothing(self):
+        self.install("--yes")
+        args = [str(BIN), "orchestrators", "approve"]
+        code, out, err = self.converse(args, [])
+        self.assertEqual(code, 0, err)
+        self.assertIn(b"No orchestrator change waits", out)
+
+    def test_upgrade_offers_the_names_a_first_install_never_saw(self):
+        self.install("--yes")
+        self.orchestrators = [PAPERCLIP]
+        code, out, err = self.converse([str(BIN), "upgrade"], [b"y\n", b"y\n"])
+        self.assertEqual(code, 0, err)
+        self.assertIn(b"PAPERCLIP_RUN_ID", out)
+        self.assertEqual(self.approved(), [PAPERCLIP])
 
     def test_declining_consent_changes_nothing_and_never_enables(self):
         code, err = self.interactive(b"n\n")
