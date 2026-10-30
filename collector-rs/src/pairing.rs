@@ -585,7 +585,11 @@ pub(crate) fn revoked(state: &Path) -> bool {
         })
 }
 pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
-    plan_with(root, settings, plan, &std::env::current_exe()?)
+    plan_with(root, settings, plan, &std::env::current_exe()?)?;
+    println!(
+        "Plan saved, settings unchanged. Metadata-only Claude lifecycle/tool IDs; no prompts, transcripts or tool contents; unknown actor. Review NEW_PLAN before claude-apply NEW_PLAN --consent. Browser approval is not local hook consent or host trust. Managed policy may block hooks; no policy-absence claim is made."
+    );
+    Ok(())
 }
 pub fn plan_with(root: &Path, settings: &Path, plan: &Path, exe: &Path) -> Result<()> {
     let doc = connection(root)?;
@@ -600,11 +604,7 @@ pub fn plan_with(root: &Path, settings: &Path, plan: &Path, exe: &Path) -> Resul
         }
     }
     initialize(root, &doc)?;
-    crate::claude::plan_for(&root.join("outbox"), settings, plan, exe)?;
-    println!(
-        "Plan saved, settings unchanged. Metadata-only Claude lifecycle/tool IDs; no prompts, transcripts or tool contents; unknown actor. Review NEW_PLAN before claude-apply NEW_PLAN --consent. Browser approval is not local hook consent or host trust. Managed policy may block hooks; no policy-absence claim is made."
-    );
-    Ok(())
+    crate::claude::plan_for(&root.join("outbox"), settings, plan, exe)
 }
 pub fn sync(root: &Path, limit: usize) -> Result<(i64, i64)> {
     let doc = connection(root)?;

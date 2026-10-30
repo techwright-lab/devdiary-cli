@@ -602,7 +602,6 @@ pub(crate) struct Report {
     pub pending: i64,
     pub delivered: i64,
     pub attempted: usize,
-    /// The failure code that stopped the batch: auth, 429, 5xx or network.
     pub stopped: Option<String>,
     pub refused: usize,
     pub refusal: Option<String>,

@@ -26,10 +26,12 @@ const BATCHES: usize = 10;
 
 pub struct Options<'a> {
     pub origin: Option<&'a str>,
+    pub trust_origin: bool,
     pub settings: Option<&'a Path>,
     pub record_orchestrated_outside_repos: bool,
     pub yes: bool,
     pub browser: bool,
+    pub new_pair: bool,
 }
 
 fn home() -> Result<PathBuf> {
@@ -38,12 +40,10 @@ fn home() -> Result<PathBuf> {
         .filter(|h| h.is_absolute())
         .ok_or_else(|| "home_required".into())
 }
+// Fixed under HOME, not XDG_DATA_HOME: a shell without that variable must still
+// find the same install record, connection and pinned binary.
 fn data_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
-        Some(p) if p.is_absolute() => p,
-        _ => home()?.join(".local/share"),
-    };
-    Ok(base.join("devdiary/collector"))
+    Ok(home()?.join(".local/share/devdiary/collector"))
 }
 fn connection(data: &Path) -> PathBuf {
     data.join("connection")
@@ -101,10 +101,13 @@ fn record(data: &Path) -> Result<Option<Record>> {
 
 // The registered hook must survive `cargo clean` and rebuilds, so it runs a
 // private copy whose path names the version.
+fn pinned(data: &Path) -> PathBuf {
+    data.join(VERSION).join(BINARY)
+}
 fn pin_binary(data: &Path) -> Result<PathBuf> {
     let dir = data.join(VERSION);
     private_dir(&dir)?;
-    let target = dir.join(BINARY);
+    let target = pinned(data);
     let source = std::env::current_exe()?;
     if fs::canonicalize(&source)? == target {
         return Ok(target);
@@ -159,16 +162,19 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     if record(&data)?.is_some() {
         return Err("already_installed".into());
     }
+    let origin = o.origin.unwrap_or(pairing::DEFAULT_ORIGIN);
+    pairing::origin(origin, o.trust_origin)?;
     claude::preflight(&settings)?;
     private_dir(&data)?;
+    reuse_or_retire(&data, o.new_pair)?;
     pairing::setup(pairing::Options {
         root: &connection(&data),
         repository: None,
         remote: None,
-        origin: o.origin.unwrap_or(pairing::DEFAULT_ORIGIN),
-        trust_origin: o.origin.is_some(),
+        origin,
+        trust_origin: o.trust_origin,
         browser: o.browser,
-        new_pair: false,
+        new_pair: o.new_pair,
         record_orchestrated_outside_repos: o.record_orchestrated_outside_repos,
         next_steps: false,
     })
@@ -185,6 +191,27 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
         return Err(error);
     }
     registration.finish(runner)
+}
+fn revoked(data: &Path) -> bool {
+    pairing::revoked(&connection(data).join("outbox"))
+}
+// A revoked connection is set aside rather than deleted so its pending rows stay
+// on disk; a working one is never replaced, since install can reuse it.
+fn reuse_or_retire(data: &Path, new_pair: bool) -> Result<()> {
+    let saved = connection(data).join("connection.json").is_file();
+    match (revoked(data), new_pair) {
+        (true, false) => Err("connection_revoked".into()),
+        (false, true) if saved => Err("connection_active".into()),
+        (true, true) => {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            fs::rename(
+                connection(data),
+                data.join(format!("connection-revoked-{nanos}")),
+            )?;
+            Ok(File::open(data)?.sync_all()?)
+        }
+        (false, _) => Ok(()),
+    }
 }
 fn setup_failure(error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
     if pairing::known_diagnostic(error.as_ref()).is_some() {
@@ -273,14 +300,17 @@ fn self_test(exe: &Path, plan: &Path, outbox: &Path) -> Result<()> {
     Ok(())
 }
 
-// The old record stays until the new one replaces it, so a failure after the
-// old entries are removed still leaves uninstall able to disable the timer.
+// The live hooks run the pinned path, so it is overwritten only after consent and
+// removal. The old record stays until replaced, so uninstall still works on failure.
 pub fn upgrade(yes: bool, runner: &dyn Runner) -> Result<()> {
     require_consent_channel(yes)?;
     let data = data_dir()?;
     let old = record(&data)?.ok_or("not_installed")?;
+    if revoked(&data) {
+        return Err("connection_revoked".into());
+    }
     claude::preflight_replacing(&old.plan)?;
-    let exe = pin_binary(&data)?;
+    let exe = pinned(&data);
     let registration = Registration::new(&data, &old.settings, &exe)?;
     registration.show()?;
     consent(
@@ -291,6 +321,7 @@ pub fn upgrade(yes: bool, runner: &dyn Runner) -> Result<()> {
         ),
     )?;
     claude::remove(&old.plan)?;
+    pin_binary(&data)?;
     registration.plan()?;
     registration.finish(runner)
 }

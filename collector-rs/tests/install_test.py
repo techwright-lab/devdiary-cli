@@ -171,6 +171,7 @@ class InstallTest(unittest.TestCase):
             "install",
             "--origin",
             self.origin,
+            "--trust-origin",
             "--no-browser",
             *extra,
         ]
@@ -248,6 +249,22 @@ class InstallTest(unittest.TestCase):
         outbox = self.data / "connection/outbox/collector-rust-v1.sqlite3"
         with closing(sqlite3.connect(outbox)) as db:
             return db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+    def rebuilt(self):
+        path = self.root / "rebuild" / BIN.name
+        path.parent.mkdir()
+        path.write_bytes(BIN.read_bytes() + b"rebuilt")
+        path.chmod(0o700)
+        return path
+
+    def pinned(self):
+        return (self.data / VERSION / BIN.name).read_bytes()
+
+    def revoke(self):
+        self.spool(1)
+        self.observation_status = 401
+        self.assertTrue(self.timer_sync()["revoked"])
+        self.observation_status = 201
 
     def timer_sync(self):
         self.run_collector(
@@ -585,6 +602,101 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.seen.count(b" claude-hook "), 9)
         self.assertEqual(self.settings.read_bytes(), before)
         self.assertEqual(self.systemctl_log(), log)
+
+    def test_declining_an_upgrade_from_a_rebuild_keeps_capture_working(self):
+        self.install("--yes")
+        rebuilt = self.rebuilt()
+        code, err = self.interactive(b"n\n", args=[str(rebuilt), "upgrade"])
+        self.assertEqual(code, 2)
+        self.assertIn(b"consent_declined", err)
+        self.assertEqual(self.pinned(), BIN.read_bytes())
+        self.spool(1)
+        self.assertEqual(json.loads(self.run_collector("doctor").stdout)["drops"], {})
+
+    def test_upgrade_from_a_rebuild_pins_and_registers_the_new_build(self):
+        self.install("--yes")
+        rebuilt = self.rebuilt()
+        self.run_collector("upgrade", "--yes", exe=rebuilt)
+        self.assertEqual(self.pinned(), rebuilt.read_bytes())
+        self.spool(1)
+
+    def test_install_refuses_a_revoked_connection_before_registering(self):
+        self.install("--yes")
+        self.revoke()
+        self.run_collector("uninstall")
+        log = self.systemctl_log()
+        result = self.install("--yes", code=2)
+        self.assertIn(b"connection_revoked", result.stderr)
+        self.assertIn(b"install --new-pair", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertFalse((self.data / "install.json").exists())
+        self.assertEqual(self.systemctl_log(), log)
+
+    def test_install_new_pair_sets_a_revoked_connection_aside_and_pairs_again(self):
+        self.install("--yes")
+        self.revoke()
+        self.run_collector("uninstall")
+        self.install("--yes", "--new-pair")
+        doctor = json.loads(self.run_collector("doctor").stdout)
+        self.assertFalse(doctor["revoked"])
+        self.assertEqual(doctor["registration"]["registration"], "installed")
+        retired = [p for p in self.data.iterdir() if p.name.startswith("connection-")]
+        self.assertEqual(len(retired), 1)
+        self.assertTrue((retired[0] / "revoked").exists())
+        self.spool(1)
+
+    def test_install_new_pair_refuses_a_connection_that_still_works(self):
+        self.install("--yes")
+        self.run_collector("uninstall")
+        result = self.install("--yes", "--new-pair", code=2)
+        self.assertIn(b"connection_active", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), self.original)
+
+    def test_upgrade_refuses_a_revoked_connection(self):
+        self.install("--yes")
+        self.revoke()
+        before, log = self.settings.read_bytes(), self.systemctl_log()
+        result = self.run_collector("upgrade", "--yes", code=2)
+        self.assertIn(b"connection_revoked", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertEqual(self.systemctl_log(), log)
+
+    def test_another_origin_needs_trust_origin(self):
+        args = [a for a in self.install_args("--yes") if a != "--trust-origin"]
+        result = self.run_collector(*args[1:], code=2)
+        self.assertIn(b"--trust-origin", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertFalse((self.data / "connection").exists())
+
+    def test_the_binary_and_connection_live_under_home_whatever_xdg_data_home_says(
+        self,
+    ):
+        elsewhere = self.root / "xdg-data"
+        env = {**self.env(), "XDG_DATA_HOME": str(elsewhere)}
+        subprocess.run(
+            self.install_args("--yes"),
+            env=env,
+            check=True,
+            capture_output=True,
+            timeout=40,
+        )
+        self.assertFalse(elsewhere.exists())
+        self.assertTrue((self.data / "install.json").exists())
+
+    def test_install_output_names_no_manual_registration_steps(self):
+        out = self.install("--yes").stdout
+        for manual in [b"claude-apply", b"setup-plan", b"NEW_PLAN"]:
+            self.assertNotIn(manual, out)
+
+    def test_install_persists_the_outside_repos_choice(self):
+        self.install("--yes", "--record-orchestrated-outside-repos")
+        connection = json.loads((self.data / "connection/connection.json").read_text())
+        self.assertTrue(connection["scope"]["record_orchestrated_outside_repos"])
+
+    def test_doctor_shows_the_last_receipt_after_a_timer_sync(self):
+        self.install("--yes")
+        self.spool(1)
+        self.assertIsNotNone(self.timer_sync()["last_receipt"])
 
 
 if __name__ == "__main__":

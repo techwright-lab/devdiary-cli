@@ -214,7 +214,7 @@ and never performs HTTP.
 cargo build --release --locked --manifest-path collector-rs/Cargo.toml
 collector-rs/target/release/devdiary-collector install \
   [--settings ~/.claude/settings.json] [--record-orchestrated-outside-repos] \
-  [--origin ORIGIN] [--yes] [--no-browser]
+  [--origin ORIGIN --trust-origin] [--yes] [--no-browser] [--new-pair]
 devdiary-collector doctor
 devdiary-collector upgrade [--yes]
 devdiary-collector uninstall
@@ -226,10 +226,16 @@ devdiary-collector uninstall
    is absent, and refuses a relative `--settings` path (`unsupported_path`), a
    missing settings file (`settings_missing`), settings that are not valid JSON
    (`invalid_settings`), already hold a collector hook or register the Python
-   observer. Nothing is paired or changed.
-2. `setup` without a repository into `~/.local/share/devdiary/collector/connection`
-   (`$XDG_DATA_HOME` when set). `--origin` is an explicit origin choice and counts
-   as `--trust-origin`.
+   observer. An alternate `--origin` without `--trust-origin` is refused, as for
+   `setup`. A saved connection that the server revoked is refused
+   (`connection_revoked`); `--new-pair` renames it to `connection-revoked-<time>`
+   (its pending rows stay there) and pairs again. `--new-pair` never replaces a
+   connection that was not revoked (`connection_active`). Nothing is paired or
+   changed.
+2. `setup` without a repository into `~/.local/share/devdiary/collector/connection`.
+   This path is fixed under `$HOME`; `$XDG_DATA_HOME` is not used, so every shell
+   finds the same install. `--new-pair` is passed on, for a pairing that was
+   interrupted.
 3. Copies the running binary to `~/.local/share/devdiary/collector/VERSION/` (0700),
    so the registered hook survives rebuilds and `cargo clean`.
 4. `setup-plan` for that copy, prints the 9 hook entries, and asks `[y/N]` on the
@@ -256,15 +262,19 @@ unit.
 `doctor` prints the registration state, `systemctl --user is-enabled/is-active` for
 the timer, pending and delivered counts, drops, the last receipt and
 `last_sync_error`. `upgrade` first checks that the settings would accept a fresh
-plan once the old entries are gone, prints the 9 new entries and asks once; only
-then does it remove the old registration and install the fresh plan. The install
+plan once the old entries are gone and that the connection was not revoked, prints
+the 9 new entries and asks once; only then does it remove the old registration, copy
+the new binary over the pinned one and install the fresh plan. Declining leaves the
+running hooks and their pinned binary untouched. The install
 record is replaced only on success, so after a failed upgrade `uninstall` still
 finds and disables the timer. `uninstall` disables and deletes the timer units,
 then runs `claude-remove`. Without a user systemd bus it still deletes the unit
 files and removes the hooks, then exits 2 with `timer_unconfirmed`. Leftover units
 without an install record are also disabled and deleted. A second `uninstall` is a
-no-op. Settings keep their layout: compact and pretty-printed files are restored
-byte for byte. The connection
+no-op. Settings keep their key order and their compact or pretty-printed layout;
+string escapes and number spellings come back in canonical JSON form (`\u00e9`
+returns as `é`, `1.50` as `1.5`), so such files keep their meaning but not their
+sha256. The connection
 and any pending rows stay; revoke the connection in the browser to retire the
 credential. Headless machines need `loginctl enable-linger` for the timer to run
 while logged out.

@@ -313,7 +313,6 @@ fn atomic_replace(
 pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> {
     plan_for(state, settings_path, plan_path, &std::env::current_exe()?)
 }
-/// Plans registration of `exe`, which need not be the running binary.
 pub fn plan_for(state: &Path, settings_path: &Path, plan_path: &Path, exe: &Path) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err("linux_only".into());
@@ -379,7 +378,6 @@ fn preflight_code(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
         _ => e,
     }
 }
-/// The refusals `plan` would give for these settings, before anything is paired.
 pub fn preflight(settings_path: &Path) -> Result<()> {
     registrable(settings_path)
         .map(|_| ())

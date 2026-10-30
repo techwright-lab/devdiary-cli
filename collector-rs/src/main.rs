@@ -14,7 +14,9 @@ const REPORTED: [&str; 5] = [
     "stale_plan",
     "repair_required",
 ];
-const INSTALL_REPORTED: [&str; 15] = [
+const INSTALL_REPORTED: [&str; 17] = [
+    "connection_revoked",
+    "connection_active",
     "consent_required",
     "consent_declined",
     "stale_plan",
@@ -57,6 +59,15 @@ fn install_hint(code: &str) -> &'static str {
         "unsupported_path" => {
             "Use an absolute path without the characters \" \\ % or $, which systemd would reinterpret."
         }
+        "connection_revoked" => {
+            "The server revoked the saved connection, so the hooks would record nothing. Run uninstall if it is installed, then install --new-pair to set the old connection aside and pair again."
+        }
+        "connection_active" => {
+            "The saved connection was not revoked. Run install without --new-pair to reuse it."
+        }
+        "self_test_failed" => {
+            "Hooks and the timer are in place, but the installed hook did not record the local test event. Run doctor to see the drop reason, or uninstall."
+        }
         "setup_incomplete" => devdiary_collector::pairing::SETUP_INCOMPLETE,
         "owned_entry_changed" | "owned_entry_missing" => {
             "The collector's hook entries in the settings were edited, so the settings were left as they are. Restore or delete those entries, then run uninstall again."
@@ -67,10 +78,12 @@ fn install_hint(code: &str) -> &'static str {
 fn install_options(args: &[String]) -> Result<install::Options<'_>> {
     let mut o = install::Options {
         origin: None,
+        trust_origin: false,
         settings: None,
         record_orchestrated_outside_repos: false,
         yes: false,
         browser: true,
+        new_pair: false,
     };
     let mut seen = std::collections::HashSet::new();
     let mut i = 0;
@@ -87,7 +100,9 @@ fn install_options(args: &[String]) -> Result<install::Options<'_>> {
                 i += 1;
                 o.settings = Some(Path::new(args.get(i).ok_or("invalid_command")?));
             }
+            "--trust-origin" => o.trust_origin = true,
             "--record-orchestrated-outside-repos" => o.record_orchestrated_outside_repos = true,
+            "--new-pair" => o.new_pair = true,
             "--yes" => o.yes = true,
             "--no-browser" => o.browser = false,
             _ => return Err("invalid_command".into()),
@@ -195,7 +210,7 @@ fn run() -> Result<i32> {
     }
     if args.len() == 2 && args[1] == "--help" {
         println!(
-            "install [--origin ORIGIN] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--yes] [--no-browser]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the 9 hook entries, then enables a systemd user timer that syncs every 2 minutes.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)"
+            "install [--origin ORIGIN --trust-origin] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--yes] [--no-browser] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the 9 hook entries, then enables a systemd user timer that syncs every 2 minutes.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)"
         );
         println!(
             "setup PRIVATE_CONNECTION_DIR [REPOSITORY [--remote NAME]] [--record-orchestrated-outside-repos] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\n  Without REPOSITORY the connection covers every active repository of the workspace (installation scope).\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
