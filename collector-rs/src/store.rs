@@ -30,9 +30,6 @@ const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INT
 const MARKS_TABLE: &str = "CREATE TABLE IF NOT EXISTS bracket_marks (session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, checkout_key TEXT NOT NULL, offset INTEGER NOT NULL, ino INTEGER NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, PRIMARY KEY(session_id, tool_use_id)) WITHOUT ROWID;";
 const MARK_TTL_NANOS: i64 = 6 * 3_600_000_000_000;
 const MAX_MARKS: i64 = 256;
-// Claude Code's Bash tool cannot run longer than this, so an unclosed mark
-// older than it is a denied or interrupted call, not one still running.
-const MAX_BASH_NANOS: i64 = 600_000_000_000;
 
 fn trusted_ancestors(path: &Path) -> Result<()> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -69,7 +66,7 @@ fn owned_by_us(path: &Path, directory: bool, forbidden_mode: u32) -> std::io::Re
 // ancestors; reject shared permissions/hardlinks rather than repairing them.
 pub fn private(path: &Path, directory: bool) -> Result<()> {
     trusted_ancestors(path)?;
-    if !owned_by_us(path, directory, 0o077)? {
+    if !owned_by_us(path, directory, 0o077).unwrap_or(false) {
         return Err("private_state_required".into());
     }
     Ok(())
@@ -78,7 +75,7 @@ pub fn private(path: &Path, directory: bool) -> Result<()> {
 // anyone but the owner, hardlinks and symlinks are refused.
 pub fn owner_writable(path: &Path, directory: bool) -> Result<()> {
     trusted_ancestors(path)?;
-    if !owned_by_us(path, directory, 0o022)? {
+    if !owned_by_us(path, directory, 0o022).unwrap_or(false) {
         return Err("unsafe_settings".into());
     }
     Ok(())
@@ -309,8 +306,8 @@ impl Store {
         let result = match open {
             Some((key, offset, ino, opened_at)) if key == bracket.checkout_key => {
                 let overlap: i64 = tx.query_row(
-                    "SELECT count(*) FROM bracket_marks WHERE checkout_key=? AND session_id<>? AND opened_at<=? AND (closed_at>=? OR (closed_at IS NULL AND opened_at>=?))",
-                    params![key, bracket.session_id, at, opened_at, opened_at - MAX_BASH_NANOS],
+                    "SELECT count(*) FROM bracket_marks WHERE checkout_key=? AND session_id<>? AND opened_at<=? AND (closed_at IS NULL OR closed_at>=?)",
+                    params![key, bracket.session_id, at, opened_at],
                     |r| r.get(0),
                 )?;
                 let mark = Mark {
@@ -323,6 +320,15 @@ impl Store {
         };
         tx.commit()?;
         Ok(result)
+    }
+    /// An unclosed call may still be waiting for permission, so it counts as
+    /// overlap until its session's turn ends; a Post after that links nothing.
+    pub fn release_brackets(&self, session_id: &str, at: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE bracket_marks SET closed_at=? WHERE session_id=? AND closed_at IS NULL",
+            params![at, session_id],
+        )?;
+        Ok(())
     }
     pub fn counts(&self) -> Result<(i64, i64)> {
         Ok(self.db.query_row(
@@ -959,31 +965,44 @@ mod tests {
     }
 
     #[test]
-    fn an_unclosed_mark_counts_only_while_its_call_could_still_run() {
+    fn an_unclosed_mark_counts_however_long_its_call_waits() {
         let (_dir, store) = store();
+        let minute = HOUR / 60;
+        let waiting = bracket("a", "t", "k");
+        store.open_bracket(&waiting, MARK, HOUR).unwrap();
+        let other = bracket("b", "t", "k");
         store
-            .open_bracket(&bracket("denied", "t", "k"), MARK, HOUR)
-            .unwrap();
-        let soon = bracket("soon", "t", "k");
-        store
-            .open_bracket(&soon, MARK, HOUR + MAX_BASH_NANOS)
+            .open_bracket(&other, MARK, HOUR + 15 * minute)
             .unwrap();
         assert_eq!(
-            store
-                .close_bracket(&soon, HOUR + MAX_BASH_NANOS + 1)
-                .unwrap(),
+            store.close_bracket(&other, HOUR + 21 * minute).unwrap(),
             Some((MARK, 1))
         );
-        let later = bracket("later", "t", "k");
-        store
-            .open_bracket(&later, MARK, HOUR + MAX_BASH_NANOS + 2)
-            .unwrap();
         assert_eq!(
-            store
-                .close_bracket(&later, HOUR + MAX_BASH_NANOS + 3)
-                .unwrap(),
-            Some((MARK, 0))
+            store.close_bracket(&waiting, HOUR + 22 * minute).unwrap(),
+            Some((MARK, 1))
         );
+    }
+
+    #[test]
+    fn a_released_mark_counts_only_for_brackets_open_before_its_release() {
+        let (_dir, store) = store();
+        let denied = bracket("denied", "t", "k");
+        store.open_bracket(&denied, MARK, HOUR).unwrap();
+        let before = bracket("before", "t", "k");
+        store.open_bracket(&before, MARK, 2 * HOUR).unwrap();
+        store.release_brackets("denied", 3 * HOUR).unwrap();
+        let after = bracket("after", "t", "k");
+        store.open_bracket(&after, MARK, 3 * HOUR + 1).unwrap();
+        assert_eq!(
+            store.close_bracket(&before, 3 * HOUR + 2).unwrap(),
+            Some((MARK, 2))
+        );
+        assert_eq!(
+            store.close_bracket(&after, 3 * HOUR + 3).unwrap(),
+            Some((MARK, 1))
+        );
+        assert_eq!(store.close_bracket(&denied, 3 * HOUR + 4).unwrap(), None);
     }
 
     #[test]

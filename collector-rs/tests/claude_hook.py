@@ -965,6 +965,7 @@ class InstallationFixture:
         exe=None,
         event="PostToolUse",
         session="session-1",
+        tool="Bash",
         **env,
     ):
         event = {
@@ -972,7 +973,7 @@ class InstallationFixture:
             "session_id": session,
             "cwd": str(cwd),
             "tool_use_id": tool_use_id,
-            "tool_name": "Bash",
+            "tool_name": tool,
             "tool_input": {"command": "PRIVATE_SENTINEL"},
         }
         result = self.run_collector(
@@ -1342,19 +1343,56 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
         self.hook(self.main, "status")
         self.assert_captured(row, [self.head()])
 
-    def test_an_unclosed_call_from_another_session_stops_counting_after_10_minutes(
-        self,
-    ):
-        self.hook(self.main, "denied", event="PreToolUse", session="session-x")
-        row = self.bracket(self.main, "soon", lambda: self.change(name="soon"))
-        self.assert_captured(row, [self.head()], overlap=1)
+    def end_turn(self, session, event):
+        event = {"hook_event_name": event, "session_id": session, "cwd": str(self.main)}
+        if event["hook_event_name"] != "SessionEnd":
+            event["prompt_id"] = f"{session}-prompt"
+        result = self.run_collector(
+            "claude-hook", self.plan, data=json.dumps(event).encode(), env=self.env()
+        )
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+
+    def age(self, tool_use_id, nanos):
         with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
             db.execute(
-                "UPDATE bracket_marks SET opened_at = opened_at - ? WHERE tool_use_id = 'denied'",
-                (HOUR_NS // 6 + 1,),
+                "UPDATE bracket_marks SET opened_at = opened_at - ? WHERE tool_use_id = ?",
+                (nanos, tool_use_id),
             )
-        row = self.bracket(self.main, "later", lambda: self.change(name="later"))
-        self.assert_captured(row, [self.head()])
+
+    def test_a_call_waiting_long_for_permission_still_counts_as_overlap(self):
+        self.hook(self.main, "waiting", event="PreToolUse", session="session-a")
+        self.age("waiting", HOUR_NS // 3)
+        self.hook(self.main, "b", event="PreToolUse", session="session-b")
+        landed = self.change(name="waiting")
+        self.hook(self.main, "b", session="session-b")
+        self.hook(self.main, "waiting", session="session-a")
+        self.assert_captured(self.post("b", "session-b"), [landed], overlap=1)
+        self.assert_captured(self.post("waiting", "session-a"), [landed], overlap=1)
+
+    def test_an_unclosed_call_stops_counting_when_its_session_ends_the_turn(self):
+        for end in ("Stop", "UserPromptSubmit", "SessionEnd"):
+            with self.subTest(end=end):
+                other = f"session-{end}"
+                self.hook(self.main, end, event="PreToolUse", session=other)
+                row = self.bracket(
+                    self.main, f"{end}-soon", lambda name=end: self.change(name=name)
+                )
+                self.assert_captured(row, [self.head()], overlap=1)
+                self.end_turn(other, end)
+                row = self.bracket(
+                    self.main, f"{end}-later", lambda name=end: self.change(name=name)
+                )
+                self.assert_captured(row, [self.head()])
+                self.hook(self.main, end, session=other)
+                self.assert_nothing(self.post(end, other))
+
+    def test_a_non_bash_tool_call_never_marks_or_links(self):
+        for event in ("PreToolUse", "PostToolUse"):
+            self.hook(self.main, "edit", event=event, tool="Edit")
+            if event == "PreToolUse":
+                self.change()
+        self.assertEqual(self.marks(), [])
+        self.assert_nothing(self.post("edit"))
 
     def test_concurrent_brackets_on_one_checkout_drop_nothing(self):
         sessions = [f"session-{i}" for i in range(24)]

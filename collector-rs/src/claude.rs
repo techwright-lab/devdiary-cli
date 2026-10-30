@@ -890,7 +890,7 @@ fn bracket(store: &Store, state: &Path, row: &mut Object, gitdir: &Path) -> Resu
         tool_use_id: &tool,
         checkout_key: &key,
     };
-    let at = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let at = nanos_now()?;
     match text(row, "event")? {
         "PreToolUse" => {
             if let Some(mark) = reflog::mark(gitdir) {
@@ -905,6 +905,11 @@ fn bracket(store: &Store, state: &Path, row: &mut Object, gitdir: &Path) -> Resu
         _ => {}
     }
     Ok(())
+}
+fn nanos_now() -> Result<i64> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
 }
 fn linked(state: &Path, row: &mut Object, appended: Appended, overlap: u64) {
     match appended {
@@ -1018,6 +1023,9 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
     }
     if let Some(gitdir) = gitdir {
         bracket(&store, state, &mut row, &gitdir)?;
+    }
+    if ["UserPromptSubmit", "Stop", "SessionEnd"].contains(&text(&row, "event")?) {
+        store.release_brackets(text(&row, "session_id")?, nanos_now()?)?;
     }
     // A racing duplicate has the same UUID but a new observation timestamp.
     // The store's conflict refusal keeps the first observation unrewritten.
