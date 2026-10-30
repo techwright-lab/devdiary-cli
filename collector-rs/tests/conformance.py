@@ -496,13 +496,46 @@ class CollectorTest(unittest.TestCase):
             {"actor_ref": "invented"},
             {"schema_version": 1},
             {"repository": "/fixture/repo"},
-            {"orchestrator": "cron"},
+            {"orchestrator": "none"},
+            {"orchestrator": "Not A Key"},
             {"commits": ["0" * 40] * 21},
         ):
             self.call("collect", data={**local, **change}, code=2)
         self.assertEqual(
             self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 0
         )
+
+    def test_v2_rows_carry_any_preset_key_or_none_at_all(self):
+        self.installation_state()
+        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
+        self.call("collect", data={**local, "orchestrator": "cron"})
+        refs = (
+            "orchestrator_agent_ref",
+            "orchestrator_run_ref",
+            "orchestrator_task_ref",
+        )
+        plain = {
+            k: v for k, v in local.items() if k != "orchestrator" and k not in refs
+        }
+        plain["observation_id"] = "88888888-8888-4888-8888-888888888888"
+        self.call("collect", data=plain)
+        bare = {**plain, "orchestrator": "cron"}
+        bare["observation_id"] = "99999999-9999-4999-8999-999999999999"
+        self.call("collect", data=bare)
+        rows = [
+            json.loads(raw)
+            for (raw,) in self.db().execute("SELECT payload FROM outbox ORDER BY seq")
+        ]
+        self.assertEqual(rows[0]["orchestrator"], "cron")
+        self.assertNotIn("orchestrator", rows[1])
+        self.assertEqual(rows[2]["orchestrator"], "cron")
+        self.assertFalse(set(refs) & rows[2].keys())
+
+    def test_v2_refuses_refs_without_a_preset_key(self):
+        self.installation_state()
+        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
+        del local["orchestrator"]
+        self.call("collect", data=local, code=2)
 
     def test_installation_without_advertised_v2_freezes_v1_bytes(self):
         self.installation_state(versions=(1,))

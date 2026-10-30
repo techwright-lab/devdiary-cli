@@ -181,6 +181,8 @@ begin
   hook_plan = root.join("installation-plan.json").to_s
   command.call(["setup-plan", installation, hook_settings.to_s, hook_plan])
   command.call(["claude-apply", hook_plan, "--consent"])
+  approved = File.join(installation, "outbox", "orchestrators-approved.json")
+  File.write(approved, JSON.generate([{key: "paperclip", env: {agent_ref: "PAPERCLIP_AGENT_ID"}}]), perm: 0o600)
   agent = SecureRandom.uuid
   [[{"PAPERCLIP_AGENT_ID" => agent, "PAPERCLIP_API_KEY" => "SENTINELSECRET"}, "PostToolUse"], [{}, "SessionStart"]].each do |env, event|
     hook_input = JSON.generate({hook_event_name: event, session_id: "fixture-installation", cwd: repository, tool_use_id: "toolu_fixture", tool_name: "Bash"})
@@ -191,7 +193,7 @@ begin
   raise "installation sync" unless JSON.parse(command.call(["connection-sync", installation, "10"])) == {"pending" => 0, "delivered" => 2}
   wire = state[:requests][sent..].map { |body| JSON.parse(body) }
   raise "installation scope did not send v2" unless wire.all? { |row| row["schema_version"] == 2 && !row.key?("actor_ref") } &&
-    wire.map { |row| row["orchestrator"] }.sort == %w[none paperclip]
+    wire.map { |row| row["orchestrator"] }.compact == %w[paperclip]
   raise "secret on the wire" if state[:requests].join.include?("SENTINELSECRET")
   raise "scope endpoint not read" unless state[:scope_reads].positive?
   rows = CollectorObservation.where(collector_credential: credential).to_a

@@ -1,4 +1,6 @@
-use crate::{MAX_WIRE, Object, Result, drops, endpoint, freeze, receipt, reflog::Mark, scope};
+use crate::{
+    MAX_WIRE, Object, Result, drops, endpoint, freeze, orchestrators, receipt, reflog::Mark, scope,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,7 +16,6 @@ const VERSION: i64 = 2;
 pub(crate) const SETTINGS_LOCK: &str = "claude-settings.lock";
 pub(crate) const FINGERPRINT: &str = "executable-fingerprint";
 const REFS: &str = "repository-refs.json";
-const REFS_NEXT: &str = "repository-refs.json.next";
 const MAX_REFS: u64 = 262144;
 const SCOPE_PATH: &str = "/ingest/v1/collector/scope";
 // Delivered IDs are kept so a late duplicate hook firing is still deduplicated
@@ -120,11 +121,12 @@ fn state_check(state: &Path) -> Result<()> {
             SETTINGS_LOCK,
             FINGERPRINT,
             REFS,
-            REFS_NEXT,
+            "repository-refs.json.next",
             drops::LOG,
             drops::FOLDING,
         ]
         .iter()
+        .chain(&orchestrators::STATE_FILES)
         .any(|n| name == *n)
         {
             return Err("separate_empty_rust_state_required".into());
@@ -533,13 +535,16 @@ pub(crate) fn read_refs(state: &Path) -> Result<Vec<String>> {
 pub(crate) fn has_refs(state: &Path) -> bool {
     state.join(REFS).exists()
 }
-// Callers hold sync.lock, so the fixed staging name has one writer.
 fn replace_refs(state: &Path, refs: &[String]) -> Result<()> {
     let raw = serde_json::to_vec(refs)?;
     if raw.len() as u64 > MAX_REFS {
         return Err("invalid_repository_refs".into());
     }
-    let next = state.join(REFS_NEXT);
+    replace(state, REFS, &raw)
+}
+// Callers hold sync.lock, so the fixed staging name has one writer.
+pub(crate) fn replace(state: &Path, name: &str, raw: &[u8]) -> Result<()> {
+    let next = state.join(format!("{name}.next"));
     match fs::remove_file(&next) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -550,9 +555,9 @@ fn replace_refs(state: &Path, refs: &[String]) -> Result<()> {
         .mode(0o600)
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
         .open(&next)?;
-    std::io::Write::write_all(&mut file, &raw)?;
+    std::io::Write::write_all(&mut file, raw)?;
     file.sync_all()?;
-    fs::rename(&next, state.join(REFS))?;
+    fs::rename(&next, state.join(name))?;
     File::open(state)?.sync_all()?;
     Ok(())
 }
@@ -639,14 +644,9 @@ pub(crate) fn sync_report(
         .as_str()
         .ok_or("invalid_collector")?
         .to_owned();
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(4))
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let client = client()?;
     if crate::installation(&store.config) {
-        refresh_refs(&client, &store, state, key, revoked)?;
+        refresh_scope(&client, &store, state, key, revoked)?;
     }
     let mut attempted = 0;
     let mut stopped = None;
@@ -697,9 +697,23 @@ pub(crate) fn sync_report(
         refusal,
     })
 }
+fn client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(5))
+        .build()?)
+}
+pub(crate) fn scope_now(state: &Path, key: &str, revoked: Option<&Path>) -> Result<()> {
+    let lock = create_private(&state.join("sync.lock"))?;
+    lock.lock()?;
+    let store = Store::open(state, None)?;
+    refresh_scope(&client()?, &store, state, key, revoked)
+}
 // A refresh that fails for any reason but revocation or a server-requested
-// wait keeps the last good list; delivery of spooled rows still proceeds.
-fn refresh_refs(
+// wait keeps the last good lists; delivery of spooled rows still proceeds.
+fn refresh_scope(
     client: &reqwest::blocking::Client,
     store: &Store,
     state: &Path,
@@ -747,12 +761,15 @@ fn refresh_refs(
     {
         return Ok(());
     }
-    if let Ok(refs) = scope_refs(&raw, &store.config) {
+    if let Ok((refs, offer)) = scope_reply(&raw, &store.config) {
         replace_refs(state, &refs)?;
+        if let Some(offer) = offer {
+            orchestrators::save_offer(state, &offer)?;
+        }
     }
     Ok(())
 }
-fn scope_refs(raw: &[u8], config: &Object) -> Result<Vec<String>> {
+fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde_json::Value>)> {
     serde_json::from_slice::<crate::claude::UniqueKeys>(raw)?;
     let doc = crate::object(raw)?;
     let keys = [
@@ -762,7 +779,8 @@ fn scope_refs(raw: &[u8], config: &Object) -> Result<Vec<String>> {
         "repository_refs",
         "observation_schema_versions",
     ];
-    if doc.len() != keys.len()
+    let offer = doc.get("orchestrators").map(orchestrators::offer);
+    if doc.len() != keys.len() + usize::from(offer.is_some())
         || keys.iter().any(|k| !doc.contains_key(*k))
         || doc["schema_version"] != serde_json::json!(1)
         || doc.get("collector_ref") != config.get("collector_ref")
@@ -770,7 +788,7 @@ fn scope_refs(raw: &[u8], config: &Object) -> Result<Vec<String>> {
     {
         return Err("invalid_scope_response".into());
     }
-    repository_refs(&doc["repository_refs"])
+    Ok((repository_refs(&doc["repository_refs"])?, offer))
 }
 const MAX_RETRY_AFTER: i64 = 86400;
 fn retry_after(value: &str, now: i64) -> Option<i64> {

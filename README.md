@@ -250,6 +250,9 @@ devdiary-collector uninstall
 7. A local self-test: the installed hook receives a `SessionStart` whose session id
    starts with `devdiary-selftest-`. The hook records it only in a local
    `self_test` table, which sync never reads; the outbox refuses such ids.
+8. Reads the scope endpoint once. If the server offers orchestrator names, prints
+   them and asks `[y/N]`. `--yes` never answers this question: without a terminal
+   `install` prints the command to run and finishes. Declining keeps the hooks.
 
 `timer-sync` runs `connection-sync DIR 100` at most 10 times and stops at the first
 batch that a 401/403, 429, 5xx or network failure stops, when no full batch is
@@ -278,6 +281,78 @@ sha256. The connection
 and any pending rows stay; revoke the connection in the browser to retire the
 credential. Headless machines need `loginctl enable-linger` for the timer to run
 while logged out.
+
+### Orchestrator names need local approval
+
+A control plane (an orchestrator, a tool that starts agents) marks its runs with
+environment variables. The collector holds no list of these tools. A workspace
+manager turns one on in DevDiary, and the scope endpoint then offers its variable
+names, for example `PAPERCLIP_AGENT_ID` for the `paperclip` preset:
+
+```json
+{"orchestrators": [{"key": "paperclip", "env": {
+  "agent_ref": "PAPERCLIP_AGENT_ID", "run_ref": "PAPERCLIP_RUN_ID",
+  "task_ref": "PAPERCLIP_TASK_ID",
+  "checkout_path": ["PAPERCLIP_WORKSPACE_WORKTREE_PATH", "PAPERCLIP_WORKSPACE_CWD"]}}]}
+```
+
+Every scope refresh stores this list as `orchestrators-offered.json` (0600) in the
+outbox. The hook takes no names from it. The hook reads only the names in
+`orchestrators-approved.json` (0600). Three commands write that file, always after
+the same prompt on a terminal: `install`, `upgrade` and:
+
+```sh
+devdiary-collector orchestrators approve [CONNECTION_DIR]
+```
+
+The prompt prints each key with its refs and its checkout paths as separate groups.
+When an approved list already exists it also prints what was added and removed. It
+asks `[y/N]` and saves what it printed. Without a terminal `orchestrators approve`
+refuses with `approval_required`, and it has no `--yes`. `install` and `upgrade`
+finish without a terminal and leave the change waiting; their `--yes` covers only the
+hook entries. So a server cannot widen what the hook reads unless a person agrees.
+
+When the offer changes, the approved list keeps working unchanged, also when the
+offer gets smaller. `doctor` (`orchestrators`), `connection-status`
+(`local_orchestrators`) and `status` (`orchestrators_waiting`, only when true) report
+that a change waits for approval. `refused` counts entries that were refused. When a
+preset is offered and not approved, `doctor` prints a line on stderr, and `notice`
+holds the same text.
+
+A bad offered file stops no command. `doctor` and `connection-status` report
+`offered_list_unreadable` and `status` reports `orchestrators_offered_unreadable`;
+the next scope reply that has the field replaces the file. `orchestrators approve`
+refuses with `offered_list_unreadable` until then. A file with the wrong owner or mode
+is different: as for all state, every command refuses until it is fixed.
+
+The collector refuses a whole entry if one name does not match
+`^[A-Z][A-Z0-9_]{0,63}$`, or contains `SECRET`, `KEY`, `AUTH`, `COOKIE`, `PASS`, `PWD`,
+`CRED`, `TOK`, `DSN`, `BEARER`, `JWT`, `PRIVATE`, `SESSION` or `DATABASE_URL`, or has
+`PAT` as a whole `_`-separated segment (`GH_PAT`, not `WORK_PATH`), or is exactly one
+of `HOME`, `PATH`, `USER`, `LOGNAME`, `PWD`, `OLDPWD`, `SHELL`, `TERM`, `LANG`,
+`HOSTNAME` or `TMPDIR`, which are set in every shell. It also refuses an entry with
+more than 8 names or without a ref, and a list with more than 8 entries. The approved file is checked
+again on each read: if it fails, the hook reads no names and drops the row (`error`).
+
+If two approved entries match the environment, the first in the list wins. Values
+are never logged. A ref is sent only when it is a UUID. Any matching variable, even
+with a malformed value, marks the run as orchestrated: the row carries `orchestrator`
+with the preset key, so the server does not treat it as the machine owner's own work.
+Rows from other runs have no `orchestrator` field. `checkout_path` values are local
+hints used when `cwd` is not a repository; they never leave the machine.
+
+An offer nobody answered fails closed. While the approved list is empty or unreadable
+and the offer has an entry, a refused entry or cannot be read, every row carries
+`orchestrator: "unapproved"`. The hook reads no environment name for these rows, so
+they have no refs and use no checkout path. The server keeps them with binding
+unknown, so an agent run never reads as the machine owner's work, and `doctor` says
+runs stay unknown until approved. Outside a repository such a row is dropped
+(`outside_scope`), also with `--record-orchestrated-outside-repos`. `unapproved` is
+reserved and cannot be a preset key. With an unreadable approved list and no offer the
+hook drops the row, as above.
+
+Once an approved list exists, a preset added to the offer is not read until approved.
+Its runs can look like ordinary runs, and `doctor` says so.
 
 Verification: `python3 collector-rs/tests/install_test.py -v` (temp HOME, a mock
 pairing/ingest server and a fake systemctl; debug builds only honour

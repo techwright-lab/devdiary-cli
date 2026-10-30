@@ -289,6 +289,9 @@ class InstallationPairingTest(unittest.TestCase):
                         "scope_kind": "installation",
                         "repository_refs": ["https://github.com/acme/later"],
                         "observation_schema_versions": [1, 2],
+                        "orchestrators": [
+                            {"key": "paperclip", "env": {"run_ref": "PAPERCLIP_RUN_ID"}}
+                        ],
                     },
                 )
 
@@ -407,6 +410,10 @@ class InstallationPairingTest(unittest.TestCase):
             (self.connection / "outbox/repository-refs.json").read_bytes()
         )
         self.assertEqual(refs, ["https://github.com/acme/later"])
+        offered = json.loads(
+            (self.connection / "outbox/orchestrators-offered.json").read_bytes()
+        )
+        self.assertEqual(offered["orchestrators"][0]["key"], "paperclip")
         self.scope_status = 401
         self.run_collector("connection-sync", self.connection, "10", code=2)
         self.assertTrue((self.connection / "revoked").exists())
