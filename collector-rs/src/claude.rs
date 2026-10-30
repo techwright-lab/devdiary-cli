@@ -5,7 +5,8 @@ use crate::{
     MAX_HOOK_INPUT, Object, Result,
     checkout::{self, Checkout},
     drops, object,
-    store::{FINGERPRINT, SETTINGS_LOCK, Store, create_private, owner_writable, private},
+    reflog::{self, Appended},
+    store::{Bracket, FINGERPRINT, SETTINGS_LOCK, Store, create_private, owner_writable, private},
     text, token,
 };
 use serde_json::{Value, json};
@@ -14,7 +15,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -754,26 +755,28 @@ fn orchestrator() -> Object {
     );
     out
 }
-fn workspace_checkout(cwd: &Path, paperclip: bool) -> Checkout {
-    let found = checkout::resolve(cwd);
-    if found != Checkout::Absent || !paperclip {
+fn workspace_checkout(cwd: &Path, paperclip: bool) -> (Checkout, Option<PathBuf>) {
+    let found = checkout::locate(cwd);
+    if found.0 != Checkout::Absent || !paperclip {
         return found;
     }
     WORKSPACE_HINTS
         .iter()
         .filter_map(|name| std::env::var(name).ok())
         .filter(|hint| hint.len() <= 4096 && Path::new(hint).is_absolute())
-        .map(|hint| checkout::resolve(Path::new(&hint)))
-        .find(|c| *c != Checkout::Absent)
-        .unwrap_or(Checkout::Absent)
+        .map(|hint| checkout::locate(Path::new(&hint)))
+        .find(|c| c.0 != Checkout::Absent)
+        .unwrap_or((Checkout::Absent, None))
 }
+type Located = Option<(String, Option<PathBuf>)>;
 // The stamped ref is the server's spelling; GitHub names are case-insensitive.
-fn locate(cwd: &Path, config: &Object, state: &Path, paperclip: bool) -> Result<Option<String>> {
-    match workspace_checkout(cwd, paperclip) {
+fn locate(cwd: &Path, config: &Object, state: &Path, paperclip: bool) -> Result<Located> {
+    let (found, gitdir) = workspace_checkout(cwd, paperclip);
+    match found {
         Checkout::Repository(found) => crate::store::read_refs(state)?
             .into_iter()
             .find(|r| r.eq_ignore_ascii_case(&found))
-            .map(Some)
+            .map(|reference| Some((reference, gitdir)))
             .ok_or_else(|| "unknown_repository".into()),
         Checkout::Unresolved => Err("unknown_repository".into()),
         Checkout::Absent
@@ -786,29 +789,30 @@ fn locate(cwd: &Path, config: &Object, state: &Path, paperclip: bool) -> Result<
         Checkout::Absent => Err("outside_scope".into()),
     }
 }
-fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<Object> {
+fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<(Object, Option<PathBuf>)> {
     if !crate::installation(config) {
         within_repository(cwd, config)?;
-        return object(&serde_json::to_vec(
-            &json!({"schema_version": 1, "repository": config["repository"]}),
-        )?);
+        let row = json!({"schema_version": 1, "repository": config["repository"]});
+        return Ok((object(&serde_json::to_vec(&row)?)?, None));
     }
     let mut row = orchestrator();
     let paperclip = row["orchestrator"] == json!("paperclip");
-    if let Some(reference) = locate(cwd, config, state, paperclip)? {
+    let mut gitdir = None;
+    if let Some((reference, found)) = locate(cwd, config, state, paperclip)? {
         row.insert("repository_ref".into(), reference.into());
+        gitdir = found;
     }
     row.insert("schema_version".into(), crate::wire_version(config).into());
-    Ok(row)
+    Ok((row, gitdir))
 }
-fn normalize(data: &Object, config: &Object, state: &Path) -> Result<Vec<u8>> {
+fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Option<PathBuf>)> {
     let event = text(data, "hook_event_name")?;
     let session = text(data, "session_id")?;
     let cwd = text(data, "cwd")?;
     if cwd.len() > 4096 || !Path::new(cwd).is_absolute() {
         return Err("invalid_cwd".into());
     }
-    let mut out = scoped_row(Path::new(cwd), config, state)?;
+    let (mut out, gitdir) = scoped_row(Path::new(cwd), config, state)?;
     for (key, value) in json!({"installation_id": config["installation_id"], "runtime": "claude-code", "session_id": session, "event": event, "actor_ref": null, "attribution_basis": "unknown", "observed_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()}).as_object().ok_or("invalid_metadata")? {
         out.insert(key.clone(), value.clone());
     }
@@ -867,7 +871,55 @@ fn normalize(data: &Object, config: &Object, state: &Path) -> Result<Vec<u8>> {
         Uuid::new_v4()
     };
     out.insert("observation_id".into(), id.to_string().into());
-    serde_json::to_vec(&out).map_err(Into::into)
+    Ok((out, gitdir))
+}
+// Only the bracketing Bash call's own checkout is read: a commit made between
+// tool calls or in another checkout is honestly absent, never inferred.
+fn bracket(store: &Store, state: &Path, row: &mut Object, gitdir: &Path) -> Result<()> {
+    let tool = row.get("tool_use_id").and_then(Value::as_str);
+    let key = reflog::checkout_key(gitdir);
+    let (Some(tool), Some(key)) = (tool, key) else {
+        return Ok(());
+    };
+    if crate::wire_version(&store.config) != 2 || row.get("tool_name") != Some(&json!("Bash")) {
+        return Ok(());
+    }
+    let (session, tool) = (text(row, "session_id")?.to_owned(), tool.to_owned());
+    let call = Bracket {
+        session_id: &session,
+        tool_use_id: &tool,
+        checkout_key: &key,
+    };
+    let at = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    match text(row, "event")? {
+        "PreToolUse" => {
+            if let Some(mark) = reflog::mark(gitdir) {
+                store.open_bracket(&call, mark, at)?;
+            }
+        }
+        "PostToolUse" | "PostToolUseFailure" => {
+            if let Some((mark, overlap)) = store.close_bracket(&call, at)? {
+                linked(state, row, reflog::appended(gitdir, mark), overlap);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn linked(state: &Path, row: &mut Object, appended: Appended, overlap: u64) {
+    match appended {
+        Appended::Commits(shas) if shas.is_empty() => {}
+        Appended::Commits(shas) => {
+            row.insert("commits".into(), json!(shas));
+            row.insert("overlap_count".into(), overlap.into());
+        }
+        Appended::Gap(gap) => {
+            if gap == "reflog_rewritten" {
+                drops::note(state, "reflog_rotated");
+            }
+            row.insert("commit_gap".into(), gap.into());
+        }
+    }
 }
 fn input_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
     if error.is::<serde_json::Error>() {
@@ -954,7 +1006,7 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
         .get("scope")
         .and_then(Value::as_object)
         .ok_or("invalid_scope")?;
-    let normalized = normalize(data, scope, state)?;
+    let (mut row, gitdir) = normalize(data, scope, state)?;
     trusted_executable(p, state)?;
     let _lock = lock(state, true)?;
     active(plan_path, p)?;
@@ -964,9 +1016,12 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
     if *scope != store.config {
         return Err("scope_changed".into());
     }
+    if let Some(gitdir) = gitdir {
+        bracket(&store, state, &mut row, &gitdir)?;
+    }
     // A racing duplicate has the same UUID but a new observation timestamp.
     // The store's conflict refusal keeps the first observation unrewritten.
-    store.collect(&normalized)
+    store.collect(&serde_json::to_vec(&row)?)
 }
 
 #[cfg(test)]
