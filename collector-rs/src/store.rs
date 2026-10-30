@@ -697,8 +697,6 @@ pub(crate) fn sync_report(
         refusal,
     })
 }
-// A refresh that fails for any reason but revocation or a server-requested
-// wait keeps the last good list; delivery of spooled rows still proceeds.
 fn refresh_refs(
     client: &reqwest::blocking::Client,
     store: &Store,
@@ -712,20 +710,20 @@ fn refresh_refs(
             .ok_or("invalid_endpoint")?,
     )?;
     url.set_path(SCOPE_PATH);
-    let Ok(response) = client
+    let response = client
         .get(url)
         .bearer_auth(key)
         .header("Accept", "application/json")
         .send()
-    else {
-        return Ok(());
-    };
+        .map_err(|_| "scope_refresh_network_failure: check the connection and retry sync")?;
     let status = response.status().as_u16();
     if matches!(status, 401 | 403) {
         if let Some(marker) = revoked {
             create_private(marker)?;
         }
-        return Err("revoked".into());
+        return Err(
+            "revoked: server refused the credential; connect this installation again".into(),
+        );
     }
     if status == 429 {
         let wait = response
@@ -738,18 +736,24 @@ fn refresh_refs(
             "UPDATE scope SET retry_after=? WHERE singleton=1",
             [now()? + wait],
         )?;
-        return Err("sync_rate_limited".into());
+        return Err("sync_rate_limited: wait for Retry-After before retrying sync".into());
+    }
+    if status != 200 {
+        return Err(
+            format!("scope_refresh_http_{status}: check server access and retry sync").into(),
+        );
     }
     let mut raw = Vec::new();
-    if status != 200
-        || response.take(MAX_REFS + 1).read_to_end(&mut raw).is_err()
-        || raw.len() as u64 > MAX_REFS
-    {
-        return Ok(());
+    response
+        .take(MAX_REFS + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| "scope_refresh_read_failure: retry sync")?;
+    if raw.len() as u64 > MAX_REFS {
+        return Err("scope_refresh_response_too_large: check server compatibility".into());
     }
-    if let Ok(refs) = scope_refs(&raw, &store.config) {
-        replace_refs(state, &refs)?;
-    }
+    let refs = scope_refs(&raw, &store.config)
+        .map_err(|_| "invalid_scope_response: check server compatibility and retry sync")?;
+    replace_refs(state, &refs)?;
     Ok(())
 }
 fn scope_refs(raw: &[u8], config: &Object) -> Result<Vec<String>> {
@@ -762,7 +766,7 @@ fn scope_refs(raw: &[u8], config: &Object) -> Result<Vec<String>> {
         "repository_refs",
         "observation_schema_versions",
     ];
-    if doc.len() != keys.len()
+    if doc.len() != keys.len() + usize::from(doc.contains_key("orchestrators"))
         || keys.iter().any(|k| !doc.contains_key(*k))
         || doc["schema_version"] != serde_json::json!(1)
         || doc.get("collector_ref") != config.get("collector_ref")
@@ -770,7 +774,69 @@ fn scope_refs(raw: &[u8], config: &Object) -> Result<Vec<String>> {
     {
         return Err("invalid_scope_response".into());
     }
+    if doc["observation_schema_versions"] != serde_json::json!([1])
+        && doc["observation_schema_versions"] != serde_json::json!([1, 2])
+    {
+        return Err("invalid_scope_response".into());
+    }
+    if let Some(entries) = doc.get("orchestrators") {
+        validate_orchestrators(entries)?;
+    }
     repository_refs(&doc["repository_refs"])
+}
+fn validate_orchestrators(value: &serde_json::Value) -> Result<()> {
+    let entries = value.as_array().ok_or("invalid_orchestrators")?;
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let entry = entry.as_object().ok_or("invalid_orchestrators")?;
+        let key = entry
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or("invalid_orchestrators")?;
+        if entry.len() != 2
+            || key.is_empty()
+            || key.len() > 64
+            || key == "none"
+            || !key.as_bytes()[0].is_ascii_lowercase()
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+            || !seen.insert(key)
+        {
+            return Err("invalid_orchestrators".into());
+        }
+        let env = entry
+            .get("env")
+            .and_then(|v| v.as_object())
+            .ok_or("invalid_orchestrators")?;
+        if !["agent_ref", "run_ref", "task_ref"]
+            .iter()
+            .any(|k| env.contains_key(*k))
+        {
+            return Err("invalid_orchestrators".into());
+        }
+        for (field, value) in env {
+            let valid = match field.as_str() {
+                "agent_ref" | "run_ref" | "task_ref" => value.as_str().is_some_and(env_name),
+                "checkout_path" => value
+                    .as_array()
+                    .is_some_and(|names| names.iter().all(|n| n.as_str().is_some_and(env_name))),
+                _ => false,
+            };
+            if !valid {
+                return Err("invalid_orchestrators".into());
+            }
+        }
+    }
+    Ok(())
+}
+fn env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.as_bytes()[0].is_ascii_uppercase()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 const MAX_RETRY_AFTER: i64 = 86400;
 fn retry_after(value: &str, now: i64) -> Option<i64> {
