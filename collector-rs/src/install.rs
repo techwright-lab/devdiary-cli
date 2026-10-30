@@ -2,7 +2,7 @@
 //! after consent, then deliver the spool from a systemd user timer.
 use crate::{
     Object, Result, claude, drops, object, pairing,
-    store::{Store, private},
+    store::{Report, Store, private},
     systemd::{self, Runner},
     text,
 };
@@ -152,7 +152,8 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     require_consent_channel(o.yes)?;
     let data = data_dir()?;
     let settings = match o.settings {
-        Some(path) => path.to_path_buf(),
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(_) => return Err("unsupported_path".into()),
         None => home()?.join(".claude/settings.json"),
     };
     if record(&data)?.is_some() {
@@ -170,45 +171,78 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
         new_pair: false,
         record_orchestrated_outside_repos: o.record_orchestrated_outside_repos,
         next_steps: false,
-    })?;
+    })
+    .map_err(setup_failure)?;
     let exe = pin_binary(&data)?;
-    register(&data, &settings, &exe, o.yes, runner)
-}
-
-fn register(
-    data: &Path,
-    settings: &Path,
-    exe: &Path,
-    yes: bool,
-    runner: &dyn Runner,
-) -> Result<()> {
-    let plans = data.join("plans");
-    private_dir(&plans)?;
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let plan = plans.join(format!("claude-{nanos}.json"));
-    pairing::plan_with(&connection(data), settings, &plan, exe)?;
-    println!("Hook entries to append to {}:", settings.display());
-    for line in claude::entries(&plan)? {
-        println!("  {line}");
-    }
+    let registration = Registration::new(&data, &settings, &exe)?;
+    registration.plan()?;
+    registration.show()?;
     if let Err(error) = consent(
-        yes,
+        o.yes,
         "Append these 9 entries and enable the devdiary-collector-sync user timer?",
     ) {
-        let _ = fs::remove_file(&plan);
+        let _ = fs::remove_file(&registration.plan);
         return Err(error);
     }
-    claude::apply(&plan)?;
-    save(
-        &data.join(RECORD),
-        &json!({"version": VERSION, "executable": exe, "plan": plan, "settings": settings}),
-    )?;
-    systemd::enable(runner, &systemd::unit_dir()?, exe, &connection(data))?;
-    self_test(exe, &plan, &connection(data).join("outbox"))?;
-    println!(
-        "Self-test passed: the installed hook recorded a local test event that is never uploaded.\nThe timer syncs every 2 minutes. Run `devdiary-collector doctor` to check it."
-    );
-    Ok(())
+    registration.finish(runner)
+}
+fn setup_failure(error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    if pairing::known_diagnostic(error.as_ref()).is_some() {
+        error
+    } else {
+        "setup_incomplete".into()
+    }
+}
+
+struct Registration<'a> {
+    data: &'a Path,
+    settings: &'a Path,
+    exe: &'a Path,
+    plan: PathBuf,
+}
+impl<'a> Registration<'a> {
+    fn new(data: &'a Path, settings: &'a Path, exe: &'a Path) -> Result<Self> {
+        let plans = data.join("plans");
+        private_dir(&plans)?;
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let plan = plans.join(format!("claude-{nanos}.json"));
+        Ok(Self {
+            data,
+            settings,
+            exe,
+            plan,
+        })
+    }
+    fn show(&self) -> Result<()> {
+        println!("Hook entries to append to {}:", self.settings.display());
+        for line in claude::entry_lines(&self.plan, self.exe)? {
+            println!("  {line}");
+        }
+        Ok(())
+    }
+    // Consent is given to the lines `show` printed, so the saved plan must match them.
+    fn plan(&self) -> Result<()> {
+        pairing::plan_with(&connection(self.data), self.settings, &self.plan, self.exe)?;
+        if claude::entries(&self.plan)? != claude::entry_lines(&self.plan, self.exe)? {
+            let _ = fs::remove_file(&self.plan);
+            return Err("stale_plan".into());
+        }
+        Ok(())
+    }
+    fn finish(&self, runner: &dyn Runner) -> Result<()> {
+        let (data, exe, plan) = (self.data, self.exe, &self.plan);
+        claude::apply(plan)?;
+        save(
+            &data.join(RECORD),
+            &json!({"version": VERSION, "executable": exe, "plan": plan, "settings": self.settings}),
+        )?;
+        systemd::enable(runner, &systemd::unit_dir()?, exe, &connection(data))?;
+        self_test(exe, plan, &connection(data).join("outbox"))?;
+        println!(
+            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\nThe timer syncs every 2 minutes. Run `devdiary-collector doctor` to check it."
+        );
+        Ok(())
+    }
 }
 
 fn self_test(exe: &Path, plan: &Path, outbox: &Path) -> Result<()> {
@@ -239,37 +273,48 @@ fn self_test(exe: &Path, plan: &Path, outbox: &Path) -> Result<()> {
     Ok(())
 }
 
+// The old record stays until the new one replaces it, so a failure after the
+// old entries are removed still leaves uninstall able to disable the timer.
 pub fn upgrade(yes: bool, runner: &dyn Runner) -> Result<()> {
     require_consent_channel(yes)?;
     let data = data_dir()?;
     let old = record(&data)?.ok_or("not_installed")?;
+    claude::preflight_replacing(&old.plan)?;
+    let exe = pin_binary(&data)?;
+    let registration = Registration::new(&data, &old.settings, &exe)?;
+    registration.show()?;
     consent(
         yes,
         &format!(
-            "Replace the hook entries of version {} with version {VERSION}?",
+            "Replace the hook entries of version {} with these 9 entries of version {VERSION}?",
             old.version
         ),
     )?;
-    let exe = pin_binary(&data)?;
     claude::remove(&old.plan)?;
-    fs::remove_file(data.join(RECORD))?;
-    register(&data, &old.settings, &exe, true, runner)
+    registration.plan()?;
+    registration.finish(runner)
 }
 
 pub fn uninstall(runner: &dyn Runner) -> Result<()> {
     let data = data_dir()?;
-    let Some(old) = record(&data)? else {
-        println!("Not installed; nothing changed.");
-        return Ok(());
-    };
-    systemd::disable(runner, &systemd::unit_dir()?)?;
-    claude::remove(&old.plan)?;
-    fs::remove_file(data.join(RECORD))?;
-    File::open(&data)?.sync_all()?;
-    println!(
-        "Hooks removed and the sync timer disabled. The connection and any pending rows stay in {}; revoke the connection in the browser to retire its credential.",
-        connection(&data).display()
-    );
+    let old = record(&data)?;
+    let timer = systemd::disable(runner, &systemd::unit_dir()?);
+    if let Some(old) = &old {
+        claude::remove(&old.plan)?;
+        fs::remove_file(data.join(RECORD))?;
+        File::open(&data)?.sync_all()?;
+    }
+    let units = timer?;
+    match (old.is_some(), units) {
+        (false, false) => println!("Not installed; nothing changed."),
+        (false, true) => {
+            println!("Not installed; the leftover sync timer was disabled and removed.")
+        }
+        (true, _) => println!(
+            "Hooks removed and the sync timer disabled. The connection and any pending rows stay in {}; revoke the connection in the browser to retire its credential.",
+            connection(&data).display()
+        ),
+    }
     Ok(())
 }
 
@@ -328,24 +373,106 @@ fn note_sync(root: &Path, error: Option<String>) -> Result<()> {
 /// Server refusals end the run quietly and are left for `doctor`; only local
 /// failures make the service fail.
 pub fn timer_sync(root: &Path) -> Result<()> {
-    for _ in 0..BATCHES {
-        let report = match pairing::sync_report(root, BATCH) {
-            Ok(report) => report,
-            Err(error) => {
-                let code = code(error.as_ref());
-                note_sync(root, Some(code.clone()))?;
-                return match code.as_str() {
-                    "revoked" | "sync_rate_limited" => Ok(()),
-                    _ => Err(error),
-                };
+    match drain(|limit| pairing::sync_report(root, limit)) {
+        Ok(refusal) => note_sync(root, refusal),
+        Err(error) => {
+            let code = code(error.as_ref());
+            note_sync(root, Some(code.clone()))?;
+            match code.as_str() {
+                "revoked" | "sync_rate_limited" => Ok(()),
+                _ => Err(error),
             }
-        };
-        if report.stopped.is_some() {
-            return note_sync(root, report.stopped);
         }
-        if report.pending == 0 || report.attempted < BATCH {
+    }
+}
+// Rows the server refuses stay pending and the cursor wraps, so one run visits
+// each row that was pending when it started at most once.
+fn drain(mut batch: impl FnMut(usize) -> Result<Report>) -> Result<Option<String>> {
+    let (mut visited, mut budget, mut refusal) = (0, BATCH, None);
+    for round in 0..BATCHES {
+        let limit = BATCH.min(budget - visited);
+        let report = batch(limit)?;
+        if report.stopped.is_some() {
+            return Ok(report.stopped);
+        }
+        refusal = report.refusal.or(refusal);
+        visited += report.attempted;
+        if round == 0 {
+            budget = report.pending as usize + report.attempted - report.refused;
+        }
+        if report.pending == 0 || report.attempted < limit || visited >= budget {
             break;
         }
     }
-    note_sync(root, None)
+    Ok(refusal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(pending: i64, attempted: usize, refused: usize) -> Report {
+        Report {
+            pending,
+            delivered: 0,
+            attempted,
+            stopped: None,
+            refused,
+            refusal: (refused > 0).then(|| "http_422".into()),
+        }
+    }
+
+    fn run(mut pending: i64, refuse: bool, stop_at: Option<usize>) -> (Vec<usize>, Option<String>) {
+        let mut limits = Vec::new();
+        let result = drain(|limit| {
+            limits.push(limit);
+            if stop_at == Some(limits.len()) {
+                return Ok(Report {
+                    stopped: Some("http_503".into()),
+                    ..report(pending, 1, 1)
+                });
+            }
+            let attempted = limit.min(pending as usize);
+            if refuse {
+                return Ok(report(pending, attempted, attempted));
+            }
+            pending -= attempted as i64;
+            Ok(report(pending, attempted, 0))
+        })
+        .unwrap();
+        (limits, result)
+    }
+
+    #[test]
+    fn a_run_sends_at_most_ten_batches_of_one_hundred() {
+        assert_eq!(run(1005, false, None), (vec![100; 10], None));
+    }
+
+    #[test]
+    fn a_run_ends_when_the_spool_is_empty() {
+        assert_eq!(run(150, false, None), (vec![100, 50], None));
+        assert_eq!(run(200, false, None), (vec![100, 100], None));
+    }
+
+    #[test]
+    fn refused_rows_are_visited_once_and_reported() {
+        assert_eq!(
+            run(120, true, None),
+            (vec![100, 20], Some("http_422".into()))
+        );
+        assert_eq!(run(100, true, None), (vec![100], Some("http_422".into())));
+    }
+
+    #[test]
+    fn a_stop_class_failure_ends_the_run_with_its_code() {
+        assert_eq!(
+            run(500, false, Some(2)),
+            (vec![100, 100], Some("http_503".into()))
+        );
+    }
+
+    #[test]
+    fn a_local_failure_propagates() {
+        assert!(drain(|_| Err("disk".into())).is_err());
+    }
 }

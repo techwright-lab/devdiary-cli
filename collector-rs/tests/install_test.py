@@ -11,6 +11,8 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -35,6 +37,10 @@ case "$*" in
   *is-enabled*) echo enabled ;;
   *is-active*) echo active ;;
 esac
+"""
+NO_USER_BUS = """#!/bin/sh
+printf '%s\\n' "$*" >> "$(dirname "$0")/systemctl.log"
+exit 1
 """
 
 
@@ -63,6 +69,7 @@ class InstallTest(unittest.TestCase):
         self.settings.chmod(0o644)
         self.data = self.home / ".local/share/devdiary/collector"
         self.received = []
+        self.observation_status = 201
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -125,6 +132,8 @@ class InstallTest(unittest.TestCase):
                         },
                     )
                 owner.received.append(data)
+                if owner.observation_status != 201:
+                    return self.reply(owner.observation_status, {"error": "refused"})
                 self.reply(
                     201,
                     {
@@ -193,6 +202,59 @@ class InstallTest(unittest.TestCase):
             for event in EVENTS
         }
 
+    def record(self):
+        return json.loads((self.data / "install.json").read_text())
+
+    def spool(self, count):
+        repo = self.root / "demo"
+        if not repo.exists():
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/acme/demo.git",
+                ],
+                check=True,
+            )
+        record = self.record()
+
+        def hook(_):
+            event = {
+                "hook_event_name": "SessionStart",
+                "session_id": str(uuid.uuid4()),
+                "cwd": str(repo),
+            }
+            subprocess.run(
+                [record["executable"], "claude-hook", record["plan"]],
+                input=json.dumps(event).encode(),
+                env=self.env(),
+                timeout=10,
+                check=True,
+            )
+
+        for i in range(count):
+            hook(i)
+        self.assertEqual(self.pending(), count)
+
+    def pending(self):
+        return self.count("outbox")
+
+    def count(self, table):
+        outbox = self.data / "connection/outbox/collector-rust-v1.sqlite3"
+        with closing(sqlite3.connect(outbox)) as db:
+            return db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+    def timer_sync(self):
+        self.run_collector(
+            "timer-sync", self.data / "connection", exe=self.record()["executable"]
+        )
+        return json.loads(self.run_collector("doctor").stdout)
+
     def test_install_yes_registers_nine_entries_beside_codegraph(self):
         out = self.install("--yes").stdout.decode()
         doc = json.loads(self.settings.read_bytes())
@@ -207,7 +269,10 @@ class InstallTest(unittest.TestCase):
         self.assertIn("Self-test passed", out)
         self.assertEqual(
             self.systemctl_log(),
-            ["--user daemon-reload", "--user enable --now devdiary-collector-sync.timer"],
+            [
+                "--user daemon-reload",
+                "--user enable --now devdiary-collector-sync.timer",
+            ],
         )
 
     def test_unit_files_snapshot(self):
@@ -220,10 +285,12 @@ class InstallTest(unittest.TestCase):
             "Nice=10\nNoNewPrivileges=true\n"
             f'ExecStart="{exe}" timer-sync "{self.data / "connection"}"\n',
         )
-        timer = (units / "devdiary-collector-sync.timer").read_text()
-        self.assertIn("\nOnUnitActiveSec=2min\n", timer)
-        self.assertIn("\nPersistent=true\n", timer)
-        self.assertIn("\nRandomizedDelaySec=30\n", timer)
+        self.assertEqual(
+            (units / "devdiary-collector-sync.timer").read_text(),
+            "[Unit]\nDescription=DevDiary collector sync every 2 minutes\n\n[Timer]\n"
+            "OnActiveSec=30s\nOnUnitActiveSec=2min\nRandomizedDelaySec=30\nPersistent=true\n"
+            "Unit=devdiary-collector-sync.service\n\n[Install]\nWantedBy=timers.target\n",
+        )
 
     def test_self_test_row_is_never_selected_by_sync(self):
         self.install("--yes")
@@ -249,9 +316,14 @@ class InstallTest(unittest.TestCase):
         )
         self.assertEqual(
             self.systemctl_log()[2:],
-            ["--user disable --now devdiary-collector-sync.timer", "--user daemon-reload"],
+            [
+                "--user disable --now devdiary-collector-sync.timer",
+                "--user daemon-reload",
+            ],
         )
-        self.assertFalse((self.config / "systemd/user/devdiary-collector-sync.timer").exists())
+        self.assertFalse(
+            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+        )
         log = self.systemctl_log()
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
@@ -275,9 +347,13 @@ class InstallTest(unittest.TestCase):
         entries = self.owned_entries()
         self.assertEqual(sum(len(v) for v in entries.values()), 9)
         self.assertNotEqual(entries["Stop"][0]["hooks"][0]["command"], before)
-        self.assertEqual(json.loads(self.settings.read_bytes())["hooks"]["UserPromptSubmit"][0], CODEGRAPH)
         self.assertEqual(
-            self.systemctl_log()[-1], "--user enable --now devdiary-collector-sync.timer"
+            json.loads(self.settings.read_bytes())["hooks"]["UserPromptSubmit"][0],
+            CODEGRAPH,
+        )
+        self.assertEqual(
+            self.systemctl_log()[-1],
+            "--user enable --now devdiary-collector-sync.timer",
         )
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
@@ -297,11 +373,162 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.data / "connection").exists())
         self.assertEqual(self.systemctl_log(), [])
 
-    def interactive(self, answer, edit=None):
+    def test_uninstall_without_a_user_bus_still_removes_the_hooks(self):
+        self.fake.write_text(NO_USER_BUS)
+        self.assertIn(b"timer_unavailable", self.install("--yes", code=2).stderr)
+        result = self.run_collector("uninstall", code=2)
+        self.assertIn(b"timer_unconfirmed", result.stderr)
+        self.assertNotIn(b"Hooks are registered", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertFalse(
+            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+        )
+        self.assertFalse((self.data / "install.json").exists())
+        self.assertIn(b"Not installed", self.run_collector("uninstall").stdout)
+
+    def test_upgrade_refused_by_the_settings_changes_nothing(self):
+        self.install("--yes")
+        doc = json.loads(self.settings.read_bytes())
+        doc["env"] = {"X": "observer_hook"}
+        edited = (json.dumps(doc, indent=2) + "\n").encode()
+        self.settings.write_bytes(edited)
+        log = self.systemctl_log()
+        result = self.run_collector("upgrade", "--yes", code=2)
+        self.assertIn(b"python_observer_registered", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), edited)
+        self.assertEqual(self.systemctl_log(), log)
+        self.assertTrue((self.data / "install.json").exists())
+
+    def test_upgrade_failing_after_removal_can_still_be_uninstalled(self):
+        self.install("--yes")
+        (self.data / "connection/connection.json").write_bytes(b"{}")
+        self.run_collector("upgrade", "--yes", code=2)
+        self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 0)
+        self.assertTrue(json.loads(self.run_collector("doctor").stdout)["installed"])
+        self.run_collector("uninstall")
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertIn(
+            "--user disable --now devdiary-collector-sync.timer", self.systemctl_log()
+        )
+        self.assertFalse(
+            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+        )
+
+    def test_uninstall_without_a_record_still_disables_leftover_units(self):
+        self.install("--yes")
+        (self.data / "install.json").unlink()
+        self.run_collector("uninstall")
+        self.assertIn(
+            "--user disable --now devdiary-collector-sync.timer", self.systemctl_log()
+        )
+        self.assertFalse(
+            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+        )
+        self.assertFalse(
+            (self.config / "systemd/user/devdiary-collector-sync.service").exists()
+        )
+
+    def test_install_without_a_settings_file_says_so(self):
+        self.settings.unlink()
+        result = self.install("--yes", code=2)
+        self.assertIn(b"settings_missing", result.stderr)
+        self.assertNotIn(b"Setup incomplete", result.stderr)
+        self.assertFalse(self.data.exists())
+
+    def test_install_refuses_a_relative_settings_path(self):
+        result = self.install("--yes", "--settings", "settings.json", code=2)
+        self.assertIn(b"unsupported_path", result.stderr)
+        self.assertNotIn(b"Setup incomplete", result.stderr)
+        self.assertFalse(self.data.exists())
+
+    def test_group_writable_settings_refuse_before_pairing(self):
+        self.settings.chmod(0o664)
+        result = self.install("--yes", code=2)
+        self.assertIn(b"unsafe_settings", result.stderr)
+        self.assertFalse(self.data.exists())
+
+    def test_python_observer_settings_refuse_before_pairing(self):
+        self.settings.write_bytes(
+            self.original.replace(b"codegraph hook prompt", b"observer_hook")
+        )
+        result = self.install("--yes", code=2)
+        self.assertIn(b"python_observer_registered", result.stderr)
+        self.assertFalse(self.data.exists())
+
+    def test_timer_sync_delivers_pending_rows_but_never_the_self_test(self):
+        self.install("--yes")
+        self.spool(3)
+        doctor = self.timer_sync()
+        self.assertEqual(len(self.received), 3)
+        self.assertEqual(doctor["pending"], 0)
+        self.assertIsNone(doctor["last_sync_error"])
+        self.assertFalse(any("selftest" in json.dumps(r) for r in self.received))
+
+    def test_timer_sync_sends_each_rejected_row_once_per_run(self):
+        self.install("--yes")
+        self.spool(120)
+        self.observation_status = 422
+        doctor = self.timer_sync()
+        self.assertEqual(len(self.received), 120)
+        self.assertEqual(doctor["pending"], 120)
+        self.assertEqual(doctor["last_sync_error"], "http_422")
+
+    def test_timer_sync_stops_on_the_first_server_error(self):
+        self.install("--yes")
+        self.spool(5)
+        self.observation_status = 503
+        doctor = self.timer_sync()
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(doctor["last_sync_error"], "http_503")
+
+    def test_timer_sync_stops_quietly_on_revocation(self):
+        self.install("--yes")
+        self.spool(5)
+        self.observation_status = 401
+        doctor = self.timer_sync()
+        self.assertEqual(len(self.received), 1)
+        self.assertTrue(doctor["revoked"])
+        self.timer_sync()
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(
+            json.loads(self.run_collector("doctor").stdout)["last_sync_error"],
+            "revoked",
+        )
+
+    def test_a_hook_event_with_the_self_test_prefix_never_reaches_the_outbox(self):
+        self.install("--yes")
+        self.spool(1)
+        record = self.record()
+        event = {
+            "hook_event_name": "SessionStart",
+            "session_id": "devdiary-selftest-x",
+            "cwd": str(self.root / "demo"),
+        }
+        subprocess.run(
+            [record["executable"], "claude-hook", record["plan"]],
+            input=json.dumps(event).encode(),
+            env=self.env(),
+            timeout=10,
+            check=True,
+        )
+        self.assertEqual((self.pending(), self.count("self_test")), (1, 2))
+
+    def test_uninstall_restores_a_compact_settings_file_byte_for_byte(self):
+        compact = json.dumps(
+            {"model": "opus", "hooks": {"UserPromptSubmit": [CODEGRAPH]}},
+            separators=(",", ":"),
+        ).encode()
+        self.settings.write_bytes(compact)
+        self.install("--yes")
+        self.run_collector("uninstall")
+        self.assertEqual(self.settings.read_bytes(), compact)
+
+    def interactive(self, answer, edit=None, args=None):
+        log, before = self.systemctl_log(), self.settings.read_bytes()
         master, slave = pty.openpty()
         self.addCleanup(os.close, master)
         process = subprocess.Popen(
-            self.install_args(),
+            args or self.install_args(),
             stdin=slave,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -315,8 +542,9 @@ class InstallTest(unittest.TestCase):
             if ready:
                 seen += os.read(process.stdout.fileno(), 4096)
         self.assertIn(b"[y/N]", seen)
-        self.assertEqual(self.systemctl_log(), [])
-        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.seen = seen
+        self.assertEqual(self.systemctl_log(), log)
+        self.assertEqual(self.settings.read_bytes(), before)
         if edit is not None:
             self.settings.write_bytes(edit)
         os.write(master, answer)
@@ -343,8 +571,20 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 9)
         self.assertEqual(
-            self.systemctl_log()[-1], "--user enable --now devdiary-collector-sync.timer"
+            self.systemctl_log()[-1],
+            "--user enable --now devdiary-collector-sync.timer",
         )
+
+    def test_upgrade_shows_the_new_entries_before_asking(self):
+        self.install("--yes")
+        before = self.settings.read_bytes()
+        log = self.systemctl_log()
+        code, err = self.interactive(b"n\n", args=[str(BIN), "upgrade"])
+        self.assertEqual(code, 2)
+        self.assertIn(b"consent_declined", err)
+        self.assertEqual(self.seen.count(b" claude-hook "), 9)
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertEqual(self.systemctl_log(), log)
 
 
 if __name__ == "__main__":

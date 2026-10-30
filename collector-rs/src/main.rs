@@ -14,17 +14,22 @@ const REPORTED: [&str; 5] = [
     "stale_plan",
     "repair_required",
 ];
-const INSTALL_REPORTED: [&str; 10] = [
+const INSTALL_REPORTED: [&str; 15] = [
     "consent_required",
     "consent_declined",
     "stale_plan",
     "invalid_settings",
+    "settings_missing",
     "already_installed",
     "not_installed",
     "timer_unavailable",
+    "timer_unconfirmed",
     "self_test_failed",
     "unsupported_path",
     "home_required",
+    "setup_incomplete",
+    "owned_entry_changed",
+    "owned_entry_missing",
 ];
 fn install_hint(code: &str) -> &'static str {
     match code {
@@ -40,8 +45,21 @@ fn install_hint(code: &str) -> &'static str {
         }
         "already_installed" => "Already installed. Use upgrade to re-register, or uninstall.",
         "not_installed" => "Not installed. Use install.",
+        "settings_missing" => {
+            "No Claude settings file at that path. Start Claude Code once, or pass --settings with an absolute path, then run install again."
+        }
         "timer_unavailable" => {
             "Hooks are registered but systemctl --user could not enable the timer. Run doctor."
+        }
+        "timer_unconfirmed" => {
+            "Hooks and timer unit files are removed, but systemctl --user could not confirm the timer stopped. In a user session run: systemctl --user disable --now devdiary-collector-sync.timer"
+        }
+        "unsupported_path" => {
+            "Use an absolute path without the characters \" \\ % or $, which systemd would reinterpret."
+        }
+        "setup_incomplete" => devdiary_collector::pairing::SETUP_INCOMPLETE,
+        "owned_entry_changed" | "owned_entry_missing" => {
+            "The collector's hook entries in the settings were edited, so the settings were left as they are. Restore or delete those entries, then run uninstall again."
         }
         _ => "",
     }
@@ -283,17 +301,13 @@ fn main() {
                 if !hint.is_empty() {
                     eprintln!("{hint}");
                 }
+            } else if lifecycle.contains(&command.as_str()) {
+                let known = devdiary_collector::pairing::known_diagnostic(error.as_ref());
+                eprintln!("collector_error");
+                eprintln!("{}", known.unwrap_or("Run doctor to inspect the install."));
             } else if matches!(
                 command.as_str(),
-                "setup"
-                    | "setup-plan"
-                    | "connection-status"
-                    | "connection-sync"
-                    | "install"
-                    | "upgrade"
-                    | "uninstall"
-                    | "doctor"
-                    | "timer-sync"
+                "setup" | "setup-plan" | "connection-status" | "connection-sync"
             ) {
                 eprintln!(
                     "{}",

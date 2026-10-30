@@ -309,7 +309,7 @@ fn atomic_replace(
 }
 
 /// Plan contains hashes/scope and ownership only, never a settings backup (which
-/// could contain provider secrets). Removal restores JSON semantics, not spacing.
+/// could contain provider secrets). Removal restores the layout `ordered` keeps.
 pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> {
     plan_for(state, settings_path, plan_path, &std::env::current_exe()?)
 }
@@ -359,28 +359,51 @@ pub fn plan_for(state: &Path, settings_path: &Path, plan_path: &Path, exe: &Path
 }
 fn registrable(settings_path: &Path) -> Result<(Vec<u8>, Object)> {
     let (raw, doc) = settings(settings_path)?;
-    if String::from_utf8_lossy(&raw).contains("observer_hook") {
+    refusal(&raw)?;
+    Ok((raw, doc))
+}
+fn refusal(raw: &[u8]) -> Result<()> {
+    if String::from_utf8_lossy(raw).contains("observer_hook") {
         return Err("python_observer_registered".into());
     }
     // Do not stack registrations or silently take over another Rust adapter.
-    if String::from_utf8_lossy(&raw).contains(" claude-hook ") {
+    if String::from_utf8_lossy(raw).contains(" claude-hook ") {
         return Err("already_registered".into());
     }
-    Ok((raw, doc))
+    Ok(())
+}
+fn preflight_code(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    match e.downcast_ref::<std::io::Error>() {
+        _ if e.is::<serde_json::Error>() => "invalid_settings".into(),
+        Some(io) if io.kind() == std::io::ErrorKind::NotFound => "settings_missing".into(),
+        _ => e,
+    }
 }
 /// The refusals `plan` would give for these settings, before anything is paired.
 pub fn preflight(settings_path: &Path) -> Result<()> {
-    registrable(settings_path).map(|_| ()).map_err(|e| {
-        if e.is::<serde_json::Error>() {
-            "invalid_settings".into()
-        } else {
-            e
-        }
-    })
+    registrable(settings_path)
+        .map(|_| ())
+        .map_err(preflight_code)
+}
+/// The refusals a fresh plan would give once `plan_path`'s entries are gone,
+/// checked before anything is removed.
+pub fn preflight_replacing(plan_path: &Path) -> Result<()> {
+    let p = load(plan_path)?;
+    let (raw, doc) = settings(Path::new(text(&p, "settings")?)).map_err(preflight_code)?;
+    if owned(&doc, &p["entry"]).is_err() {
+        return refusal(&raw);
+    }
+    refusal(&without(&p, &raw)?)
 }
 pub fn entries(plan_path: &Path) -> Result<Vec<String>> {
     let p = load(plan_path)?;
-    let command = p["entry"]["hooks"][0]["command"]
+    lines(&p["entry"])
+}
+pub fn entry_lines(plan_path: &Path, exe: &Path) -> Result<Vec<String>> {
+    lines(&entry(plan_path, exe.to_str().ok_or("invalid_path")?)?)
+}
+fn lines(entry: &Value) -> Result<Vec<String>> {
+    let command = entry["hooks"][0]["command"]
         .as_str()
         .ok_or("invalid_entry")?;
     Ok(EVENTS.iter().map(|e| format!("{e}: {command}")).collect())
@@ -654,11 +677,23 @@ pub fn remove(plan_path: &Path) -> Result<()> {
     }
     // Removal must remain possible after executable upgrades or spool failure.
     owned(&doc, &p["entry"])?;
+    let bytes = without(&p, &raw)?;
+    m.insert("status".into(), json!("removing"));
+    m.insert("removed_sha256".into(), json!(hash(&bytes)));
+    save_manifest(plan_path, &m)?;
+    checkpoint("removing")?;
+    replace(path, &bytes, &raw)?;
+    checkpoint("removed_settings")?;
+    m.insert("status".into(), json!("removed"));
+    save_manifest(plan_path, &m)?;
+    checkpoint("removed")
+}
+fn without(p: &Object, raw: &[u8]) -> Result<Vec<u8>> {
     let absent = p
         .get("absent_events")
         .and_then(Value::as_array)
         .ok_or("invalid_plan")?;
-    let mut ordered = ordered::parse(&raw)?;
+    let mut ordered = ordered::parse(raw)?;
     let hooks = ordered.get_mut("hooks").ok_or("invalid_hooks")?;
     for event in EVENTS {
         let Some(Json::Array(items)) = hooks.get_mut(event) else {
@@ -672,16 +707,7 @@ pub fn remove(plan_path: &Path) -> Result<()> {
     if hooks.is_empty_container() && p.get("absent_hooks") == Some(&Value::Bool(true)) {
         ordered.remove("hooks");
     }
-    let bytes = ordered::render(&ordered, &raw)?;
-    m.insert("status".into(), json!("removing"));
-    m.insert("removed_sha256".into(), json!(hash(&bytes)));
-    save_manifest(plan_path, &m)?;
-    checkpoint("removing")?;
-    replace(path, &bytes, &raw)?;
-    checkpoint("removed_settings")?;
-    m.insert("status".into(), json!("removed"));
-    save_manifest(plan_path, &m)?;
-    checkpoint("removed")
+    ordered::render(&ordered, raw)
 }
 
 const HOOK_FIELDS: [&str; 11] = [

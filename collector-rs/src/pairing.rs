@@ -648,8 +648,12 @@ pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     );
     Ok(())
 }
+pub const SETUP_INCOMPLETE: &str = "Setup incomplete. No secret is recoverable from a consumed exchange. Inspect/revoke unused browser connections before --new-pair. Existing saved credentials/outboxes are never retargeted.";
 pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
-    match error.to_string().as_str() {
+    known_diagnostic(error).unwrap_or(SETUP_INCOMPLETE)
+}
+pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
+    Some(match error.to_string().as_str() {
         "choose_remote" => {
             "Multiple or missing GitHub remotes: choose explicitly with --remote NAME."
         }
@@ -683,10 +687,8 @@ pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
         "approved_scope_mismatch" => {
             "Approved scope does not match this installation and local repository. Revoke the unused browser connection, then --new-pair; hooks unchanged."
         }
-        _ => {
-            "Setup incomplete. No secret is recoverable from a consumed exchange. Inspect/revoke unused browser connections before --new-pair. Existing saved credentials/outboxes are never retargeted."
-        }
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

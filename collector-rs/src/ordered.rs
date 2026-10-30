@@ -1,5 +1,6 @@
-//! Customer settings keep their key order and indentation through apply and
-//! removal, so removal can restore the original bytes, not only the JSON value.
+//! Customer settings keep their key order and layout through apply and removal,
+//! so removal restores the original bytes of compact and pretty documents.
+//! String escapes and number spellings are re-rendered.
 use crate::Result;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -167,10 +168,30 @@ pub(crate) fn parse(raw: &[u8]) -> Result<Json> {
     Ok(serde_json::from_slice(raw)?)
 }
 
-/// Renders with the indentation and trailing newline of `like`.
+/// Renders in the layout of `like`: compact when it is one line, otherwise
+/// pretty with its indentation, line endings and trailing newline.
 pub(crate) fn render(doc: &Json, like: &[u8]) -> Result<Vec<u8>> {
-    let indent: Vec<u8> = like
-        .iter()
+    let crlf = like.windows(2).any(|w| w == b"\r\n");
+    let body = like.strip_suffix(b"\n").unwrap_or(like);
+    let body = body.strip_suffix(b"\r").unwrap_or(body);
+    let mut out = if body.contains(&b'\n') {
+        pretty(doc, &indent(like))?
+    } else {
+        serde_json::to_vec(doc)?
+    };
+    if crlf {
+        out = out
+            .split(|b| *b == b'\n')
+            .collect::<Vec<_>>()
+            .join(&b"\r\n"[..]);
+    }
+    if like.ends_with(b"\n") {
+        out.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+    }
+    Ok(out)
+}
+fn indent(like: &[u8]) -> Vec<u8> {
+    like.iter()
         .position(|b| *b == b'\n')
         .map(|start| {
             like[start + 1..]
@@ -180,16 +201,15 @@ pub(crate) fn render(doc: &Json, like: &[u8]) -> Result<Vec<u8>> {
                 .collect()
         })
         .filter(|i: &Vec<u8>| !i.is_empty())
-        .unwrap_or_else(|| b"  ".to_vec());
+        .unwrap_or_else(|| b"  ".to_vec())
+}
+fn pretty(doc: &Json, indent: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(
         &mut out,
-        serde_json::ser::PrettyFormatter::with_indent(&indent),
+        serde_json::ser::PrettyFormatter::with_indent(indent),
     );
     doc.serialize(&mut ser)?;
-    if like.ends_with(b"\n") {
-        out.push(b'\n');
-    }
     Ok(out)
 }
 
@@ -202,6 +222,21 @@ mod tests {
         for raw in [
             "{\n  \"z\": 1,\n  \"a\": {\n    \"y\": [\n      true,\n      null,\n      \"s\"\n    ],\n    \"b\": {}\n  },\n  \"e\": []\n}\n",
             "{\n\t\"z\": -2.5\n}",
+        ] {
+            let doc = parse(raw.as_bytes()).unwrap();
+            assert_eq!(
+                String::from_utf8(render(&doc, raw.as_bytes()).unwrap()).unwrap(),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn compact_and_crlf_documents_round_trip_byte_for_byte() {
+        for raw in [
+            "{\"model\":\"opus\",\"hooks\":{\"Stop\":[]}}",
+            "{\"model\":\"opus\"}\n",
+            "{\r\n  \"a\": [\r\n    1\r\n  ]\r\n}\r\n",
         ] {
             let doc = parse(raw.as_bytes()).unwrap();
             assert_eq!(

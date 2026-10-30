@@ -604,6 +604,8 @@ pub(crate) struct Report {
     pub attempted: usize,
     /// The failure code that stopped the batch: auth, 429, 5xx or network.
     pub stopped: Option<String>,
+    pub refused: usize,
+    pub refusal: Option<String>,
 }
 pub(crate) fn sync_report(
     state: &Path,
@@ -649,6 +651,8 @@ pub(crate) fn sync_report(
     }
     let mut attempted = 0;
     let mut stopped = None;
+    let mut refused = 0;
+    let mut refusal = None;
     for (seq, payload) in store.batch(limit)? {
         attempted += 1;
         // Autocommit FULL before any HTTP. Lost response or process death cannot
@@ -678,6 +682,8 @@ pub(crate) fn sync_report(
                     stopped = Some(failure.code);
                     break;
                 }
+                refused += 1;
+                refusal = Some(failure.code);
             }
         }
     }
@@ -688,6 +694,8 @@ pub(crate) fn sync_report(
         delivered,
         attempted,
         stopped,
+        refused,
+        refusal,
     })
 }
 // A refresh that fails for any reason but revocation or a server-requested

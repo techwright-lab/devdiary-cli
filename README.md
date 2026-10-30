@@ -223,9 +223,10 @@ devdiary-collector uninstall
 `install` does these steps in order, and stops at the first failure:
 
 1. Refuses at once (`consent_required`) when stdin is not a terminal and `--yes`
-   is absent, and refuses settings that are not valid JSON (`invalid_settings`),
-   already hold a collector hook or register the Python observer. Nothing is
-   paired or changed.
+   is absent, and refuses a relative `--settings` path (`unsupported_path`), a
+   missing settings file (`settings_missing`), settings that are not valid JSON
+   (`invalid_settings`), already hold a collector hook or register the Python
+   observer. Nothing is paired or changed.
 2. `setup` without a repository into `~/.local/share/devdiary/collector/connection`
    (`$XDG_DATA_HOME` when set). `--origin` is an explicit origin choice and counts
    as `--trust-origin`.
@@ -245,22 +246,33 @@ devdiary-collector uninstall
    `self_test` table, which sync never reads; the outbox refuses such ids.
 
 `timer-sync` runs `connection-sync DIR 100` at most 10 times and stops at the first
-batch that a 401/403, 429, 5xx or network failure stops, or when no full batch is
-left. Server refusals end the run with exit 0 and are kept for `doctor` as
-`last_sync_error`; local failures fail the unit.
+batch that a 401/403, 429, 5xx or network failure stops, when no full batch is
+left, or once it has visited every row that was pending when it started. Rows the
+server rejects (other 4xx, invalid receipts) stay pending and are sent at most once
+per run. Server refusals and rejections end the run with exit 0 and are kept for
+`doctor` as `last_sync_error` (for example `http_422`); local failures fail the
+unit.
 
 `doctor` prints the registration state, `systemctl --user is-enabled/is-active` for
 the timer, pending and delivered counts, drops, the last receipt and
-`last_sync_error`. `upgrade` asks once, copies the running binary, removes the old
-registration and installs a fresh plan. `uninstall` disables and deletes the timer
-units, then runs `claude-remove`; a second `uninstall` is a no-op. The connection
+`last_sync_error`. `upgrade` first checks that the settings would accept a fresh
+plan once the old entries are gone, prints the 9 new entries and asks once; only
+then does it remove the old registration and install the fresh plan. The install
+record is replaced only on success, so after a failed upgrade `uninstall` still
+finds and disables the timer. `uninstall` disables and deletes the timer units,
+then runs `claude-remove`. Without a user systemd bus it still deletes the unit
+files and removes the hooks, then exits 2 with `timer_unconfirmed`. Leftover units
+without an install record are also disabled and deleted. A second `uninstall` is a
+no-op. Settings keep their layout: compact and pretty-printed files are restored
+byte for byte. The connection
 and any pending rows stay; revoke the connection in the browser to retire the
 credential. Headless machines need `loginctl enable-linger` for the timer to run
 while logged out.
 
 Verification: `python3 collector-rs/tests/install_test.py -v` (temp HOME, a mock
 pairing/ingest server and a fake systemctl; debug builds only honour
-`DEVDIARY_COLLECTOR_SYSTEMCTL`, release builds always run `/usr/bin/systemctl`).
+`DEVDIARY_COLLECTOR_SYSTEMCTL`; release builds run the first of `/usr/bin/systemctl`,
+`/bin/systemctl` and `/run/current-system/sw/bin/systemctl`, never a `PATH` lookup).
 
 ## Rust Claude raw-hook adapter: Linux fixture-qualified only
 

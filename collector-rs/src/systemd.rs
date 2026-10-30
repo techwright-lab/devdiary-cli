@@ -17,12 +17,13 @@ pub trait Runner {
 pub struct Systemctl;
 impl Runner for Systemctl {
     fn run(&self, args: &[&str]) -> Result<(bool, String)> {
-        let output = Command::new(program())
+        let output = Command::new(program().ok_or("timer_unavailable")?)
             .arg("--user")
             .args(args)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
-            .output()?;
+            .output()
+            .map_err(|_| "timer_unavailable")?;
         let mut stdout = output.stdout;
         stdout.truncate(4096);
         Ok((
@@ -31,12 +32,18 @@ impl Runner for Systemctl {
         ))
     }
 }
-// Release builds always run the system binary; only test builds take a fake.
-fn program() -> PathBuf {
+// Release builds take systemctl only from fixed system paths, never from PATH;
+// only test builds take a fake.
+const SYSTEMCTL: [&str; 3] = [
+    "/usr/bin/systemctl",
+    "/bin/systemctl",
+    "/run/current-system/sw/bin/systemctl",
+];
+fn program() -> Option<PathBuf> {
     let fake = std::env::var_os("DEVDIARY_COLLECTOR_SYSTEMCTL")
         .map(PathBuf::from)
         .filter(|p| cfg!(debug_assertions) && p.is_absolute());
-    fake.unwrap_or_else(|| PathBuf::from("/usr/bin/systemctl"))
+    fake.or_else(|| SYSTEMCTL.iter().map(PathBuf::from).find(|p| p.is_file()))
 }
 
 pub fn unit_dir() -> Result<PathBuf> {
@@ -102,19 +109,23 @@ pub fn enable(runner: &dyn Runner, dir: &Path, exe: &Path, connection: &Path) ->
     check(runner, &["daemon-reload"])?;
     check(runner, &["enable", "--now", TIMER])
 }
-/// Returns false when no timer unit was installed.
+/// Returns false when no timer unit was installed. The unit files go even when
+/// systemctl fails, so nothing restarts the timer at the next login.
 pub fn disable(runner: &dyn Runner, dir: &Path) -> Result<bool> {
     if !dir.join(TIMER).exists() && !dir.join(SERVICE).exists() {
         return Ok(false);
     }
-    check(runner, &["disable", "--now", TIMER])?;
+    let stopped = check(runner, &["disable", "--now", TIMER]);
     for name in [TIMER, SERVICE] {
         match fs::remove_file(dir.join(name)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
     }
-    check(runner, &["daemon-reload"])?;
+    let reloaded = check(runner, &["daemon-reload"]);
+    if stopped.is_err() || reloaded.is_err() {
+        return Err("timer_unconfirmed".into());
+    }
     Ok(true)
 }
 pub fn state(runner: &dyn Runner) -> serde_json::Value {
@@ -169,6 +180,25 @@ mod tests {
             self.0.borrow_mut().push(args.join(" "));
             Ok((true, "enabled\n".into()))
         }
+    }
+
+    struct NoBus;
+    impl Runner for NoBus {
+        fn run(&self, _: &[&str]) -> crate::Result<(bool, String)> {
+            Err("timer_unavailable".into())
+        }
+    }
+
+    #[test]
+    fn disable_without_a_user_bus_still_removes_the_units() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [SERVICE, TIMER] {
+            fs::write(dir.path().join(name), "").unwrap();
+        }
+        let error = disable(&NoBus, dir.path()).unwrap_err();
+        assert_eq!(error.to_string(), "timer_unconfirmed");
+        assert!(!dir.path().join(SERVICE).exists() && !dir.path().join(TIMER).exists());
+        assert!(!disable(&NoBus, dir.path()).unwrap());
     }
 
     #[test]
