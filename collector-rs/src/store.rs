@@ -26,7 +26,9 @@ const SCHEMA: &str = "
 const ADDED_TABLES: &str = "
     CREATE TABLE delivered (observation_id TEXT PRIMARY KEY, digest BLOB NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TABLE drops (reason TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at INTEGER NOT NULL) WITHOUT ROWID;";
-const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INTEGER PRIMARY KEY CHECK(singleton=1), inode INTEGER NOT NULL);";
+const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INTEGER PRIMARY KEY CHECK(singleton=1), inode INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS self_test (session_id TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;";
+const SELF_TESTS: i64 = 10;
 const MARKS_TABLE: &str = "CREATE TABLE IF NOT EXISTS bracket_marks (session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, checkout_key TEXT NOT NULL, offset INTEGER NOT NULL, ino INTEGER NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, PRIMARY KEY(session_id, tool_use_id)) WITHOUT ROWID;";
 const MARK_TTL_NANOS: i64 = 6 * 3_600_000_000_000;
 const MAX_MARKS: i64 = 256;
@@ -222,6 +224,9 @@ impl Store {
     pub fn collect(&mut self, raw: &[u8]) -> Result<()> {
         let payload = freeze(raw, &self.config)?;
         let parsed = crate::object(&payload)?;
+        if crate::text(&parsed, "session_id")?.starts_with(crate::claude::SELF_TEST) {
+            return Err("reserved_session".into());
+        }
         let id = parsed["observation_id"].as_str().ok_or("invalid_id")?;
         let tx = self
             .db
@@ -268,6 +273,32 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+    pub fn self_test(&mut self, session: &str) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO self_test(session_id,at) VALUES(?,?)",
+            params![session, now()?],
+        )?;
+        tx.execute(
+            "DELETE FROM self_test WHERE session_id IN (SELECT session_id FROM self_test ORDER BY at DESC LIMIT -1 OFFSET ?)",
+            [SELF_TESTS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn self_tested(&self, session: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT 1 FROM self_test WHERE session_id=?",
+                [session],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
     // A repeated PreToolUse keeps the first offset, so the bracket never shrinks.
     pub fn open_bracket(&self, bracket: &Bracket, mark: Mark, at: i64) -> Result<()> {
@@ -565,6 +596,21 @@ pub(crate) fn sync_key(
     limit: usize,
     revoked: Option<&Path>,
 ) -> Result<(i64, i64)> {
+    sync_report(state, key, limit, revoked).map(|r| (r.pending, r.delivered))
+}
+pub(crate) struct Report {
+    pub pending: i64,
+    pub delivered: i64,
+    pub attempted: usize,
+    /// The failure code that stopped the batch: auth, 429, 5xx or network.
+    pub stopped: Option<String>,
+}
+pub(crate) fn sync_report(
+    state: &Path,
+    key: &str,
+    limit: usize,
+    revoked: Option<&Path>,
+) -> Result<Report> {
     if !(1..=100).contains(&limit) {
         return Err("invalid_limit".into());
     }
@@ -601,7 +647,10 @@ pub(crate) fn sync_key(
     if crate::installation(&store.config) {
         refresh_refs(&client, &store, state, key, revoked)?;
     }
+    let mut attempted = 0;
+    let mut stopped = None;
     for (seq, payload) in store.batch(limit)? {
+        attempted += 1;
         // Autocommit FULL before any HTTP. Lost response or process death cannot
         // erase frozen bytes or pin the next invocation to a poison row.
         store
@@ -626,13 +675,20 @@ pub(crate) fn sync_key(
                     create_private(marker)?;
                 }
                 if failure.stop {
+                    stopped = Some(failure.code);
                     break;
                 }
             }
         }
     }
     store.compact()?;
-    store.counts()
+    let (pending, delivered) = store.counts()?;
+    Ok(Report {
+        pending,
+        delivered,
+        attempted,
+        stopped,
+    })
 }
 // A refresh that fails for any reason but revocation or a server-requested
 // wait keeps the last good list; delivery of spooled rows still proceeds.

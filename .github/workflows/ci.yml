@@ -59,6 +59,8 @@ jobs:
         run: |
           python3 collector-rs/tests/pairing.py -v
           python3 collector-rs/tests/pairing_rails_test.py -v
+      - name: One-command install, timer units and uninstall (fake systemctl)
+        run: python3 collector-rs/tests/install_test.py -v
       - name: Qualification harness control-flow fixtures (no provider calls)
         run: python3 collector-rs/tests/qualification_test.py -v
       - name: Dependency advisories

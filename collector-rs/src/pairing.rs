@@ -259,6 +259,7 @@ pub struct Options<'a> {
     pub browser: bool,
     pub new_pair: bool,
     pub record_orchestrated_outside_repos: bool,
+    pub next_steps: bool,
 }
 enum Target {
     Repository { path: String, reference: String },
@@ -565,6 +566,10 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         .map_err(|_| "repair_new_pair")?;
         // If interrupted here, setup reuses the committed connection, never exchanges again.
         initialize(o.root, saved.as_object().ok_or("invalid_connection")?)?;
+        if !o.next_steps {
+            println!("Connection saved privately.");
+            return Ok(());
+        }
         println!(
             "Connection saved privately. Hooks remain unchanged. Next: setup-plan CONNECTION_DIR SETTINGS NEW_PLAN, review the plan, then claude-apply NEW_PLAN --consent. Host trust and managed policy remain controlled by Claude; runtime coverage is unverified."
         );
@@ -580,6 +585,9 @@ pub(crate) fn revoked(state: &Path) -> bool {
         })
 }
 pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
+    plan_with(root, settings, plan, &std::env::current_exe()?)
+}
+pub fn plan_with(root: &Path, settings: &Path, plan: &Path, exe: &Path) -> Result<()> {
     let doc = connection(root)?;
     let config = doc["scope"].as_object().ok_or("invalid_connection")?;
     // Revalidate current local remotes at registration, not only at approval.
@@ -592,7 +600,7 @@ pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
         }
     }
     initialize(root, &doc)?;
-    crate::claude::plan(&root.join("outbox"), settings, plan)?;
+    crate::claude::plan_for(&root.join("outbox"), settings, plan, exe)?;
     println!(
         "Plan saved, settings unchanged. Metadata-only Claude lifecycle/tool IDs; no prompts, transcripts or tool contents; unknown actor. Review NEW_PLAN before claude-apply NEW_PLAN --consent. Browser approval is not local hook consent or host trust. Managed policy may block hooks; no policy-absence claim is made."
     );
@@ -602,6 +610,16 @@ pub fn sync(root: &Path, limit: usize) -> Result<(i64, i64)> {
     let doc = connection(root)?;
     initialize(root, &doc)?;
     crate::store::sync_key(
+        &root.join("outbox"),
+        text(&doc, "token")?,
+        limit,
+        Some(&root.join("revoked")),
+    )
+}
+pub(crate) fn sync_report(root: &Path, limit: usize) -> Result<crate::store::Report> {
+    let doc = connection(root)?;
+    initialize(root, &doc)?;
+    crate::store::sync_report(
         &root.join("outbox"),
         text(&doc, "token")?,
         limit,
