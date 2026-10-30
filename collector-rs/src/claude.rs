@@ -2,7 +2,9 @@
 //! Registration uses an atomic settings replacement and a private hash-only
 //! receipt binding the validated plan. Crashes leave all hooks or none installed.
 use crate::{
-    MAX_HOOK_INPUT, Object, Result, drops, object,
+    MAX_HOOK_INPUT, Object, Result,
+    checkout::{self, Checkout},
+    drops, object,
     store::{FINGERPRINT, SETTINGS_LOCK, Store, create_private, owner_writable, private},
     text, token,
 };
@@ -324,9 +326,11 @@ pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> 
         return Err("python_observer_registered".into());
     }
     let store = Store::open(state, None)?;
-    let repo = Path::new(text(&store.config, "repository")?);
-    if !repo.is_dir() || fs::canonicalize(repo)? != repo {
-        return Err("canonical_repository_required".into());
+    if !crate::installation(&store.config) {
+        let repo = Path::new(text(&store.config, "repository")?);
+        if !repo.is_dir() || fs::canonicalize(repo)? != repo {
+            return Err("canonical_repository_required".into());
+        }
     }
     let exe = std::env::current_exe()?;
     let (current, digest) = executable(&exe)?;
@@ -706,24 +710,108 @@ fn fields(raw: &[u8]) -> Result<Object> {
     }
     Ok(data)
 }
-fn normalize(data: &Object, config: &Object) -> Result<Vec<u8>> {
+fn within_repository(cwd: &Path, config: &Object) -> Result<()> {
+    let repository = Path::new(text(config, "repository")?);
+    if !repository.is_dir()
+        || !cwd.is_dir()
+        || fs::canonicalize(repository)? != repository
+        || !fs::canonicalize(cwd)?.starts_with(repository)
+    {
+        return Err("outside_scope".into());
+    }
+    Ok(())
+}
+const PAPERCLIP: [(&str, &str); 3] = [
+    ("orchestrator_agent_ref", "PAPERCLIP_AGENT_ID"),
+    ("orchestrator_run_ref", "PAPERCLIP_RUN_ID"),
+    ("orchestrator_task_ref", "PAPERCLIP_TASK_ID"),
+];
+const WORKSPACE_HINTS: [&str; 2] = [
+    "PAPERCLIP_WORKSPACE_WORKTREE_PATH",
+    "PAPERCLIP_WORKSPACE_CWD",
+];
+// Any Paperclip id, even malformed, marks the run orchestrated: reporting
+// 'none' would let the server bind someone else's run to the machine owner.
+fn orchestrator() -> Object {
+    let mut out = Object::new();
+    let mut paperclip = false;
+    for (field, name) in PAPERCLIP {
+        match std::env::var(name) {
+            Ok(value) => {
+                paperclip = true;
+                let value = value.to_ascii_lowercase();
+                if crate::is_uuid(&value) {
+                    out.insert(field.into(), value.into());
+                }
+            }
+            Err(std::env::VarError::NotUnicode(_)) => paperclip = true,
+            Err(std::env::VarError::NotPresent) => {}
+        }
+    }
+    out.insert(
+        "orchestrator".into(),
+        if paperclip { "paperclip" } else { "none" }.into(),
+    );
+    out
+}
+fn workspace_checkout(cwd: &Path, paperclip: bool) -> Checkout {
+    let found = checkout::resolve(cwd);
+    if found != Checkout::Absent || !paperclip {
+        return found;
+    }
+    WORKSPACE_HINTS
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .filter(|hint| hint.len() <= 4096 && Path::new(hint).is_absolute())
+        .map(|hint| checkout::resolve(Path::new(&hint)))
+        .find(|c| *c != Checkout::Absent)
+        .unwrap_or(Checkout::Absent)
+}
+// The stamped ref is the server's spelling; GitHub names are case-insensitive.
+fn locate(cwd: &Path, config: &Object, state: &Path, paperclip: bool) -> Result<Option<String>> {
+    match workspace_checkout(cwd, paperclip) {
+        Checkout::Repository(found) => crate::store::read_refs(state)?
+            .into_iter()
+            .find(|r| r.eq_ignore_ascii_case(&found))
+            .map(Some)
+            .ok_or_else(|| "unknown_repository".into()),
+        Checkout::Unresolved => Err("unknown_repository".into()),
+        Checkout::Absent
+            if paperclip
+                && crate::wire_version(config) == 2
+                && config["record_orchestrated_outside_repos"] == json!(true) =>
+        {
+            Ok(None)
+        }
+        Checkout::Absent => Err("outside_scope".into()),
+    }
+}
+fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<Object> {
+    if !crate::installation(config) {
+        within_repository(cwd, config)?;
+        return object(&serde_json::to_vec(
+            &json!({"schema_version": 1, "repository": config["repository"]}),
+        )?);
+    }
+    let mut row = orchestrator();
+    let paperclip = row["orchestrator"] == json!("paperclip");
+    if let Some(reference) = locate(cwd, config, state, paperclip)? {
+        row.insert("repository_ref".into(), reference.into());
+    }
+    row.insert("schema_version".into(), crate::wire_version(config).into());
+    Ok(row)
+}
+fn normalize(data: &Object, config: &Object, state: &Path) -> Result<Vec<u8>> {
     let event = text(data, "hook_event_name")?;
     let session = text(data, "session_id")?;
     let cwd = text(data, "cwd")?;
     if cwd.len() > 4096 || !Path::new(cwd).is_absolute() {
         return Err("invalid_cwd".into());
     }
-    let repository = Path::new(text(config, "repository")?);
-    if !repository.is_dir()
-        || !Path::new(cwd).is_dir()
-        || fs::canonicalize(repository)? != repository
-        || !fs::canonicalize(cwd)?.starts_with(repository)
-    {
-        return Err("outside_scope".into());
+    let mut out = scoped_row(Path::new(cwd), config, state)?;
+    for (key, value) in json!({"installation_id": config["installation_id"], "runtime": "claude-code", "session_id": session, "event": event, "actor_ref": null, "attribution_basis": "unknown", "observed_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()}).as_object().ok_or("invalid_metadata")? {
+        out.insert(key.clone(), value.clone());
     }
-    let mut out = object(&serde_json::to_vec(
-        &json!({"schema_version": 1, "installation_id": config["installation_id"], "runtime": "claude-code", "session_id": session, "event": event, "repository": config["repository"], "actor_ref": null, "attribution_basis": "unknown", "observed_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()}),
-    )?)?;
     for key in ["prompt_id", "tool_use_id", "agent_id", "agent_type"] {
         if let Some(value) = data.get(key) {
             if !value.as_str().is_some_and(token) {
@@ -814,6 +902,7 @@ fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
     }
     match error.to_string().as_str() {
         "outside_scope" => "outside_scope",
+        "unknown_repository" => "unknown_repository",
         "spool_full" => "spool_full",
         "observation_conflict" => "observation_conflict",
         "revoked" => "revoked",
@@ -865,7 +954,7 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
         .get("scope")
         .and_then(Value::as_object)
         .ok_or("invalid_scope")?;
-    let normalized = normalize(data, scope)?;
+    let normalized = normalize(data, scope, state)?;
     trusted_executable(p, state)?;
     let _lock = lock(state, true)?;
     active(plan_path, p)?;

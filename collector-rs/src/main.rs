@@ -31,17 +31,19 @@ fn input(limit: usize) -> Result<Vec<u8>> {
 }
 fn run() -> Result<i32> {
     let args: Vec<_> = std::env::args().collect();
-    if args.get(1).is_some_and(|s| s == "setup") && args.len() >= 4 {
+    if args.get(1).is_some_and(|s| s == "setup") && args.len() >= 3 {
+        let repository = args.get(3).filter(|a| !a.starts_with("--"));
         let mut options = devdiary_collector::pairing::Options {
             root: Path::new(&args[2]),
-            repository: Path::new(&args[3]),
+            repository: repository.map(Path::new),
             remote: None,
             origin: devdiary_collector::pairing::DEFAULT_ORIGIN,
             trust_origin: false,
             browser: true,
             new_pair: false,
+            record_orchestrated_outside_repos: false,
         };
-        let mut i = 4;
+        let mut i = if repository.is_some() { 4 } else { 3 };
         let mut seen = std::collections::HashSet::new();
         while i < args.len() {
             if !seen.insert(args[i].as_str()) {
@@ -59,6 +61,9 @@ fn run() -> Result<i32> {
                 "--trust-origin" => options.trust_origin = true,
                 "--no-browser" => options.browser = false,
                 "--new-pair" => options.new_pair = true,
+                "--record-orchestrated-outside-repos" => {
+                    options.record_orchestrated_outside_repos = true
+                }
                 _ => return Err("invalid_command".into()),
             }
             i += 1;
@@ -89,7 +94,7 @@ fn run() -> Result<i32> {
     }
     if args.len() == 2 && args[1] == "--help" {
         println!(
-            "setup PRIVATE_CONNECTION_DIR REPOSITORY [--remote NAME] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
+            "setup PRIVATE_CONNECTION_DIR [REPOSITORY [--remote NAME]] [--record-orchestrated-outside-repos] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\n  Without REPOSITORY the connection covers every active repository of the workspace (installation scope).\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
         );
         println!(
             "Experimental Linux collector; Claude adapter runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nrepair STATE (migrates an older spool; pending rows keep their bytes)\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."

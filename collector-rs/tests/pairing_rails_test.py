@@ -4,8 +4,10 @@ import contextlib
 import email.utils
 import io
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -248,6 +250,249 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
         self.status = 403
         self.run_collector("connection-sync", self.connection, "10", code=1)
         self.assertTrue((self.connection / "revoked").exists())
+
+
+COLLECTOR_REF = "urn:devdiary:collector:" + "1" * 8 + "-1111-4111-8111-" + "1" * 12
+
+
+class InstallationPairingTest(unittest.TestCase):
+    """Real binary pairs an installation scope against a fake pairing server."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="installation-pairing-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.exe = self.root / "collector"
+        shutil.copyfile(BIN, self.exe)
+        self.exe.chmod(0o700)
+        self.starts, self.scope_status = [], 200
+        self.connection_shape = {}
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, body):
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                self.reply(
+                    owner.scope_status,
+                    {
+                        "schema_version": 1,
+                        "collector_ref": COLLECTOR_REF,
+                        "scope_kind": "installation",
+                        "repository_refs": ["https://github.com/acme/later"],
+                        "observation_schema_versions": [1, 2],
+                    },
+                )
+
+            def do_POST(self):
+                sent = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.endswith("/exchange"):
+                    connection = {
+                        "collector_ref": COLLECTOR_REF,
+                        "token": "dc_live_" + "s" * 43,
+                        "installation_id": owner.starts[-1]["installation_id"],
+                        "runtime": "claude-code",
+                        "endpoint_path": "/ingest/v1/observations",
+                        "scope_kind": "installation",
+                        "repository_refs": ["https://github.com/acme/demo"],
+                        "scope_path": "/ingest/v1/collector/scope",
+                        "observation_schema_versions": [1, 2],
+                        **owner.connection_shape,
+                    }
+                    connection = {k: v for k, v in connection.items() if v is not None}
+                    return self.reply(
+                        200,
+                        {
+                            "schema_version": 1,
+                            "status": "consumed",
+                            "connection": connection,
+                        },
+                    )
+                owner.starts.append(sent)
+                self.reply(
+                    201,
+                    {
+                        "schema_version": 1,
+                        "pairing_token": "dp_pair_" + "p" * 43,
+                        "user_code": "a" * 32,
+                        "verification_path": "/phoenix/settings/collector",
+                        "interval": 5,
+                        "expires_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60)
+                        ),
+                    },
+                )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.origin = f"http://127.0.0.1:{server.server_port}"
+        self.connection = self.root / "connection"
+
+    def run_collector(self, *args, code=0):
+        result = subprocess.run(
+            [str(self.exe), *map(str, args)],
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, code, result.stderr)
+        self.assertNotIn(b"dc_live_", result.stdout + result.stderr)
+        return result
+
+    def setup_collector(self, *extra, code=0):
+        return self.run_collector(
+            "setup",
+            self.connection,
+            "--origin",
+            self.origin,
+            "--trust-origin",
+            "--no-browser",
+            *extra,
+            code=code,
+        )
+
+    def test_setup_without_repository_pairs_installation_scope(self):
+        out = self.setup_collector("--record-orchestrated-outside-repos").stdout
+        self.assertIn(b"All active repositories", out)
+        (start,) = self.starts
+        self.assertEqual(start["scope_kind"], "installation")
+        self.assertEqual(
+            set(start), {"schema_version", "installation_id", "runtime", "scope_kind"}
+        )
+        saved = json.loads((self.connection / "connection.json").read_bytes())
+        self.assertEqual(saved["repository_refs"], ["https://github.com/acme/demo"])
+        self.assertEqual(
+            saved["scope"],
+            {
+                "endpoint": self.origin + "/ingest/v1/observations",
+                "collector_ref": COLLECTOR_REF,
+                "installation_id": start["installation_id"],
+                "scope_kind": "installation",
+                "observation_schema_versions": [1, 2],
+                "record_orchestrated_outside_repos": True,
+            },
+        )
+        refs = self.connection / "outbox/repository-refs.json"
+        self.assertEqual(
+            json.loads(refs.read_bytes()), ["https://github.com/acme/demo"]
+        )
+        self.assertEqual(refs.stat().st_mode & 0o777, 0o600)
+        health = json.loads(
+            self.run_collector("connection-status", self.connection).stdout
+        )
+        self.assertEqual(health["local_repository_refs"], 1)
+        self.setup_collector("--record-orchestrated-outside-repos")
+        self.setup_collector(code=2)
+        settings, plan = self.root / "settings.json", self.root / "plan.json"
+        settings.write_text("{}")
+        settings.chmod(0o600)
+        self.run_collector("setup-plan", self.connection, settings, plan)
+
+    def test_sync_refreshes_refs_and_a_revoked_scope_read_stops(self):
+        self.setup_collector()
+        self.run_collector("connection-sync", self.connection, "10")
+        refs = json.loads(
+            (self.connection / "outbox/repository-refs.json").read_bytes()
+        )
+        self.assertEqual(refs, ["https://github.com/acme/later"])
+        self.scope_status = 401
+        self.run_collector("connection-sync", self.connection, "10", code=2)
+        self.assertTrue((self.connection / "revoked").exists())
+
+    def test_a_server_without_v2_pairs_a_v1_installation(self):
+        self.connection_shape = {"observation_schema_versions": [1]}
+        self.setup_collector()
+        saved = json.loads((self.connection / "connection.json").read_bytes())
+        self.assertEqual(saved["scope"]["observation_schema_versions"], [1])
+
+    def test_the_outside_repo_opt_in_is_not_saved_without_v2(self):
+        self.connection_shape = {"observation_schema_versions": [1]}
+        err = self.setup_collector("--record-orchestrated-outside-repos").stderr
+        self.assertIn(b"--record-orchestrated-outside-repos", err)
+        saved = json.loads((self.connection / "connection.json").read_bytes())
+        self.assertFalse(saved["scope"]["record_orchestrated_outside_repos"])
+        self.run_collector("connection-status", self.connection)
+        self.run_collector("connection-sync", self.connection, "10")
+        self.setup_collector("--record-orchestrated-outside-repos")
+        settings, plan = self.root / "settings.json", self.root / "plan.json"
+        settings.write_text("{}")
+        settings.chmod(0o600)
+        self.run_collector("setup-plan", self.connection, settings, plan)
+
+    def test_an_outside_repo_opt_in_cannot_be_widened_after_pairing(self):
+        self.connection_shape = {"observation_schema_versions": [1]}
+        self.setup_collector("--record-orchestrated-outside-repos")
+        path = self.connection / "connection.json"
+        saved = json.loads(path.read_bytes())
+        saved["scope"]["record_orchestrated_outside_repos"] = True
+        path.write_text(json.dumps(saved))
+        self.run_collector("connection-status", self.connection, code=2)
+        saved["scope"]["observation_schema_versions"] = [1, 2]
+        path.write_text(json.dumps(saved))
+        self.run_collector("connection-status", self.connection, code=2)
+
+    def test_an_exchange_for_another_scope_is_refused(self):
+        self.connection_shape = {
+            "scope_kind": None,
+            "scope_path": None,
+            "observation_schema_versions": None,
+            "repository_refs": None,
+            "repository_ref": "https://github.com/acme/demo",
+        }
+        self.setup_collector(code=2)
+        self.assertFalse((self.connection / "connection.json").exists())
+
+    def test_outside_repo_opt_in_is_installation_only(self):
+        repo = self.root / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        self.run_collector(
+            "setup",
+            self.connection,
+            repo,
+            "--record-orchestrated-outside-repos",
+            code=2,
+        )
+        self.assertEqual(self.starts, [])
+
+
+@unittest.skipUnless(
+    os.environ.get("DEVDIARY_RAILS_CHECKOUT"),
+    "set DEVDIARY_RAILS_CHECKOUT to a reviewed DevDiary checkout and run on its Ruby PATH",
+)
+class LocalRailsInteropTest(unittest.TestCase):
+    """Repository scope sends v1 and installation scope v2 to a real local server."""
+
+    def test_schema_version_follows_what_the_server_advertises(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("pairing_rails.py")),
+                "--rails-checkout",
+                os.environ["DEVDIARY_RAILS_CHECKOUT"],
+                "--collector",
+                str(BIN),
+            ],
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+        report = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(result.returncode, 0, report)
+        self.assertTrue(report["repository_scope_v1"])
+        self.assertTrue(report["installation_scope_v2"])
+        self.assertTrue(report["database_dropped"])
 
 
 if __name__ == "__main__":

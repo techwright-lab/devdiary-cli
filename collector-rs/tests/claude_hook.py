@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -798,6 +799,374 @@ class ClaudeHookTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+
+AGENT = "22c99d01-c3ee-4041-9066-0a83f34bd2e2"
+RUN = "66666666-6666-4666-8666-666666666666"
+TASK = "77777777-7777-4777-8777-777777777777"
+CANARIES = (
+    "PAPERCLIP_API_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
+    "TRUSTGROWTH_API_KEY",
+    "WRIGHTBOT_REVIEW_SIGNOFF_TOKEN",
+)
+
+
+def git(*args):
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", *map(str, args)],
+        check=True,
+        capture_output=True,
+    )
+
+
+class InstallationScopeHookTest(unittest.TestCase):
+    """An installation-scope connection built locally against a fake ingest server."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="installation-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.exe = self.root / "collector"
+        shutil.copyfile(ROOT / "target/debug/devdiary-collector", self.exe)
+        self.exe.chmod(0o700)
+        self.main = self.repo("main", "git@github.com:acme/demo.git")
+        self.refs = ["https://github.com/acme/demo"]
+        self.received = []
+        self.served_refs = list(self.refs)
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, body):
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if self.path != "/ingest/v1/collector/scope":
+                    return self.reply(404, {})
+                self.reply(
+                    200,
+                    {
+                        "schema_version": 1,
+                        "collector_ref": owner.collector_ref,
+                        "scope_kind": "installation",
+                        "repository_refs": owner.served_refs,
+                        "observation_schema_versions": [1, 2],
+                    },
+                )
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                owner.received.append(raw)
+                sent = json.loads(raw)
+                self.reply(
+                    201,
+                    {
+                        "collector_ref": owner.collector_ref,
+                        "observation_id": sent["observation_id"],
+                        "installation_id": sent["installation_id"],
+                        "record_id": len(owner.received),
+                    },
+                )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.origin = f"http://127.0.0.1:{server.server_port}"
+        self.collector_ref = (
+            "urn:devdiary:collector:" + "1" * 8 + "-1111-4111-8111-" + "1" * 12
+        )
+
+    def repo(self, name, url):
+        path = self.root / name
+        git("init", "-q", path)
+        git("-C", path, "remote", "add", "origin", url)
+        git("-C", path, "commit", "-q", "--allow-empty", "-m", "init")
+        return path
+
+    def connect(self, opt_in=False, versions=(1, 2)):
+        self.connection = self.root / "connection"
+        self.connection.mkdir(mode=0o700)
+        installation = {
+            "installation_id": str(uuid.uuid4()),
+            "origin": self.origin,
+            "scope_kind": "installation",
+            "record_orchestrated_outside_repos": opt_in,
+        }
+        scope = {
+            "endpoint": self.origin + "/ingest/v1/observations",
+            "collector_ref": self.collector_ref,
+            "installation_id": installation["installation_id"],
+            "scope_kind": "installation",
+            "observation_schema_versions": list(versions),
+            "record_orchestrated_outside_repos": opt_in,
+        }
+        self.write(self.connection / "installation.json", installation)
+        self.write(
+            self.connection / "connection.json",
+            {
+                "scope": scope,
+                "token": "dc_live_" + "s" * 43,
+                "repository_refs": self.refs,
+            },
+        )
+        self.settings = self.root / "settings.json"
+        self.write(self.settings, {})
+        self.plan = self.root / "plan.json"
+        self.run_collector("setup-plan", self.connection, self.settings, self.plan)
+        self.run_collector("claude-apply", self.plan, "--consent")
+        self.outbox = self.connection / "outbox"
+
+    def write(self, path, value):
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    def run_collector(self, *args, code=0, data=None, env=None, exe=None):
+        result = subprocess.run(
+            [str(exe or self.exe), *map(str, args)],
+            input=data,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            env=env,
+        )
+        self.assertEqual(result.returncode, code, result.stderr)
+        return result
+
+    def env(self, **extra):
+        base = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("PAPERCLIP_", "TRUSTGROWTH_", "WRIGHTBOT_", "TG_"))
+        }
+        return {**base, **extra}
+
+    def hook(self, cwd, tool_use_id="tool-1", exe=None, **env):
+        event = {
+            "hook_event_name": "PostToolUse",
+            "session_id": "session-1",
+            "cwd": str(cwd),
+            "tool_use_id": tool_use_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "PRIVATE_SENTINEL"},
+        }
+        result = self.run_collector(
+            "claude-hook",
+            self.plan,
+            data=json.dumps(event).encode(),
+            env=self.env(**env),
+            exe=exe,
+        )
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+
+    def rows(self):
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            return [
+                json.loads(r[0])
+                for r in db.execute("SELECT payload FROM outbox ORDER BY seq")
+            ]
+
+    def drops(self):
+        status = self.run_collector("connection-status", self.connection)
+        return json.loads(status.stdout)["local_drops"]
+
+    def sync(self, code=0):
+        return self.run_collector("connection-sync", self.connection, "100", code=code)
+
+    def test_sibling_worktrees_of_an_allowed_repository_are_captured(self):
+        self.connect()
+        nested = self.main / ".worktrees/x"
+        external = self.root / "home/.t3/worktrees/demo/y"
+        git("-C", self.main, "worktree", "add", "-q", nested)
+        git("-C", self.main, "worktree", "add", "-q", external)
+        for i, cwd in enumerate((self.main, nested, external / "sub")):
+            cwd.mkdir(exist_ok=True)
+            self.hook(cwd, tool_use_id=f"tool-{i}")
+        rows = self.rows()
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual(row["repository_ref"], "https://github.com/acme/demo")
+            self.assertEqual(row["schema_version"], 2)
+            self.assertEqual(row["orchestrator"], "none")
+            self.assertNotIn("actor_ref", row)
+            self.assertNotIn("repository", row)
+        self.assertEqual(self.drops(), {})
+
+    def test_unknown_repository_is_dropped_without_a_row(self):
+        self.connect()
+        other = self.repo("other", "https://github.com/acme/other.git")
+        self.hook(other)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"unknown_repository": 1})
+
+    def test_a_large_config_with_non_utf8_bytes_still_resolves(self):
+        config = self.main / ".git/config"
+        branches = "".join(
+            f'[branch "f/{i}"]\n\tremote = origin\n\tmerge = refs/heads/f/{i}\n'
+            for i in range(3000)
+        )
+        config.write_bytes(
+            branches.encode() + config.read_bytes() + b"[user]\n\tname = Ren\xe9\n"
+        )
+        self.connect()
+        self.hook(self.main)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {})
+
+    def test_repository_refs_match_the_server_spelling(self):
+        self.refs = ["https://github.com/Acme/Demo"]
+        self.connect()
+        self.hook(self.main)
+        self.assertEqual(
+            self.rows()[0]["repository_ref"], "https://github.com/Acme/Demo"
+        )
+
+    def test_non_repository_cwd_needs_paperclip_and_the_opt_in(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        self.connect()
+        self.hook(plain, tool_use_id="no-env")
+        self.hook(plain, tool_use_id="paperclip", PAPERCLIP_AGENT_ID=AGENT)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"outside_scope": 2})
+
+    def test_opted_in_paperclip_run_outside_a_repository_is_recorded_without_one(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        self.connect(opt_in=True)
+        self.hook(plain, tool_use_id="no-env")
+        self.hook(
+            plain,
+            PAPERCLIP_AGENT_ID=AGENT,
+            PAPERCLIP_RUN_ID=RUN,
+            PAPERCLIP_TASK_ID=TASK.upper(),
+        )
+        (row,) = self.rows()
+        self.assertNotIn("repository_ref", row)
+        self.assertEqual(row["orchestrator"], "paperclip")
+        self.assertEqual(row["orchestrator_agent_ref"], AGENT)
+        self.assertEqual(row["orchestrator_run_ref"], RUN)
+        self.assertEqual(row["orchestrator_task_ref"], TASK)
+        self.assertEqual(self.drops(), {"outside_scope": 1})
+
+    def test_paperclip_workspace_path_is_a_local_checkout_hint_only(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        tree = self.root / "paperclip-ws-HINTMARKER"
+        git("-C", self.main, "worktree", "add", "-q", tree)
+        self.connect()
+        self.hook(
+            plain, tool_use_id="hint-without-agent", PAPERCLIP_WORKSPACE_CWD=str(tree)
+        )
+        self.hook(
+            plain,
+            tool_use_id="hint",
+            PAPERCLIP_AGENT_ID=AGENT,
+            PAPERCLIP_WORKSPACE_WORKTREE_PATH=str(self.root / "missing"),
+            PAPERCLIP_WORKSPACE_CWD=str(tree),
+        )
+        (row,) = self.rows()
+        self.assertEqual(row["repository_ref"], "https://github.com/acme/demo")
+        self.assertEqual(row["orchestrator_agent_ref"], AGENT)
+        self.sync()
+        self.assertNotIn(b"HINTMARKER", b"".join(self.received))
+
+    def test_malformed_or_partial_paperclip_ids_never_read_as_interactive(self):
+        self.connect()
+        self.hook(self.main, tool_use_id="bad-agent", PAPERCLIP_AGENT_ID="agent-7")
+        self.hook(self.main, tool_use_id="run-only", PAPERCLIP_RUN_ID=RUN)
+        rows = self.rows()
+        self.assertEqual([r["orchestrator"] for r in rows], ["paperclip", "paperclip"])
+        self.assertNotIn("orchestrator_agent_ref", rows[0])
+        self.assertEqual(rows[1]["orchestrator_run_ref"], RUN)
+
+    def test_secret_environment_never_reaches_spool_or_wire(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        self.connect(opt_in=True)
+        secrets = {name: "SENTINELSECRET" for name in CANARIES}
+        hints = {
+            "PAPERCLIP_WORKSPACE_CWD": str(self.root / "ws-cwd-PATHCANARY"),
+            "PAPERCLIP_WORKSPACE_WORKTREE_PATH": str(self.main),
+        }
+        self.hook(self.main, tool_use_id="repo", **secrets, **hints)
+        self.hook(
+            plain, tool_use_id="hinted", PAPERCLIP_AGENT_ID=AGENT, **secrets, **hints
+        )
+        self.hook(
+            plain,
+            tool_use_id="bare",
+            PAPERCLIP_AGENT_ID=AGENT,
+            **secrets,
+            PAPERCLIP_WORKSPACE_CWD=str(self.root / "ws-cwd-PATHCANARY"),
+        )
+        self.assertEqual(len(self.rows()), 3)
+        for file in self.outbox.iterdir():
+            raw = file.read_bytes()
+            self.assertNotIn(b"SENTINELSECRET", raw)
+            self.assertNotIn(b"PRIVATE_SENTINEL", raw)
+        self.sync()
+        wire = b"".join(self.received)
+        self.assertEqual(len(self.received), 3)
+        for value in [
+            "SENTINELSECRET",
+            *hints.values(),
+            str(plain),
+            "PRIVATE_SENTINEL",
+        ]:
+            self.assertNotIn(value.encode(), wire)
+
+    def test_sync_refreshes_repository_refs_from_the_scope_endpoint(self):
+        self.connect()
+        other = self.repo("other", "https://github.com/acme/other.git")
+        self.hook(other, tool_use_id="before")
+        self.served_refs = ["https://github.com/acme/other"]
+        self.sync()
+        self.hook(other, tool_use_id="after")
+        self.hook(self.main, tool_use_id="removed")
+        self.assertEqual(
+            [r["repository_ref"] for r in self.rows()],
+            ["https://github.com/acme/other"],
+        )
+        self.assertEqual(self.drops(), {"unknown_repository": 2})
+
+    def test_server_without_v2_gets_v1_rows(self):
+        self.connect(versions=(1,))
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        (row,) = self.rows()
+        self.assertEqual(row["schema_version"], 1)
+        self.assertEqual(row["repository_ref"], "https://github.com/acme/demo")
+        self.assertFalse({"orchestrator", "orchestrator_agent_ref"} & row.keys())
+
+    def test_out_of_scope_hook_p99_on_the_release_build(self):
+        release = ROOT / "target/release/devdiary-collector"
+        if not release.exists():
+            self.skipTest("cargo build --release first")
+        exe = self.root / "release-collector"
+        shutil.copyfile(release, exe)
+        exe.chmod(0o700)
+        self.exe = exe
+        self.connect()
+        other = self.repo("other", "https://github.com/acme/other.git")
+        timings = []
+        for i in range(200):
+            start = time.perf_counter()
+            self.hook(other, tool_use_id=f"t{i}")
+            timings.append(time.perf_counter() - start)
+        timings.sort()
+        p99 = timings[int(len(timings) * 0.99) - 1]
+        print(f"out-of-scope hook p99 {p99 * 1000:.1f} ms over {len(timings)} runs")
+        self.assertLess(p99, 0.050)
+        self.assertEqual(self.rows(), [])
 
 
 if __name__ == "__main__":
