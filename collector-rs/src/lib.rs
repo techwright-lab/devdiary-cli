@@ -2,13 +2,14 @@
 #[cfg(not(unix))]
 compile_error!("This experimental collector currently requires Unix private-file semantics");
 
+pub mod checkout;
 pub mod claude;
 pub mod drops;
 pub mod pairing;
 pub mod store;
 use chrono::{DateTime, Datelike, Utc};
 use serde::de::{MapAccess, Visitor};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -103,6 +104,9 @@ pub fn scope(raw: &[u8]) -> Result<Object> {
         return Err("scope_too_large".into());
     }
     let o = object(raw)?;
+    if o.contains_key("scope_kind") {
+        return installation_scope(o);
+    }
     let keys = [
         "endpoint",
         "collector_ref",
@@ -123,45 +127,111 @@ pub fn scope(raw: &[u8]) -> Result<Object> {
     endpoint(text(&o, "endpoint")?)?;
     Ok(o)
 }
+fn installation_scope(o: Object) -> Result<Object> {
+    let keys = [
+        "endpoint",
+        "collector_ref",
+        "installation_id",
+        "scope_kind",
+        "observation_schema_versions",
+        "record_orchestrated_outside_repos",
+    ];
+    let versions = o.get("observation_schema_versions");
+    if o.len() != keys.len()
+        || keys.iter().any(|k| !o.contains_key(*k))
+        || text(&o, "scope_kind")? != "installation"
+        || !token(text(&o, "collector_ref")?)
+        || !uuid(text(&o, "installation_id")?)
+        || !o["record_orchestrated_outside_repos"].is_boolean()
+        || !(versions == Some(&json!([1])) || versions == Some(&json!([1, 2])))
+    {
+        return Err("invalid_scope".into());
+    }
+    endpoint(text(&o, "endpoint")?)?;
+    Ok(o)
+}
+pub fn installation(config: &Object) -> bool {
+    config.contains_key("scope_kind")
+}
+pub fn wire_version(config: &Object) -> u64 {
+    if config.get("observation_schema_versions") == Some(&json!([1, 2])) {
+        2
+    } else {
+        1
+    }
+}
+pub fn repository_ref(s: &str) -> bool {
+    repository(s)
+}
+pub(crate) fn is_uuid(s: &str) -> bool {
+    uuid(s)
+}
+
+const V1_FIELDS: [&str; 17] = [
+    "schema_version",
+    "observation_id",
+    "installation_id",
+    "runtime",
+    "session_id",
+    "event",
+    "observed_at",
+    "attribution_basis",
+    "prompt_id",
+    "turn_id",
+    "tool_use_id",
+    "agent_id",
+    "agent_type",
+    "model",
+    "tool_name",
+    "source",
+    "reason",
+];
+const V2_FIELDS: [&str; 8] = [
+    "repository_ref",
+    "orchestrator",
+    "orchestrator_agent_ref",
+    "orchestrator_run_ref",
+    "orchestrator_task_ref",
+    "commits",
+    "overlap_count",
+    "commit_gap",
+];
+const ORCHESTRATOR_REFS: [&str; 3] = [
+    "orchestrator_agent_ref",
+    "orchestrator_run_ref",
+    "orchestrator_task_ref",
+];
 
 /// Local normalized Python-observer metadata, not raw vendor hooks. Unknown
-/// identity only in v1. Nulls are omitted exactly like Python's SQL projection.
+/// identity only. Nulls are omitted exactly like Python's SQL projection.
 pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     if raw.len() > MAX_INPUT {
         return Err("input_too_large".into());
     }
     let input = object(raw)?;
-    if input.get("schema_version").and_then(Value::as_u64) != Some(1)
-        || input.get("repository") != config.get("repository")
+    let version = wire_version(config);
+    let repository_matches = if installation(config) {
+        !input.contains_key("repository")
+    } else {
+        input.get("repository") == config.get("repository")
+    };
+    if input.get("schema_version").and_then(Value::as_u64) != Some(version)
+        || !repository_matches
         || input.get("installation_id") != config.get("installation_id")
         || input.get("attribution_basis").and_then(Value::as_str) != Some("unknown")
         || input.get("actor_ref").is_some_and(|v| !v.is_null())
     {
         return Err("invalid_scope_or_identity".into());
     }
-    let fields = [
-        "schema_version",
-        "observation_id",
-        "installation_id",
-        "runtime",
-        "session_id",
-        "event",
-        "observed_at",
-        "attribution_basis",
-        "prompt_id",
-        "turn_id",
-        "tool_use_id",
-        "agent_id",
-        "agent_type",
-        "model",
-        "tool_name",
-        "source",
-        "reason",
-    ];
+    let extra: &[&str] = match (installation(config), version) {
+        (false, _) => &[],
+        (true, 1) => &V2_FIELDS[..1],
+        (true, _) => &V2_FIELDS,
+    };
     let mut out = Object::new();
-    for field in fields {
-        if let Some(v) = input.get(field).filter(|v| !v.is_null()) {
-            out.insert(field.into(), v.clone());
+    for field in V1_FIELDS.iter().chain(extra) {
+        if let Some(v) = input.get(*field).filter(|v| !v.is_null()) {
+            out.insert((*field).into(), v.clone());
         }
     }
     for field in [
@@ -197,9 +267,19 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
         return Err("invalid_timestamp".into());
     }
     out.insert("observed_at".into(), timestamp.into());
-    out.insert("repository_ref".into(), config["repository_ref"].clone());
+    if installation(config) {
+        located(&out, config, version)?;
+    } else {
+        out.insert("repository_ref".into(), config["repository_ref"].clone());
+    }
+    if version == 2 {
+        orchestrated(&out)?;
+        captured(&out)?;
+    }
     for (k, v) in &out {
-        if k != "schema_version" && !v.as_str().is_some_and(token) {
+        if !["schema_version", "commits", "overlap_count"].contains(&k.as_str())
+            && !v.as_str().is_some_and(token)
+        {
             return Err("invalid_metadata".into());
         }
     }
@@ -208,6 +288,61 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
         return Err("wire_too_large".into());
     }
     Ok(bytes)
+}
+// Only an orchestrated run the customer opted in for may leave the repository out.
+fn located(out: &Object, config: &Object, version: u64) -> Result<()> {
+    match out.get("repository_ref") {
+        Some(r) if r.as_str().is_some_and(repository) => Ok(()),
+        None if version == 2
+            && config["record_orchestrated_outside_repos"] == json!(true)
+            && out.get("orchestrator") == Some(&json!("paperclip")) =>
+        {
+            Ok(())
+        }
+        _ => Err("invalid_repository".into()),
+    }
+}
+fn orchestrated(out: &Object) -> Result<()> {
+    let paperclip = match out.get("orchestrator").and_then(Value::as_str) {
+        Some("paperclip") => true,
+        Some("none") => false,
+        _ => return Err("invalid_orchestrator".into()),
+    };
+    for key in ORCHESTRATOR_REFS {
+        if let Some(v) = out.get(key)
+            && (!paperclip || !v.as_str().is_some_and(uuid))
+        {
+            return Err("invalid_orchestrator".into());
+        }
+    }
+    Ok(())
+}
+fn captured(out: &Object) -> Result<()> {
+    if let Some(commits) = out.get("commits") {
+        let valid = commits.as_array().is_some_and(|shas| {
+            (1..=20).contains(&shas.len())
+                && shas.iter().all(|sha| {
+                    sha.as_str().is_some_and(|s| {
+                        s.len() == 40
+                            && s.bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                })
+        });
+        if !valid || out.contains_key("commit_gap") {
+            return Err("invalid_commits".into());
+        }
+    }
+    if out
+        .get("overlap_count")
+        .is_some_and(|n| !n.as_u64().is_some_and(|n| n <= 64))
+        || out
+            .get("commit_gap")
+            .is_some_and(|g| !matches!(g.as_str(), Some("reflog_rewritten" | "reflog_overflow")))
+    {
+        return Err("invalid_commits".into());
+    }
+    Ok(())
 }
 
 // Input is serde_json's validated, round-trip numeric spelling, matching the

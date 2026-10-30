@@ -103,3 +103,163 @@ fn refuses_scope_and_identity_coercion() {
         assert!(freeze(original.replace(from, to).as_bytes(), &config).is_err());
     }
 }
+
+fn installation() -> devdiary_collector::Object {
+    scope(include_bytes!("fixtures/installation-scope.json")).unwrap()
+}
+fn local_v2() -> serde_json::Value {
+    serde_json::from_slice(include_bytes!("fixtures/local-observation-v2.json")).unwrap()
+}
+fn frozen(
+    config: &devdiary_collector::Object,
+    row: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    freeze(&serde_json::to_vec(row).unwrap(), config)
+        .ok()
+        .map(|w| serde_json::from_slice(&w).unwrap())
+}
+
+#[test]
+fn installation_scope_shape_is_exact() {
+    let base: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/installation-scope.json")).unwrap();
+    assert!(scope(&serde_json::to_vec(&base).unwrap()).is_ok());
+    let mut opted = base.clone();
+    opted["record_orchestrated_outside_repos"] = true.into();
+    opted["observation_schema_versions"] = serde_json::json!([1]);
+    assert!(scope(&serde_json::to_vec(&opted).unwrap()).is_ok());
+    for (key, value) in [
+        ("scope_kind", serde_json::json!("repository")),
+        ("observation_schema_versions", serde_json::json!([2])),
+        ("observation_schema_versions", serde_json::json!([1, 3])),
+        ("observation_schema_versions", serde_json::json!([2, 1])),
+        ("observation_schema_versions", serde_json::json!([1, 1])),
+        ("observation_schema_versions", serde_json::json!("1,2")),
+        (
+            "record_orchestrated_outside_repos",
+            serde_json::json!("true"),
+        ),
+        ("repository", serde_json::json!("/fixture/repo")),
+        (
+            "repository_ref",
+            serde_json::json!("https://github.com/acme/project"),
+        ),
+    ] {
+        let mut bad = base.clone();
+        bad[key] = value;
+        assert!(scope(&serde_json::to_vec(&bad).unwrap()).is_err(), "{key}");
+    }
+}
+
+#[test]
+fn v2_frozen_bytes_carry_orchestrator_and_commit_fields() {
+    let wire = freeze(
+        include_bytes!("fixtures/local-observation-v2.json"),
+        &installation(),
+    )
+    .unwrap();
+    assert_eq!(wire, include_bytes!("fixtures/wire-v2.json"));
+    assert!(
+        !String::from_utf8(wire)
+            .unwrap()
+            .contains("PRIVATE-SENTINEL")
+    );
+}
+
+#[test]
+fn v2_refuses_identity_claims_and_malformed_capture() {
+    let config = installation();
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        ("actor_ref", "invented".into()),
+        ("attribution_basis", "explicit_local_binding".into()),
+        ("orchestrator", "cron".into()),
+        ("orchestrator_agent_ref", "agent-7".into()),
+        (
+            "orchestrator_run_ref",
+            "66666666-6666-4666-8666-66666666666G".into(),
+        ),
+        (
+            "commits",
+            serde_json::json!(["0123456789ABCDEF0123456789ABCDEF01234567"]),
+        ),
+        ("commits", serde_json::json!(["0123456"])),
+        ("commits", serde_json::json!([])),
+        (
+            "commits",
+            serde_json::json!(vec!["0123456789abcdef0123456789abcdef01234567"; 21]),
+        ),
+        ("overlap_count", 65.into()),
+        ("overlap_count", (-1).into()),
+        ("overlap_count", "0".into()),
+        ("commit_gap", "reflog_overflow".into()),
+        ("repository", "/fixture/repo".into()),
+        (
+            "repository_ref",
+            "https://github.com/acme/project.git".into(),
+        ),
+        ("schema_version", 1.into()),
+    ];
+    for (key, value) in cases {
+        let mut row = local_v2();
+        row[key] = value;
+        assert!(frozen(&config, &row).is_none(), "{key}");
+    }
+    let mut none = local_v2();
+    none["orchestrator"] = "none".into();
+    assert!(frozen(&config, &none).is_none(), "refs need paperclip");
+    for key in [
+        "orchestrator_agent_ref",
+        "orchestrator_run_ref",
+        "orchestrator_task_ref",
+    ] {
+        none.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(frozen(&config, &none).unwrap()["orchestrator"], "none");
+    let mut gap = local_v2();
+    gap.as_object_mut().unwrap().remove("commits");
+    gap["commit_gap"] = "reflog_rewritten".into();
+    assert_eq!(
+        frozen(&config, &gap).unwrap()["commit_gap"],
+        "reflog_rewritten"
+    );
+}
+
+#[test]
+fn v2_repository_is_optional_only_for_opted_in_paperclip_rows() {
+    let mut row = local_v2();
+    row.as_object_mut().unwrap().remove("repository_ref");
+    assert!(frozen(&installation(), &row).is_none());
+    let mut config = installation();
+    config.insert("record_orchestrated_outside_repos".into(), true.into());
+    let wire = frozen(&config, &row).unwrap();
+    assert!(wire.get("repository_ref").is_none());
+    row["orchestrator"] = "none".into();
+    for key in [
+        "orchestrator_agent_ref",
+        "orchestrator_run_ref",
+        "orchestrator_task_ref",
+    ] {
+        row.as_object_mut().unwrap().remove(key);
+    }
+    assert!(frozen(&config, &row).is_none());
+}
+
+#[test]
+fn installation_without_advertised_v2_sends_v1() {
+    let mut config = installation();
+    config.insert("observation_schema_versions".into(), serde_json::json!([1]));
+    let mut row = local_v2();
+    row["schema_version"] = 1.into();
+    for key in ["commits", "overlap_count"] {
+        row.as_object_mut().unwrap().remove(key);
+    }
+    let wire = frozen(&config, &row).unwrap();
+    assert_eq!(wire["schema_version"], 1);
+    assert_eq!(wire["repository_ref"], "https://github.com/acme/project");
+    assert!(wire.get("orchestrator").is_none());
+    assert!(wire.get("orchestrator_agent_ref").is_none());
+    row.as_object_mut().unwrap().remove("repository_ref");
+    assert!(frozen(&config, &row).is_none());
+    row["schema_version"] = 2.into();
+    assert!(frozen(&config, &row).is_none());
+}

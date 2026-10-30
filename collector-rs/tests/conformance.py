@@ -469,6 +469,49 @@ class CollectorTest(unittest.TestCase):
         self.call("sync", self.key, 1, code=1)
         self.assertLess(time.monotonic() - start, 7)
 
+    def installation_state(self, versions=(1, 2)):
+        config = json.loads((FIXTURES / "installation-scope.json").read_bytes())
+        config["endpoint"] = self.config["endpoint"]
+        config["observation_schema_versions"] = list(versions)
+        self.state = self.root / "installation-state"
+        self.state.mkdir(mode=0o700)
+        self.call("init", "--consent", data=config)
+
+    def test_v2_fixture_is_frozen_and_sent_byte_identical(self):
+        self.installation_state()
+        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
+        wire = (FIXTURES / "wire-v2.json").read_bytes()
+        self.call("collect", data=local)
+        self.call("collect", data=local)
+        (payload,) = self.db().execute("SELECT payload FROM outbox").fetchall()
+        self.assertEqual(payload[0], wire)
+        self.call("sync", self.key, 10)
+        self.assertEqual([raw for raw, _ in self.requests], [wire])
+        self.assertEqual(json.loads(self.call("status").stdout)["delivered"], 1)
+
+    def test_v2_refuses_actor_claims_and_v1_shape(self):
+        self.installation_state()
+        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
+        for change in (
+            {"actor_ref": "invented"},
+            {"schema_version": 1},
+            {"repository": "/fixture/repo"},
+            {"orchestrator": "cron"},
+            {"commits": ["0" * 40] * 21},
+        ):
+            self.call("collect", data={**local, **change}, code=2)
+        self.assertEqual(
+            self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 0
+        )
+
+    def test_installation_without_advertised_v2_freezes_v1_bytes(self):
+        self.installation_state(versions=(1,))
+        row = {**self.row, "repository_ref": self.config["repository_ref"]}
+        del row["repository"]
+        self.call("collect", data=row)
+        (payload,) = self.db().execute("SELECT payload FROM outbox").fetchone()
+        self.assertEqual(payload, (FIXTURES / "wire.json").read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
