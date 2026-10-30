@@ -50,27 +50,34 @@ mkdir "$RUST_STATE"
 ```
 
 The Rust-only SQLite filename, application ID and schema version refuse Python,
-foreign or incompatible state; there is **no migration/shared-writer mode**. Scope
+foreign or incompatible state; there is **no shared-writer mode**. A spool written
+by an older collector (schema version 1) is refused with `repair_required` until
+`"$COLLECTOR" repair "$RUST_STATE"` migrates it in place: delivered rows become a
+counter, pending rows keep their exact bytes, and the file switches to incremental
+auto-vacuum. Repair holds the sync lock and is safe to re-run after a crash. Scope
 is immutable from initialization, including after delivery. Keys stay in separate
 0600 regular files and are read only by explicit sync; rotating the key file does
 not retarget evidence. Owner-only state, no symlink ancestors or hardlinks, FULL
 SQLite commits, 250 ms lock waits, 10,000 retained rows and a 16 MiB database ceiling
 bound storage. Capacity/lock failures leave existing evidence unchanged; callers
-must retry failed collection with the same UUID. Retained receipts count toward
-capacity; no pruning yet. Admission reserves worst-case SQLite table/index and
-overflow pages for every retained row, including future receipts, failures and
-cursor updates. This conservative reservation intentionally refuses new rows
-before the physical file is full (currently hundreds, not thousands, of rows);
-the 10,000-row limit is an additional ceiling, not a promised capacity. Existing
-pre-fix spools are not rewritten or pruned; previously over-admitted spools may
-still lack update space and require a separately designed recovery/migration.
-Same-UID processes are trusted, not sandboxed.
+must retry failed collection with the same UUID. A delivered row is deleted in the
+same transaction that records its validated receipt; the delivered counter, the
+last receipt and a small tombstone (observation ID plus payload SHA-256, newest
+4,000 kept) replace it, so a late duplicate is still deduplicated or refused as a
+conflict. A lost response keeps the row pending and the retry sends identical
+bytes. Admission reserves worst-case SQLite table/index and overflow pages for
+every **pending** row, so capacity returns as rows are acknowledged. The
+reservation still refuses new rows before the physical file is full (several
+hundred pending rows); the 10,000-row limit is an additional ceiling, not a
+promised capacity. Same-UID processes are trusted, not sandboxed.
 
 Input is capped at 64 KiB with a 700 ms stdin deadline (not a whole-hook SLA).
 Frozen ASCII allowlisted wire bytes are capped at 16 KiB. Explicit sync attempts
 1–100 rows, commits its rotating cursor before HTTP, retains exact bytes after
 crash/response loss, and acknowledges only the exact Rails receipt. 401/403/429,
 5xx and network failures stop the batch; row failures do not starve later rows.
+A `Retry-After` on 429 (seconds or an HTTP date, at most one day) is saved in the spool, and later
+syncs refuse with `sync_rate_limited` before any request until it passes.
 No redirects or ambient proxies; verified TLS except exact loopback HTTP; each
 request has a five-second timeout including the response body. Exit 0 means the
 command succeeded, sync exit 1 means pending evidence remains, and exit 2 is a
@@ -166,8 +173,12 @@ CONNECTION="$HOME/.config/devdiary/customer-project"
   integration does **not** require proving policy absence. Health reports host
   trust/effective managed policy as unknown, and only reports a target-file block
   when inspected settings explicitly disable hooks or allow managed hooks only.
+- `connection-sync` treats 401/403 as revocation: it writes `CONNECTION/revoked`,
+  stops, and refuses later syncs. The hook then stops spooling and counts a
+  `revoked` drop. Pair a new connection directory to resume.
 - Health separates saved connection, local registration evidence (when PLAN is
-  supplied), observed/pending counts and deliveries with validated receipts.
+  supplied), observed/pending counts, deliveries with validated receipts,
+  `local_drops` (hook events not stored, by reason) and `local_revoked`.
   Zero observations is not proof of host coverage. Current server revocation and
   last receipt are shown by the browser, not invented from local registration.
   Unknown attribution remains unknown; no authorship or human minutes change.
@@ -219,8 +230,9 @@ Example **disposable** setup, after reviewing and initializing the scope above:
 ```sh
 cargo build --release --locked --manifest-path collector-rs/Cargo.toml
 # PRIVATE_INSTALL and REGISTRATION must already be owner-only absolute dirs.
-# SETTINGS must already be a private JSON object file in an owner-only directory;
-# explicitly create {} under umask 077 if it does not exist. Do not overwrite it.
+# SETTINGS must already be a JSON object file owned by you; it and its directory
+# may be readable by others (0644 under 0755) but never group/world-writable.
+# Explicitly create {} if it does not exist. Do not overwrite it.
 install -m 700 collector-rs/target/release/devdiary-collector "$PRIVATE_INSTALL/collector"
 COLLECTOR="$PRIVATE_INSTALL/collector"
 PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
@@ -235,8 +247,16 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
 ```
 
 - The executable is an absolute, owner-only native ELF file with private/trusted
-  ancestors, shell-quoted paths and a SHA-256 pin verified on apply and capture.
-  Symlinks, hardlinks and shared state/config permissions are refused, not repaired.
+  ancestors, shell-quoted paths and a SHA-256 pin verified at plan and apply. The
+  hook compares a stat fingerprint (device, inode, size, mtime and ctime in ns)
+  saved in STATE after the last full hash; any replacement, write or chmod forces
+  a full re-hash. Each sync hashes its own binary and saves that fingerprint (or
+  discards the saved one when hashing fails). Symlinks, hardlinks and
+  shared state permissions are refused, not repaired. Settings and their directory
+  only need to be owned by you and not group/world-writable, with exactly one link
+  and no symlinked ancestor; a replaced settings file keeps its original mode.
+  `claude-plan` refuses settings that already register the Python observer hook
+  (`python_observer_registered`).
   Updates require removal and a freshly reviewed plan; removal remains possible
   after executable/spool failures. Same-UID processes remain trusted.
 - Plan and settings are bounded to 64 KiB. The plan stores only ownership, hashes
@@ -249,7 +269,8 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   exact installation is harmless. Edited, duplicate or partially missing owned
   entries block removal instead of deleting customer changes. Pre-receipt
   experimental installations are not adopted automatically.
-- Setup/removal use a stable, nonblocking advisory lock and private fsynced atomic
+- Setup/removal use a stable, nonblocking advisory lock (`STATE/claude-settings.lock`,
+  so the settings directory need not be private) and private fsynced atomic
   replacement, with an immediate pre-rename content check. Cooperating hooks hold
   a shared lock. Noncooperating editors cannot be made transactional: keep the
   host/settings editors quiescent. A crash leaves the old or complete new JSON;
@@ -274,15 +295,23 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   without delivery IDs get random UUIDs: repeated starts/resumes/ends are not
   collapsed. Stop remains a **turn** observation, not SessionEnd; no completion,
   authorship, human minutes or duration is inferred. No binding support is added.
-- Raw stdin is capped at 64 KiB. A whole-process 700 ms watchdog covers stdin,
+- Raw stdin is capped at 4 MiB; fields outside the allowlist (prompts, tool input
+  and responses) are skipped without being parsed into memory. The hook runs its
+  cheap checks first: parse and event allowlist, plan, registration receipt,
+  revocation, repository scope, executable fingerprint, and only then the settings
+  re-parse and SQLite. A whole-process 700 ms watchdog covers stdin,
   validation, filesystem and SQLite work; the registered command also has a
   two-second host timeout. The command exits zero with no stdout/stderr on malformed
   input, missing registration, timeout, lock/full-spool/permission failures or panic.
   A shell neutralizer also silences missing/broken executable failures. OS-level
   scheduling stalls remain outside an application deadline guarantee. Failed
   captures are dropped, not retried by the hook: zero exit is **not** proof of
-  capture, and `status` counts are not a complete coverage/host-health signal.
-  Conservative capacity reservation remains unchanged (hundreds of retained rows).
+  capture. Every refusal after the plan loads is counted by reason
+  (`outside_scope`, `spool_full`, `permission`, `invalid`, `observation_conflict`,
+  `revoked`, `stale_plan`, `busy`, `error`) as one byte appended to `STATE/drops.log`
+  without opening SQLite; sync folds it into the spool's `drops` table, and
+  `status` / `connection-status` print the totals. Drops before the plan loads
+  cannot be attributed to a STATE and are not counted.
 
 Additional Linux fixture gate:
 

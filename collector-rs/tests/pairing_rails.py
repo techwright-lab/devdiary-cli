@@ -104,18 +104,16 @@ def main():
             with contextlib.closing(
                 sqlite3.connect(root / "connection/outbox/collector-rust-v1.sqlite3")
             ) as db:
-                row = db.execute(
-                    "SELECT receipt,payload FROM outbox WHERE delivered=1"
-                ).fetchone()
-                receipt, payload = json.loads(row[0]), json.loads(row[1])
+                (raw,) = db.execute("SELECT last_receipt FROM scope").fetchone()
+                receipt = json.loads(raw)
             config = json.loads((root / "connection/connection.json").read_text())
             require(
                 receipt
                 == {
                     "record_id": report["record_id"],
                     "collector_ref": config["scope"]["collector_ref"],
-                    "installation_id": payload["installation_id"],
-                    "observation_id": payload["observation_id"],
+                    "installation_id": config["scope"]["installation_id"],
+                    "observation_id": report["observation_id"],
                 },
                 "exact_rails_receipt",
             )

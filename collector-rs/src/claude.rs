@@ -2,8 +2,8 @@
 //! Registration uses an atomic settings replacement and a private hash-only
 //! receipt binding the validated plan. Crashes leave all hooks or none installed.
 use crate::{
-    MAX_INPUT, Object, Result, object,
-    store::{Store, private},
+    MAX_HOOK_INPUT, Object, Result, drops, object,
+    store::{FINGERPRINT, SETTINGS_LOCK, Store, create_private, owner_writable, private},
     text, token,
 };
 use serde_json::{Value, json};
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +32,14 @@ const MAX_PLAN: usize = 65536;
 
 fn read(path: &Path) -> Result<Vec<u8>> {
     private(path, false)?;
+    bounded(path)
+}
+fn read_settings(path: &Path) -> Result<Vec<u8>> {
+    owner_writable(path.parent().ok_or("invalid_path")?, true)?;
+    owner_writable(path, false)?;
+    bounded(path)
+}
+fn bounded(path: &Path) -> Result<Vec<u8>> {
     let mut raw = Vec::new();
     File::open(path)?
         .take((MAX_PLAN + 1) as u64)
@@ -44,14 +52,26 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 fn hash(raw: &[u8]) -> String {
     format!("{:x}", Sha256::digest(raw))
 }
-fn executable(path: &Path) -> Result<String> {
+fn fingerprint(m: &fs::Metadata, sha: &str) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{sha}",
+        m.dev(),
+        m.ino(),
+        m.size(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec()
+    )
+}
+fn executable(path: &Path) -> Result<(String, String)> {
     private(path, false)?;
-    let m = fs::metadata(path)?;
+    let mut f = File::open(path)?;
+    let m = f.metadata()?;
     if m.mode() & 0o100 == 0 || m.len() > 128 * 1024 * 1024 {
         return Err("untrusted_executable".into());
     }
     // Native Linux executable, not an interpreter or package-manager shim.
-    let mut f = File::open(path)?;
     let mut magic = [0; 4];
     f.read_exact(&mut magic)?;
     if magic != *b"\x7fELF" {
@@ -67,7 +87,66 @@ fn executable(path: &Path) -> Result<String> {
         }
         digest.update(&buf[..n]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    let sha = format!("{:x}", digest.finalize());
+    Ok((fingerprint(&m, &sha), sha))
+}
+fn fingerprint_file(state: &Path, write: bool) -> Result<File> {
+    private(state, true)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(write)
+        .create(write)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(state.join(FINGERPRINT))?;
+    let m = file.metadata()?;
+    if m.uid() != rustix::process::geteuid().as_raw()
+        || m.mode() & 0o077 != 0
+        || m.nlink() != 1
+        || !m.is_file()
+    {
+        return Err("private_state_required".into());
+    }
+    Ok(file)
+}
+fn verify_executable(p: &Object, state: &Path) -> Result<()> {
+    let (current, sha) = executable(Path::new(text(p, "executable")?))?;
+    if sha != text(p, "executable_sha256")? {
+        return Err("executable_changed".into());
+    }
+    remember(state, &current)
+}
+fn remember(state: &Path, fingerprint: &str) -> Result<()> {
+    let mut file = fingerprint_file(state, true)?;
+    file.write_all(fingerprint.as_bytes())?;
+    file.set_len(fingerprint.len() as u64)?;
+    Ok(())
+}
+// The syncing binary is normally the registered one, so hashing it here keeps
+// the full hash out of the next hook's deadline. Any other binary's stat
+// fingerprint never matches the registered path and the hook re-hashes.
+pub(crate) fn rehash(state: &Path) -> Result<()> {
+    match executable(&std::env::current_exe()?) {
+        Ok((current, _)) => remember(state, &current),
+        Err(_) => match fs::remove_file(state.join(FINGERPRINT)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        },
+    }
+}
+// A matching stat fingerprint stands in for the full hash; any replacement,
+// write or chmod changes ino, size, mtime or ctime and forces a re-hash.
+fn trusted_executable(p: &Object, state: &Path) -> Result<()> {
+    let path = Path::new(text(p, "executable")?);
+    private(path, false)?;
+    let current = fingerprint(&fs::metadata(path)?, text(p, "executable_sha256")?);
+    let mut recorded = Vec::new();
+    let read =
+        fingerprint_file(state, false).and_then(|f| Ok(f.take(512).read_to_end(&mut recorded)?));
+    if read.is_ok() && recorded == current.as_bytes() {
+        return Ok(());
+    }
+    verify_executable(p, state)
 }
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
@@ -77,24 +156,9 @@ fn entry(plan: &Path, exe: &str) -> Result<Value> {
         json!({"hooks": [{"type": "command", "command": format!("{} claude-hook {} >/dev/null 2>&1 || :", quote(exe), quote(plan.to_str().ok_or("invalid_path")?)), "timeout": 2}]}),
     )
 }
-fn lock(settings: &Path, shared: bool) -> Result<File> {
-    let parent = settings.parent().ok_or("invalid_path")?;
-    private(parent, true)?;
-    let path = parent.join(".devdiary-rust-claude.lock");
-    let file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            private(&path, false)?;
-            OpenOptions::new().read(true).write(true).open(&path)?
-        }
-        Err(e) => return Err(e.into()),
-    };
+fn lock(state: &Path, shared: bool) -> Result<File> {
+    private(state, true)?;
+    let file = create_private(&state.join(SETTINGS_LOCK))?;
     rustix::fs::flock(
         &file,
         if shared {
@@ -162,7 +226,7 @@ impl<'de> serde::Deserialize<'de> for UniqueKeys {
     }
 }
 fn settings(path: &Path) -> Result<(Vec<u8>, Object)> {
-    let raw = read(path)?;
+    let raw = read_settings(path)?;
     serde_json::from_slice::<UniqueKeys>(&raw)?;
     let doc = object(&raw)?;
     if doc.get("hooks").is_some_and(|v| !v.is_object()) {
@@ -191,9 +255,16 @@ fn owned(doc: &Object, expected: &Value) -> Result<()> {
     Ok(())
 }
 fn replace(path: &Path, value: &Object, expected: &[u8]) -> Result<()> {
-    atomic_replace(path, value, Some(expected))
+    let mode = fs::metadata(path)?.mode() & 0o755;
+    atomic_replace(path, value, Some(expected), mode, read_settings)
 }
-fn atomic_replace(path: &Path, value: &Object, expected: Option<&[u8]>) -> Result<()> {
+fn atomic_replace(
+    path: &Path,
+    value: &Object,
+    expected: Option<&[u8]>,
+    mode: u32,
+    current: fn(&Path) -> Result<Vec<u8>>,
+) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     if bytes.len() > MAX_PLAN {
         return Err("settings_too_large".into());
@@ -206,10 +277,11 @@ fn atomic_replace(path: &Path, value: &Object, expected: Option<&[u8]>) -> Resul
             .create_new(true)
             .mode(0o600)
             .open(&temporary)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         if let Some(expected) = expected {
-            if read(path)? != expected {
+            if current(path)? != expected {
                 return Err("settings_changed_replan".into());
             }
             fs::rename(&temporary, path)?;
@@ -246,15 +318,18 @@ pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> 
     {
         return Err("separate_registration_paths_required".into());
     }
-    let _lock = lock(settings_path, false)?;
+    let _lock = lock(state, false)?;
     let (raw, doc) = settings(settings_path)?;
+    if String::from_utf8_lossy(&raw).contains("observer_hook") {
+        return Err("python_observer_registered".into());
+    }
     let store = Store::open(state, None)?;
     let repo = Path::new(text(&store.config, "repository")?);
     if !repo.is_dir() || fs::canonicalize(repo)? != repo {
         return Err("canonical_repository_required".into());
     }
     let exe = std::env::current_exe()?;
-    let digest = executable(&exe)?;
+    let (current, digest) = executable(&exe)?;
     let expected = entry(plan_path, exe.to_str().ok_or("invalid_path")?)?;
     // Do not stack registrations or silently take over another Rust adapter.
     if String::from_utf8_lossy(&raw).contains(" claude-hook ") {
@@ -276,7 +351,7 @@ pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> 
     file.write_all(&serde_json::to_vec_pretty(&plan)?)?;
     file.sync_all()?;
     File::open(plan_path.parent().ok_or("invalid_path")?)?.sync_all()?;
-    Ok(())
+    remember(state, &current)
 }
 fn load(plan_path: &Path) -> Result<Object> {
     let raw = read(plan_path)?;
@@ -410,7 +485,7 @@ fn save_manifest(plan: &Path, m: &Object) -> Result<()> {
     } else {
         None
     };
-    atomic_replace(&path, m, old.as_deref())
+    atomic_replace(&path, m, old.as_deref(), 0o600, read)
 }
 
 #[cfg(test)]
@@ -426,10 +501,9 @@ fn validate(p: &Object) -> Result<Store> {
     if !cfg!(target_os = "linux") {
         return Err("linux_only".into());
     }
-    if executable(Path::new(text(p, "executable")?))? != text(p, "executable_sha256")? {
-        return Err("executable_changed".into());
-    }
-    let store = Store::open(Path::new(text(p, "state")?), None)?;
+    let state = Path::new(text(p, "state")?);
+    verify_executable(p, state)?;
+    let store = Store::open(state, None)?;
     if p.get("scope") != Some(&Value::Object(store.config.clone())) {
         return Err("scope_changed".into());
     }
@@ -438,7 +512,7 @@ fn validate(p: &Object) -> Result<Store> {
 pub fn apply(plan_path: &Path) -> Result<()> {
     let p = load(plan_path)?;
     let path = Path::new(text(&p, "settings")?);
-    let _lock = lock(path, false)?;
+    let _lock = lock(Path::new(text(&p, "state")?), false)?;
     let (raw, mut doc) = settings(path)?;
     if owned(&doc, &p["entry"]).is_ok() {
         let mut m = manifest(plan_path, &p)?;
@@ -517,7 +591,14 @@ pub fn registration_status(plan_path: &Path, state: &Path) -> Result<Object> {
 pub fn remove(plan_path: &Path) -> Result<()> {
     let p = load(plan_path)?;
     let path = Path::new(text(&p, "settings")?);
-    let _lock = lock(path, false)?;
+    // Without its state directory no hook can capture, so removal proceeds
+    // unlocked rather than being stranded by a deleted spool.
+    let state = Path::new(text(&p, "state")?);
+    let _lock = if state.is_dir() {
+        Some(lock(state, false)?)
+    } else {
+        None
+    };
     let mut m = manifest(plan_path, &p)?;
     let (raw, mut doc) = settings(path)?;
     let status = text(&m, "status")?;
@@ -574,17 +655,61 @@ pub fn remove(plan_path: &Path) -> Result<()> {
     checkpoint("removed")
 }
 
-pub fn normalize(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
-    if raw.len() > MAX_INPUT {
+const HOOK_FIELDS: [&str; 11] = [
+    "hook_event_name",
+    "session_id",
+    "cwd",
+    "prompt_id",
+    "tool_use_id",
+    "agent_id",
+    "agent_type",
+    "source",
+    "model",
+    "reason",
+    "tool_name",
+];
+fn fields(raw: &[u8]) -> Result<Object> {
+    struct Known;
+    impl<'de> serde::de::Visitor<'de> for Known {
+        type Value = Object;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("hook object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Object, A::Error> {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Object::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(serde::de::Error::custom("duplicate"));
+                }
+                if HOOK_FIELDS.contains(&key.as_str()) {
+                    out.insert(key, map.next_value::<Value>()?);
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(out)
+        }
+    }
+    if raw.len() > MAX_HOOK_INPUT {
         return Err("input_too_large".into());
     }
-    let data = object(raw)?;
+    let mut de = serde_json::Deserializer::from_slice(raw);
+    let data = serde::Deserializer::deserialize_map(&mut de, Known)?;
+    de.end()?;
     let event = text(&data, "hook_event_name")?;
-    let session = text(&data, "session_id")?;
-    if !EVENTS.contains(&event) || !token(session) {
+    if !EVENTS.contains(&event) || !token(text(&data, "session_id")?) {
         return Err("invalid_event".into());
     }
-    let cwd = text(&data, "cwd")?;
+    Ok(data)
+}
+fn normalize(data: &Object, config: &Object) -> Result<Vec<u8>> {
+    let event = text(data, "hook_event_name")?;
+    let session = text(data, "session_id")?;
+    let cwd = text(data, "cwd")?;
     if cwd.len() > 4096 || !Path::new(cwd).is_absolute() {
         return Err("invalid_cwd".into());
     }
@@ -656,21 +781,102 @@ pub fn normalize(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     out.insert("observation_id".into(), id.to_string().into());
     serde_json::to_vec(&out).map_err(Into::into)
 }
-pub fn hook(plan_path: &Path, raw: &[u8]) -> Result<()> {
+fn input_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if error.is::<serde_json::Error>() {
+        return "invalid";
+    }
+    drop_reason(error)
+}
+// Past input parsing, unparseable JSON is registration state: settings, the
+// manifest or the saved scope, never the hook event.
+fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if error.is::<serde_json::Error>() {
+        return "stale_plan";
+    }
+    if let Some(e) = error.downcast_ref::<rustix::io::Errno>() {
+        return if *e == rustix::io::Errno::WOULDBLOCK {
+            "busy"
+        } else {
+            "error"
+        };
+    }
+    if let Some(e) = error.downcast_ref::<std::io::Error>() {
+        return match e.kind() {
+            std::io::ErrorKind::PermissionDenied => "permission",
+            _ => "error",
+        };
+    }
+    if let Some(rusqlite::Error::SqliteFailure(e, _)) = error.downcast_ref::<rusqlite::Error>() {
+        return match e.code {
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => "busy",
+            _ => "error",
+        };
+    }
+    match error.to_string().as_str() {
+        "outside_scope" => "outside_scope",
+        "spool_full" => "spool_full",
+        "observation_conflict" => "observation_conflict",
+        "revoked" => "revoked",
+        "invalid_event" | "invalid_cwd" | "invalid_metadata" | "input_too_large" => "invalid",
+        "owned_entry_missing"
+        | "owned_entry_changed"
+        | "executable_changed"
+        | "scope_changed"
+        | "plan_changed"
+        | "registration_not_active"
+        | "invalid_registration"
+        | "repair_required"
+        | "incompatible_spool" => "stale_plan",
+        "private_state_required"
+        | "symlink_path"
+        | "unsafe_ancestor"
+        | "unsafe_settings"
+        | "untrusted_executable"
+        | "native_executable_required" => "permission",
+        _ => "error",
+    }
+}
+/// Cheap checks run first so out-of-scope events never hash the executable,
+/// parse settings or open SQLite. Every refusal after the plan loads is counted.
+pub fn hook(plan_path: &Path, raw: Result<Vec<u8>>) -> Result<()> {
+    let data = raw.and_then(|raw| fields(&raw));
     let p = load(plan_path)?;
-    let path = Path::new(text(&p, "settings")?);
-    let _lock = lock(path, true)?;
-    let m = manifest(plan_path, &p)?;
+    let state = Path::new(text(&p, "state")?);
+    let data = data.inspect_err(|error| drops::note(state, input_reason(error.as_ref())))?;
+    let outcome = capture(plan_path, &p, state, &data);
+    if let Err(error) = &outcome {
+        drops::note(state, drop_reason(error.as_ref()));
+    }
+    outcome
+}
+fn active(plan_path: &Path, p: &Object) -> Result<()> {
+    let m = manifest(plan_path, p)?;
     if !["prepared", "installed"].contains(&text(&m, "status")?) {
         return Err("registration_not_active".into());
     }
-    let (_, doc) = settings(path)?;
+    Ok(())
+}
+fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<()> {
+    active(plan_path, p)?;
+    if crate::pairing::revoked(state) {
+        return Err("revoked".into());
+    }
+    let scope = p
+        .get("scope")
+        .and_then(Value::as_object)
+        .ok_or("invalid_scope")?;
+    let normalized = normalize(data, scope)?;
+    trusted_executable(p, state)?;
+    let _lock = lock(state, true)?;
+    active(plan_path, p)?;
+    let (_, doc) = settings(Path::new(text(p, "settings")?))?;
     owned(&doc, &p["entry"])?;
-    let mut store = validate(&p)?;
-    let normalized = normalize(raw, &store.config)?;
+    let mut store = Store::open(state, None)?;
+    if *scope != store.config {
+        return Err("scope_changed".into());
+    }
     // A racing duplicate has the same UUID but a new observation timestamp.
-    // Store's exact-byte conflict is deliberately ignored by the host-neutral
-    // entrypoint, preserving the first observation without rewriting evidence.
+    // The store's conflict refusal keeps the first observation unrewritten.
     store.collect(&normalized)
 }
 
@@ -705,7 +911,7 @@ mod recovery_tests {
             .filter(|e| original.get("hooks").and_then(|h| h.get(**e)).is_none())
             .collect();
         let p = json!({"version":1,"state":state,"settings":path,"plan":plan_path,
-            "scope":config,"executable":exe,"executable_sha256":executable(&exe).unwrap(),
+            "scope":config,"executable":exe,"executable_sha256":executable(&exe).unwrap().1,
             "settings_sha256":hash(&raw),"entry":entry(&plan_path, exe.to_str().unwrap()).unwrap(),
             "absent_events":absent,"absent_hooks":original.get("hooks").is_none()});
         fs::write(&plan_path, serde_json::to_vec(&p).unwrap()).unwrap();
@@ -759,9 +965,13 @@ mod recovery_tests {
                     assert!(owned(&doc, &p["entry"]).is_err());
                 }
                 if ["removing", "removed_settings", "removed"].contains(&stage) {
-                    // Revocation blocks capture before any payload/store work.
+                    // An inactive registration blocks capture before any store work.
+                    let event = json!({"hook_event_name": "Stop", "session_id": "s",
+                        "cwd": dir.path().join("repo")});
                     assert_eq!(
-                        hook(&plan, b"{}").unwrap_err().to_string(),
+                        hook(&plan, Ok(serde_json::to_vec(&event).unwrap()))
+                            .unwrap_err()
+                            .to_string(),
                         "registration_not_active"
                     );
                     // Removal retry works without a usable spool or executable.

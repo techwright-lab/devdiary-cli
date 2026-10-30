@@ -430,6 +430,14 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         return Ok(());
     }
 }
+// Only a paired outbox has a revocation marker. A plain state's parent is an
+// arbitrary user directory whose entries say nothing about this connection.
+pub(crate) fn revoked(state: &Path) -> bool {
+    state.file_name().is_some_and(|name| name == "outbox")
+        && state.parent().is_some_and(|root| {
+            root.join("connection.json").is_file() && root.join("revoked").exists()
+        })
+}
 pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
     let doc = connection(root)?;
     let config = doc["scope"].as_object().ok_or("invalid_connection")?;
@@ -450,12 +458,19 @@ pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
 pub fn sync(root: &Path, limit: usize) -> Result<(i64, i64)> {
     let doc = connection(root)?;
     initialize(root, &doc)?;
-    crate::store::sync_key(&root.join("outbox"), text(&doc, "token")?, limit)
+    crate::store::sync_key(
+        &root.join("outbox"),
+        text(&doc, "token")?,
+        limit,
+        Some(&root.join("revoked")),
+    )
 }
 pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     let doc = connection(root)?;
     initialize(root, &doc)?;
-    let (pending, delivered) = Store::open(&root.join("outbox"), None)?.counts()?;
+    let store = Store::open(&root.join("outbox"), None)?;
+    let (pending, delivered) = store.counts()?;
+    let drops = crate::drops::counts(&store, &root.join("outbox"))?;
     let registration = match plan {
         Some(path) => json!(crate::claude::registration_status(
             path,
@@ -465,7 +480,7 @@ pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     };
     println!(
         "{}",
-        json!({"connection":"saved", "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
+        json!({"connection":"saved", "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
     );
     Ok(())
 }
@@ -485,6 +500,21 @@ pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
         }
         "pairing_unavailable" => {
             "Pairing endpoint unavailable. Requires server PR #571 deployed; do not assume this backend is enabled."
+        }
+        "revoked" => {
+            "The server revoked this connection. Capture and sync have stopped; pair a new connection directory."
+        }
+        "sync_rate_limited" => {
+            "The server asked the collector to wait. Sync resumes after the saved Retry-After time."
+        }
+        "repair_required" => {
+            "This outbox uses an older storage format. Run: repair CONNECTION_DIR/outbox"
+        }
+        "python_observer_registered" => {
+            "These settings already register the Python observer hook. Remove it before registering this collector."
+        }
+        "unsafe_settings" => {
+            "Settings and their directory must be owned by you and not writable by group or others, with no symlinks or hardlinks."
         }
         "approved_scope_mismatch" => {
             "Approved scope does not match this installation and local repository. Revoke the unused browser connection, then --new-pair; hooks unchanged."

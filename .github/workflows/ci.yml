@@ -16,7 +16,8 @@ concurrency:
 jobs:
   qualification-safety:
     name: Qualification safety (no vendor or database calls)
-    runs-on: ubuntu-latest
+    # setup-ruby has no 3.4.4 build for the ubuntu-latest (26.04) image.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: ruby/setup-ruby@v1

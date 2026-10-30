@@ -168,7 +168,7 @@ begin
   raise "authorship changed" unless before == [WorkSession.count, SessionEvent.count, Attribution.count]
   raise "identity invented" unless CollectorObservation.first.metadata["attribution_basis"] == "unknown"
   guard.verify_application!
-  report.merge!({"passed" => true, "browser_real_csrf" => true, "lost_pairing_response_new_pair" => true, "consumed_replay_rejected" => true, "exact_ingest_replay" => true, "scoped_rejections" => 4, "unknown_authorship" => true, "plan_apply_remove_preserved_settings" => true, "record_id" => record_id})
+  report.merge!({"passed" => true, "browser_real_csrf" => true, "lost_pairing_response_new_pair" => true, "consumed_replay_rejected" => true, "exact_ingest_replay" => true, "scoped_rejections" => 4, "unknown_authorship" => true, "plan_apply_remove_preserved_settings" => true, "record_id" => record_id, "observation_id" => observation[:observation_id]})
 ensure
   QualificationCleanup.run(report, {
     "revoke" => -> {

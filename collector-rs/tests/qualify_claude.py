@@ -427,19 +427,16 @@ def rails_interop(args, root, env, report):
         with contextlib.closing(
             sqlite3.connect(root / "state/collector-rust-v1.sqlite3")
         ) as db:
-            receipts = [
-                json.loads(r[0])
-                for r in db.execute("SELECT receipt FROM outbox WHERE delivered=1")
-            ]
+            raw, delivered = db.execute(
+                "SELECT last_receipt,delivered FROM scope"
+            ).fetchone()
+        receipt = json.loads(raw)
         require(
-            all(
-                type(r.get("record_id")) is int and r["record_id"] > 0 for r in receipts
-            ),
+            type(receipt.get("record_id")) is int and receipt["record_id"] > 0,
             "receipt_record_ids",
         )
         require(
-            sorted(receipts, key=lambda r: r["observation_id"])
-            == sorted(expected, key=lambda r: r["observation_id"]),
+            receipt in expected and delivered == len(expected),
             "exact_rails_receipts",
         )
         report["exact_rails_receipts"] = True

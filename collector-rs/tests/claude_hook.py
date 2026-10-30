@@ -75,9 +75,9 @@ class ClaudeHookTest(unittest.TestCase):
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
-    def hook(self, data=None, raw=None):
+    def hook(self, data=None, raw=None, plan=None):
         result = subprocess.run(
-            [str(self.exe), "claude-hook", str(self.plan)],
+            [str(self.exe), "claude-hook", str(plan or self.plan)],
             input=raw
             if raw is not None
             else json.dumps(data if data is not None else self.raw).encode(),
@@ -89,6 +89,9 @@ class ClaudeHookTest(unittest.TestCase):
             (result.returncode, result.stdout, result.stderr), (0, b"", b"")
         )
         return result
+
+    def drops(self):
+        return json.loads(self.command("status", self.state).stdout)["drops"]
 
     def rows(self):
         with sqlite3.connect(self.state / "collector-rust-v1.sqlite3") as db:
@@ -213,9 +216,11 @@ class ClaudeHookTest(unittest.TestCase):
             after = {
                 str(p.relative_to(self.root)): p.read_bytes()
                 for p in self.root.rglob("*")
-                if p.is_file()
+                if p.is_file() and p.name != "drops.log"
             }
-            self.assertEqual(after, before)
+            before.pop("state/drops.log", None)
+            self.assertEqual(after.keys(), before.keys())
+            self.assertTrue(all(after[k] == before[k] for k in before))
         self.save(self.plan, original)
         self.command("claude-remove", self.plan, "--consent")
         self.command("claude-remove", self.plan, "--consent")
@@ -455,6 +460,7 @@ class ClaudeHookTest(unittest.TestCase):
         ):
             self.hook(raw=raw)
         self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"outside_scope": 2, "invalid": 9})
         child = self.repo / "sub"
         child.mkdir()
         self.hook(dict(self.raw, cwd=str(child)))
@@ -487,11 +493,14 @@ class ClaudeHookTest(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             list(pool.map(lambda _: self.hook(), range(12)))
         self.assertEqual(len(self.rows()), 1)
-        with (self.root / ".devdiary-rust-claude.lock").open("rb") as lock:
+        with (self.state / "claude-settings.lock").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.hook(dict(self.raw, tool_use_id="locked"))
             self.command("claude-remove", self.plan, "--consent", code=2)
         self.assertEqual(len(self.rows()), 1)
+        drops = self.drops()
+        self.assertGreaterEqual(drops.pop("busy"), 1)
+        self.assertLessEqual(drops.keys(), {"observation_conflict", "busy"})
 
     def test_consent_stale_plan_owned_entry_and_unrelated_edits(self):
         self.command("claude-remove", self.plan, code=2)
@@ -600,7 +609,7 @@ class ClaudeHookTest(unittest.TestCase):
         )
         import uuid
 
-        for _ in range(700):
+        for _ in range(1200):
             row["observation_id"] = str(uuid.uuid4())
             result = subprocess.run(
                 [str(self.exe), "collect", str(self.state)],
@@ -620,6 +629,115 @@ class ClaudeHookTest(unittest.TestCase):
         self.assertLessEqual(
             (self.state / "collector-rust-v1.sqlite3").stat().st_size, 16 * 1024 * 1024
         )
+
+    def test_outside_scope_event_counts_a_drop_without_a_row(self):
+        outside = self.root / "repo-other"
+        outside.mkdir()
+        self.hook(dict(self.raw, cwd=str(outside)))
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"outside_scope": 1})
+
+    def test_settings_readable_by_others_but_writable_only_by_owner(self):
+        self.command("claude-remove", self.plan, "--consent")
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        claude = home / ".claude"
+        claude.mkdir()
+        claude.chmod(0o755)
+        settings = claude / "settings.json"
+        settings.write_text(json.dumps(self.original))
+        settings.chmod(0o644)
+        plan = self.root / "shared-plan.json"
+        self.command("claude-plan", self.state, settings, plan)
+        self.command("claude-apply", plan, "--consent")
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o644)
+        self.hook(plan=plan)
+        self.assertEqual(len(self.rows()), 1)
+        for path, mode in ((settings, 0o664), (settings, 0o777), (claude, 0o777)):
+            with self.subTest(path=path.name, mode=oct(mode)):
+                original = path.stat().st_mode & 0o777
+                path.chmod(mode)
+                self.hook(dict(self.raw, tool_use_id=f"mode-{mode}"), plan=plan)
+                self.command("claude-remove", plan, "--consent", code=2)
+                path.chmod(original)
+        alias = home / "settings-alias.json"
+        os.link(settings, alias)
+        self.hook(dict(self.raw, tool_use_id="hardlinked"), plan=plan)
+        self.command("claude-remove", plan, "--consent", code=2)
+        alias.unlink()
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {"permission": 4})
+        linked = self.root / "linked-home"
+        linked.symlink_to(home, target_is_directory=True)
+        self.command(
+            "claude-plan",
+            self.state,
+            linked / ".claude/settings.json",
+            self.root / "linked-plan.json",
+            code=2,
+        )
+        self.command("claude-remove", plan, "--consent")
+        self.assertEqual(json.loads(settings.read_bytes()), self.original)
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o644)
+
+    def test_broken_settings_count_as_stale_plan_not_invalid_events(self):
+        text = self.settings.read_text()
+        for broken in ('{"permissions": {}, ' + text[1:], text[:-1]):
+            with self.subTest(broken=broken[:20]):
+                self.settings.write_text(broken)
+                self.hook()
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"stale_plan": 2})
+
+    def test_python_observer_registration_is_refused(self):
+        self.command("claude-remove", self.plan, "--consent")
+        self.plan.unlink()
+        observer = {"type": "command", "command": "python3 /opt/observer_hook.py"}
+        self.save(
+            self.settings,
+            dict(self.original, hooks={"Stop": [{"hooks": [observer]}]}),
+        )
+        result = self.command(
+            "claude-plan", self.state, self.settings, self.plan, code=2
+        )
+        self.assertIn(b"python_observer_registered", result.stderr)
+        self.assertFalse(self.plan.exists())
+
+    def test_replaced_binary_is_rehashed_within_the_hook_deadline(self):
+        self.assertGreater(self.exe.stat().st_size, 32 * 1024 * 1024)
+        fingerprint = self.state / "executable-fingerprint"
+        self.hook()
+        before = fingerprint.read_bytes()
+        replacement = self.root / "replacement"
+        shutil.copyfile(ROOT / "target/debug/devdiary-collector", replacement)
+        replacement.chmod(0o700)
+        os.replace(replacement, self.exe)
+        self.hook(dict(self.raw, tool_use_id="after-replace"))
+        self.assertEqual(len(self.rows()), 2)
+        self.assertNotEqual(fingerprint.read_bytes(), before)
+        with self.exe.open("ab") as f:
+            f.write(b"changed")
+        self.hook(dict(self.raw, tool_use_id="after-change"))
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(self.drops(), {"stale_plan": 1})
+
+    def test_unrelated_revoked_entry_beside_a_plain_state_is_ignored(self):
+        (self.root / "revoked").write_text("unrelated")
+        self.hook()
+        (self.root / "revoked").unlink()
+        (self.root / "revoked").mkdir()
+        self.hook(dict(self.raw, tool_use_id="beside-directory"))
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(self.drops(), {})
+
+    def test_large_tool_payload_is_skipped_up_to_four_mebibytes(self):
+        self.hook(dict(self.raw, tool_response="PRIVATE_SENTINEL" * 200_000))
+        self.assertEqual(len(self.rows()), 1)
+        self.hook(raw=b'{"pad":"' + b"x" * (4 * 1024 * 1024) + b'"}')
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {"invalid": 1})
+        for file in self.state.iterdir():
+            self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
 
     def test_hook_to_real_cli_http_delivery(self):
         owner = self
@@ -663,14 +781,18 @@ class ClaudeHookTest(unittest.TestCase):
             self.command("claude-plan", self.state, self.settings, self.plan)
             self.command("claude-apply", self.plan, "--consent")
             self.hook()
+            spooled = self.rows()
             key = self.root / "synthetic-key"
             key.write_text("dc_live_SYNTHETIC_ONLY")
             key.chmod(0o600)
+            (self.state / "executable-fingerprint").unlink()
             self.command("sync", self.state, key, "10")
-            self.assertEqual(received, self.rows())
+            self.assertTrue((self.state / "executable-fingerprint").exists())
+            self.assertEqual(received, spooled)
+            self.assertEqual(self.rows(), [])
             self.assertEqual(
                 json.loads(self.command("status", self.state).stdout),
-                {"pending": 0, "delivered": 1},
+                {"pending": 0, "delivered": 1, "drops": {}},
             )
         finally:
             server.shutdown()

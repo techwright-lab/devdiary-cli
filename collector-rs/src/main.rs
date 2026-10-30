@@ -1,22 +1,30 @@
 #![forbid(unsafe_code)]
 use devdiary_collector::{
-    MAX_INPUT, Result,
-    store::{Store, sync},
+    MAX_HOOK_INPUT, MAX_INPUT, Result, drops,
+    store::{Store, repair, sync},
 };
 use std::{io::Read, path::Path, sync::mpsc, time::Duration};
 
-fn input() -> Result<Vec<u8>> {
+// Static refusal codes only; other errors can carry input or paths.
+const REPORTED: [&str; 5] = [
+    "python_observer_registered",
+    "already_registered",
+    "unsafe_settings",
+    "stale_plan",
+    "repair_required",
+];
+fn input(limit: usize) -> Result<Vec<u8>> {
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut data = Vec::new();
         let result = std::io::stdin()
-            .take((MAX_INPUT + 1) as u64)
+            .take((limit + 1) as u64)
             .read_to_end(&mut data)
             .map(|_| data);
         let _ = tx.send(result);
     });
     let data = rx.recv_timeout(Duration::from_millis(700))??;
-    if data.len() > MAX_INPUT {
+    if data.len() > limit {
         return Err("input_too_large".into());
     }
     Ok(data)
@@ -84,7 +92,7 @@ fn run() -> Result<i32> {
             "setup PRIVATE_CONNECTION_DIR REPOSITORY [--remote NAME] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
         );
         println!(
-            "Experimental Linux collector; Claude adapter runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
+            "Experimental Linux collector; Claude adapter runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nrepair STATE (migrates an older spool; pending rows keep their bytes)\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
         );
         return Ok(0);
     }
@@ -110,16 +118,26 @@ fn run() -> Result<i32> {
     let state = Path::new(args.get(2).ok_or("state_required")?);
     let counts = match args.get(1).map(String::as_str) {
         Some("init") if args.len() == 4 && args[3] == "--consent" => {
-            Store::open(state, Some(&input()?))?.counts()?
+            Store::open(state, Some(&input(MAX_INPUT)?))?.counts()?
         }
         Some("collect") if args.len() == 3 => {
-            let raw = input()?;
+            let raw = input(MAX_INPUT)?;
             let mut store = Store::open(state, None)?;
             store.collect(&raw)?;
             store.counts()?
         }
         Some("sync") if args.len() == 5 => sync(state, Path::new(&args[3]), args[4].parse()?)?,
-        Some("status") if args.len() == 3 => Store::open(state, None)?.counts()?,
+        Some("status") if args.len() == 3 => {
+            let store = Store::open(state, None)?;
+            let (pending, delivered) = store.counts()?;
+            let drops = serde_json::to_string(&drops::counts(&store, state)?)?;
+            println!("{{\"pending\":{pending},\"delivered\":{delivered},\"drops\":{drops}}}");
+            return Ok(0);
+        }
+        Some("repair") if args.len() == 3 => {
+            repair(state)?;
+            Store::open(state, None)?.counts()?
+        }
         _ => return Err("invalid_command".into()),
     };
     println!("{{\"pending\":{},\"delivered\":{}}}", counts.0, counts.1);
@@ -152,7 +170,7 @@ fn main() {
             if args.len() != 3 {
                 return Ok(());
             }
-            devdiary_collector::claude::hook(Path::new(&args[2]), &input()?)
+            devdiary_collector::claude::hook(Path::new(&args[2]), input(MAX_HOOK_INPUT))
         });
         std::process::exit(0);
     }
@@ -170,6 +188,8 @@ fn main() {
                     "{}",
                     devdiary_collector::pairing::diagnostic(error.as_ref())
                 );
+            } else if let Some(code) = REPORTED.iter().find(|c| **c == error.to_string()) {
+                eprintln!("collector_error: {code}");
             } else {
                 eprintln!("collector_error");
             }
