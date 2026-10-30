@@ -359,7 +359,8 @@ class PairingTest(unittest.TestCase):
 
     def test_insecure_state_and_untrusted_origin_never_connect(self):
         connection = self.root / "connection"
-        connection.mkdir(mode=0o755)
+        connection.mkdir()
+        connection.chmod(0o755)
         self.assertNotEqual(self.run_setup().returncode, 0)
         connection.rmdir()
         connection.symlink_to(self.repo, target_is_directory=True)
