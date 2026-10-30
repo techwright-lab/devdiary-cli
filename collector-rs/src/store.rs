@@ -228,13 +228,9 @@ impl Store {
                 "INSERT INTO outbox(observation_id,payload) VALUES(?,?)",
                 params![id, payload],
             )?;
-            // Reserve every pending row's worst-case geometry: failure updates can
-            // split leaves or create overflow pages even when the added bytes are
-            // small. The table and its unique index each need at most one leaf
-            // and one interior page per row. Overflow pages carry 4092 bytes; 1024
-            // extra bytes bound the ID, record header and bounded failure code.
-            // 32 fixed pages cover scope, schema, drops and balancing; 160 more
-            // cover the capped delivered-ID tombstones.
+            // Worst case per pending row: a leaf and an interior page for the table
+            // and its unique index, plus overflow with 1024 bytes of ID/header/failure
+            // slack. 192 fixed pages cover schema, scope, drops and capped tombstones.
             let reserved: i64 = tx.query_row(
                 "SELECT 192 + coalesce(sum(4 + (length(payload)+1024+4091)/4092),0) FROM outbox",
                 [],

@@ -237,7 +237,7 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
         self.collect(0, **large)  # an exact retry of a delivered row stays deduplicated
         self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
-        self.call("collect", data=row)  # delivered rows no longer reserve capacity
+        self.call("collect", data=row)  # reclaimed capacity admits the refused row
         self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 1)
         (raw_receipt,) = db.execute("SELECT last_receipt FROM scope").fetchone()
         last = json.loads(raw_receipt)["observation_id"]
