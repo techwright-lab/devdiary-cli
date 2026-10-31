@@ -618,7 +618,7 @@ class InstallTest(unittest.TestCase):
         self.install("--yes")
         outbox = self.data / "connection/outbox"
         refs = (outbox / "repository-refs.json").read_bytes()
-        offer = (outbox / "orchestrators-offered.json")
+        offer = outbox / "orchestrators-offered.json"
         before_offer = offer.read_bytes() if offer.exists() else None
         self.scope_status = 503
         result = self.run_collector("upgrade", "--yes", code=2)
@@ -626,9 +626,7 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"retry", result.stderr)
         self.assertNotIn(b"response-secret", result.stdout + result.stderr)
         self.assertEqual((outbox / "repository-refs.json").read_bytes(), refs)
-        self.assertEqual(
-            offer.read_bytes() if offer.exists() else None, before_offer
-        )
+        self.assertEqual(offer.read_bytes() if offer.exists() else None, before_offer)
         self.assertIsNone(self.approved())
 
     def test_install_shows_the_names_and_stores_them_only_on_yes(self):

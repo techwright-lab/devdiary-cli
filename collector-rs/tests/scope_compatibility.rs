@@ -40,7 +40,7 @@ fn refresh_wire(status: u16, raw: String, accepted: bool, length: usize) {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let mut request = [0; 8192];
-        socket.read(&mut request).unwrap();
+        let _request_bytes = socket.read(&mut request).unwrap();
         if status == 0 {
             return;
         }
