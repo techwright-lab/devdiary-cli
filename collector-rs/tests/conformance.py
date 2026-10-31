@@ -528,16 +528,12 @@ class CollectorTest(unittest.TestCase):
         self.call("sync", self.key, 10)
         refs = (self.state / "repository-refs.json").read_bytes()
         offer = (self.state / "orchestrators-offered.json").read_bytes()
-        evil = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
         failures = {
             "scope_refresh_network_failure": "loss",
             "scope_refresh_http_failure": (503, b'{"error":"response-secret"}'),
             "scope_refresh_read_failure": (200, b"{response-secret", 100),
             "scope_refresh_response_too_large": (200, b"x" * 262145),
             "scope_refresh_invalid_response": (200, b"{response-secret"),
-            "scope_refresh_offer_refused": self.good_scope(
-                orchestrators=[evil], repository_refs=["https://github.com/acme/bad"]
-            ),
         }
         for number, (code, scope) in enumerate(failures.items(), start=1):
             with self.subTest(code):
@@ -557,6 +553,31 @@ class CollectorTest(unittest.TestCase):
                 self.assertEqual(
                     (self.state / "orchestrators-offered.json").read_bytes(), offer
                 )
+
+    def test_a_refused_entry_applies_refs_keeps_the_offer_and_still_delivers(self):
+        self.installation_state()
+        self.scope = self.good_scope()
+        self.call("sync", self.key, 10)
+        offer = (self.state / "orchestrators-offered.json").read_bytes()
+        evil = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
+        refs = ["https://github.com/acme/moved"]
+        self.scope = self.good_scope(orchestrators=[evil], repository_refs=refs)
+        self.collect_v2(1)
+        result = self.call("sync", self.key, 10)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "pending": 0,
+                "delivered": 1,
+                "scope_refresh_error": "scope_refresh_offer_refused",
+            },
+        )
+        self.assertEqual(
+            json.loads((self.state / "repository-refs.json").read_bytes()), refs
+        )
+        self.assertEqual(
+            (self.state / "orchestrators-offered.json").read_bytes(), offer
+        )
 
     def test_revocation_and_a_requested_wait_stop_delivery(self):
         self.installation_state()

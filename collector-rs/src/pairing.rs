@@ -356,11 +356,9 @@ impl Target {
                 (config, None)
             }
             Self::Installation { record_outside } => {
-                let versions = c
-                    .get("observation_schema_versions")
-                    .and_then(|v| v.as_array())
-                    .filter(|v| v.iter().all(|n| n.as_u64().is_some()) && v.contains(&json!(1)))
-                    .ok_or("approved_scope_mismatch")?;
+                let versions =
+                    crate::store::accepted_versions(c.get("observation_schema_versions"))
+                        .ok_or("approved_scope_mismatch")?;
                 if c.get("scope_kind") != Some(&json!("installation"))
                     || c.get("scope_path") != Some(&json!("/ingest/v1/collector/scope"))
                 {

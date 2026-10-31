@@ -7,15 +7,17 @@ use std::{
     process::Command,
 };
 
-#[derive(Clone, Copy)]
 enum Want {
     Applied,
     Kept(&'static str),
+    Refused(Value),
     Stopped,
 }
-use Want::{Applied, Kept, Stopped};
+use Want::{Applied, Kept, Refused, Stopped};
 const INVALID: Want = Kept("scope_refresh_invalid_response");
-const OFFER_REFUSED: Want = Kept("scope_refresh_offer_refused");
+const OFFER_REFUSED: &str = "scope_refresh_offer_refused";
+const EMPTY_OFFER: &str = r#"{"orchestrators":[],"refused":0}"#;
+const NEW_REFS: &str = "[\"https://github.com/acme/new\"]";
 
 fn refresh(status: u16, body: Value, want: Want) {
     refresh_raw(status, body.to_string(), want);
@@ -25,6 +27,14 @@ fn refresh_raw(status: u16, raw: String, want: Want) {
     refresh_wire(status, raw, want, length);
 }
 fn refresh_wire(status: u16, raw: String, want: Want, length: usize) {
+    refresh_over(EMPTY_OFFER, status, raw, want, length);
+}
+fn refresh_saved(saved: &str, body: Value, want: Want) {
+    let raw = body.to_string();
+    let length = raw.len();
+    refresh_over(saved, 200, raw, want, length);
+}
+fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
         "http://{}/ingest/v1/observations",
@@ -72,8 +82,7 @@ fn refresh_wire(status: u16, raw: String, want: Want, length: usize) {
     fs::write(&refs, b"[\"https://github.com/acme/old\"]").unwrap();
     fs::set_permissions(&refs, fs::Permissions::from_mode(0o600)).unwrap();
     let offered = dir.path().join("orchestrators-offered.json");
-    let old_offer = br#"{"orchestrators":[],"refused":0}"#;
-    fs::write(&offered, old_offer).unwrap();
+    fs::write(&offered, saved).unwrap();
     fs::set_permissions(&offered, fs::Permissions::from_mode(0o600)).unwrap();
     let approved = dir.path().join("orchestrators-approved.json");
     fs::write(&approved, b"[]").unwrap();
@@ -99,24 +108,33 @@ fn refresh_wire(status: u16, raw: String, want: Want, length: usize) {
     assert!(!stdout.contains("dc_live_secret_fixture"));
     assert!(!stdout.contains("response-secret"));
     assert_eq!(fs::read(approved).unwrap(), b"[]");
-    if let Kept(code) = want {
+    let reported = match want {
+        Kept(code) => Some(code),
+        Refused(_) => Some(OFFER_REFUSED),
+        Applied | Stopped => None,
+    };
+    if let Some(code) = reported {
         let line: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(stdout.lines().count(), 1);
         assert_eq!(line["scope_refresh_error"], code);
     }
-    if matches!(want, Applied) {
-        assert!(!stdout.contains("scope_refresh_error"));
-        assert_eq!(
-            fs::read_to_string(refs).unwrap(),
-            "[\"https://github.com/acme/new\"]"
-        );
-    } else {
-        assert!(!error.trim().is_empty());
-        assert_eq!(fs::read(offered).unwrap(), old_offer);
-        assert_eq!(
-            fs::read_to_string(refs).unwrap(),
-            "[\"https://github.com/acme/old\"]"
-        );
+    let refs_now = fs::read_to_string(refs).unwrap();
+    let offer_now = fs::read_to_string(offered).unwrap();
+    match want {
+        Applied => {
+            assert!(!stdout.contains("scope_refresh_error"));
+            assert_eq!(refs_now, NEW_REFS);
+        }
+        Refused(offer) => {
+            assert!(!error.trim().is_empty());
+            assert_eq!(refs_now, NEW_REFS);
+            assert_eq!(serde_json::from_str::<Value>(&offer_now).unwrap(), offer);
+        }
+        Kept(_) | Stopped => {
+            assert!(!error.trim().is_empty());
+            assert_eq!(offer_now, saved);
+            assert_eq!(refs_now, "[\"https://github.com/acme/old\"]");
+        }
     }
 }
 fn payload() -> Value {
@@ -144,18 +162,72 @@ fn scope_compatibility_nonempty_orchestrators() {
 }
 #[test]
 fn scope_compatibility_malformed_orchestrators() {
-    for invalid in [
-        json!(null),
-        json!({}),
-        json!([{}]),
-        json!([preset(), preset()]),
-        json!([{"key":"paperclip","env":{"agent_ref":42}}]),
-        json!([{"key":"paperclip","env":{"agent_ref":"invalid-name"}}]),
-        json!([{"key":"paperclip","env":{"unexpected":"NAME"}}]),
+    for (invalid, clean) in [
+        (json!(null), json!([])),
+        (json!({}), json!([])),
+        (json!([{}]), json!([])),
+        (json!([preset(), preset()]), json!([preset()])),
+        (
+            json!([{"key":"paperclip","env":{"agent_ref":42}}]),
+            json!([]),
+        ),
+        (
+            json!([{"key":"paperclip","env":{"agent_ref":"invalid-name"}}]),
+            json!([]),
+        ),
+        (
+            json!([{"key":"paperclip","env":{"unexpected":"NAME"}}]),
+            json!([]),
+        ),
     ] {
         let mut p = payload();
         p["orchestrators"] = invalid;
-        refresh(200, p, OFFER_REFUSED);
+        refresh(200, p, Refused(json!({"orchestrators":clean,"refused":1})));
+    }
+}
+fn refused_entry() -> Value {
+    json!({"key":"evil","env":{"agent_ref":"AWS_SECRET_ACCESS_KEY"}})
+}
+#[test]
+fn scope_compatibility_refused_entry_replaces_an_offer_with_no_entries() {
+    for saved in [EMPTY_OFFER, r#"{"orchestrators":[],"refused":2}"#] {
+        let mut p = payload();
+        p["orchestrators"] = json!([preset(), refused_entry()]);
+        let clean = json!({"orchestrators":[preset()],"refused":1});
+        refresh_saved(saved, p, Refused(clean));
+    }
+}
+#[test]
+fn scope_compatibility_refused_entry_keeps_saved_entries_but_applies_refs() {
+    let saved = json!({"orchestrators":[preset()],"refused":0});
+    let mut other = preset();
+    other["key"] = json!("cron");
+    let mut p = payload();
+    p["orchestrators"] = json!([other, refused_entry()]);
+    refresh_saved(&saved.to_string(), p, Refused(saved));
+}
+#[test]
+fn scope_compatibility_accepts_every_version_list_pairing_accepts() {
+    for versions in [json!([1]), json!([1, 2]), json!([1, 2, 3]), json!([3, 1])] {
+        let mut p = payload();
+        p["observation_schema_versions"] = versions;
+        refresh(200, p, Applied);
+    }
+}
+#[test]
+fn scope_compatibility_refuses_version_lists_pairing_refuses() {
+    for versions in [
+        json!(null),
+        json!(1),
+        json!([]),
+        json!([2]),
+        json!(["1"]),
+        json!([1, "2"]),
+        json!([1, -2]),
+    ] {
+        let mut p = payload();
+        p["observation_schema_versions"] = versions;
+        refresh(200, p, INVALID);
     }
 }
 #[test]
@@ -165,7 +237,6 @@ fn scope_compatibility_identity_mismatch() {
         ("scope_kind", json!("repository")),
         ("schema_version", json!(2)),
         ("repository_refs", json!(["invalid-repository"])),
-        ("observation_schema_versions", json!(["1"])),
     ] {
         let mut p = payload();
         p[field] = value;

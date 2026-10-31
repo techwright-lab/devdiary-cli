@@ -158,8 +158,8 @@ pub fn waiting(state: &Path) -> bool {
 pub fn offer_unreadable(state: &Path) -> bool {
     offered(state).is_err()
 }
-pub(crate) fn offer_saved(state: &Path) -> bool {
-    matches!(offered(state), Ok(Some(_)))
+pub(crate) fn entries_saved(state: &Path) -> bool {
+    matches!(offered(state), Ok(Some(offer)) if !list(&offer).is_empty())
 }
 /// What approval would save, as read once: approving never takes a later offer.
 pub(crate) fn pending(state: &Path) -> Result<(Vec<Value>, u64)> {

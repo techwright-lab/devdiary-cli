@@ -743,9 +743,9 @@ fn refresh_and_note(
     store.note_scope_refresh(failure)?;
     Ok(failure)
 }
-// A failed refresh returns its code: the last good refs, offer and approvals stay,
-// and spooled rows are still delivered. Err stops the run: revocation, a
-// server-requested wait or a local failure.
+// A returned code never stops delivery. A failed refresh keeps refs, offer and
+// approvals; a refused entry holds back only the offer. Err stops the run:
+// revocation, a server-requested wait or a local failure.
 fn refresh_scope(
     client: &reqwest::blocking::Client,
     store: &Store,
@@ -803,13 +803,10 @@ fn refresh_scope(
     let refused = offer
         .as_ref()
         .is_some_and(|o| o["refused"] != serde_json::json!(0));
-    // With no saved offer nothing good can be lost, and saving the clean part
-    // lets the hook mark rows of a run that nobody has approved.
-    if refused && orchestrators::offer_saved(state) {
-        return Ok(Some(OFFER_REFUSED));
-    }
     replace_refs(state, &refs)?;
-    if let Some(offer) = offer {
+    // With no saved entries nothing good can be lost, and saving the clean part
+    // lets the hook mark rows of a run that nobody has approved.
+    if let Some(offer) = offer.filter(|_| !refused || !orchestrators::entries_saved(state)) {
         orchestrators::save_offer(state, &offer)?;
     }
     Ok(refused.then_some(OFFER_REFUSED))
@@ -830,15 +827,18 @@ fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde
         || doc["schema_version"] != serde_json::json!(1)
         || doc.get("collector_ref") != config.get("collector_ref")
         || doc["scope_kind"] != serde_json::json!("installation")
-    {
-        return Err("invalid_scope_response".into());
-    }
-    if doc["observation_schema_versions"] != serde_json::json!([1])
-        && doc["observation_schema_versions"] != serde_json::json!([1, 2])
+        || accepted_versions(doc.get("observation_schema_versions")).is_none()
     {
         return Err("invalid_scope_response".into());
     }
     Ok((repository_refs(&doc["repository_refs"])?, offer))
+}
+pub(crate) fn accepted_versions(
+    versions: Option<&serde_json::Value>,
+) -> Option<&Vec<serde_json::Value>> {
+    versions
+        .and_then(serde_json::Value::as_array)
+        .filter(|v| v.iter().all(|n| n.as_u64().is_some()) && v.contains(&serde_json::json!(1)))
 }
 const MAX_RETRY_AFTER: i64 = 86400;
 fn retry_after(value: &str, now: i64) -> Option<i64> {

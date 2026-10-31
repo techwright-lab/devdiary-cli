@@ -265,8 +265,9 @@ unit.
 Each `sync`, `connection-sync` and `timer-sync` batch refreshes the scope first. A
 network failure, a non-200 reply, a read failure, or an oversized or invalid reply
 keeps the last good refs, offer and approvals, and spooled rows are still delivered.
-A refused orchestrator entry does the same; an offer is saved without the entry only
-when no offer exists yet. `sync` and `connection-sync` add a `scope_refresh_error`
+A refused orchestrator entry is reported the same way, but the new refs still apply,
+and an offer is saved without the entry only when no saved offer has entries yet.
+`sync` and `connection-sync` add a `scope_refresh_error`
 code to their JSON line and print guidance to stderr. The last code is kept for
 `doctor` as `last_scope_refresh_error` and for `connection-status` as
 `local_scope_refresh_error`, until a good refresh clears it. Revocation and a
