@@ -33,6 +33,7 @@ pub fn locate(cwd: &Path) -> (Checkout, Option<PathBuf>) {
         match fs::symlink_metadata(dir.join(".git")) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return (Checkout::Unresolved, None),
+            Ok(_) if stray_git_dir(&dir.join(".git")) => continue,
             Ok(_) => {
                 let gitdir = git_dir(dir);
                 return match gitdir.as_deref().and_then(repository) {
@@ -43,6 +44,12 @@ pub fn locate(cwd: &Path) -> (Checkout, Option<PathBuf>) {
         }
     }
     (Checkout::Absent, None)
+}
+
+// Git itself walks past a directory that is not a repository, and so must a
+// run working under one, or every row in that tree drops as unknown.
+fn stray_git_dir(dotgit: &Path) -> bool {
+    dotgit.is_dir() && !dotgit.join("HEAD").exists() && !dotgit.join("config").exists()
 }
 
 fn repository(gitdir: &Path) -> Option<String> {
@@ -185,6 +192,22 @@ mod tests {
     }
     fn found(slug: &str) -> Checkout {
         Checkout::Repository(format!("https://github.com/{slug}"))
+    }
+
+    #[test]
+    fn a_stray_git_dir_is_not_a_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let stray = dir.path().join("workspace");
+        fs::create_dir_all(stray.join(".git/info")).unwrap();
+        assert_eq!(resolve(&stray), Checkout::Absent);
+    }
+
+    #[test]
+    fn a_stray_git_dir_does_not_hide_the_repository_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(dir.path(), "https://github.com/acme/project.git");
+        fs::create_dir_all(repo.join("nested/.git/info")).unwrap();
+        assert_eq!(resolve(&repo.join("nested")), found("acme/project"));
     }
 
     #[test]
