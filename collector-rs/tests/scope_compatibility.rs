@@ -60,7 +60,9 @@ fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let mut request = [0; 8192];
-        let _request_bytes = socket.read(&mut request).unwrap();
+        let request_bytes = socket.read(&mut request).unwrap();
+        let sent = String::from_utf8_lossy(&request[..request_bytes]).to_ascii_lowercase();
+        assert!(sent.contains("\r\ndevdiary-scope-keys: accepts_declared_run_ref\r\n"));
         if status == 0 {
             return;
         }

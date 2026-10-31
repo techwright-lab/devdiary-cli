@@ -888,7 +888,11 @@ class InstallationFixture:
                 }
                 if owner.served_orchestrators is not None:
                     reply["orchestrators"] = owner.served_orchestrators
-                if owner.served_declared_run is not None:
+                declared = self.headers.get("DevDiary-Scope-Keys")
+                if (
+                    owner.served_declared_run is not None
+                    and declared == "accepts_declared_run_ref"
+                ):
                     reply["accepts_declared_run_ref"] = owner.served_declared_run
                 self.reply(200, reply)
 

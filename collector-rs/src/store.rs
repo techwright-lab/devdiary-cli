@@ -18,6 +18,10 @@ pub(crate) const FINGERPRINT: &str = "executable-fingerprint";
 const REFS: &str = "repository-refs.json";
 const MAX_REFS: u64 = 262144;
 const SCOPE_PATH: &str = "/ingest/v1/collector/scope";
+// Collectors older than this header refuse a scope reply with any key they do not
+// know, so the server may send an optional key only when it is listed here.
+const SCOPE_KEYS_HEADER: &str = "DevDiary-Scope-Keys";
+const SCOPE_KEYS: &str = "accepts_declared_run_ref";
 // Delivered IDs are kept so a late duplicate hook firing is still deduplicated
 // instead of being resent as a conflicting observation.
 const TOMBSTONES: i64 = 4000;
@@ -784,6 +788,7 @@ fn refresh_scope(
         .get(url)
         .bearer_auth(key)
         .header("Accept", "application/json")
+        .header(SCOPE_KEYS_HEADER, SCOPE_KEYS)
         .send()
     else {
         return Ok(Some("scope_refresh_network_failure"));

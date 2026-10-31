@@ -375,6 +375,17 @@ session with that ref. The hook sends the same ref in the optional v2 field
 `declared_run_ref`, so the server can match the observed visit to the declared
 session and show one run once.
 
+The scope request lists the optional reply keys this collector understands:
+
+```text
+DevDiary-Scope-Keys: accepts_declared_run_ref
+```
+
+The server must send `accepts_declared_run_ref` only to a request with that header.
+Older collectors do not send it, and they refuse a scope reply with a key they do not
+know (`scope_refresh_invalid_response`), which keeps their refs and offer stale until
+`upgrade`.
+
 The field needs a `true` answer in the scope reply:
 
 ```json
