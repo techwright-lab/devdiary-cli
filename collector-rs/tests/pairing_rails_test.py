@@ -418,6 +418,39 @@ class InstallationPairingTest(unittest.TestCase):
         self.run_collector("connection-sync", self.connection, "10", code=2)
         self.assertTrue((self.connection / "revoked").exists())
 
+    def test_a_failed_refresh_is_reported_until_a_good_one_clears_it(self):
+        self.setup_collector()
+        self.run_collector("connection-sync", self.connection, "10")
+        refs = self.connection / "outbox/repository-refs.json"
+        before = refs.read_bytes()
+        self.scope_status = 503
+        result = self.run_collector("connection-sync", self.connection, "10")
+        (line,) = result.stdout.splitlines()
+        self.assertEqual(
+            json.loads(line),
+            {
+                "pending": 0,
+                "delivered": 0,
+                "scope_refresh_error": "scope_refresh_http_failure",
+            },
+        )
+        self.assertIn(b"The server refused scope refresh", result.stderr)
+        self.assertEqual(refs.read_bytes(), before)
+        health = json.loads(
+            self.run_collector("connection-status", self.connection).stdout
+        )
+        self.assertEqual(
+            health["local_scope_refresh_error"], "scope_refresh_http_failure"
+        )
+        self.scope_status = 200
+        result = self.run_collector("connection-sync", self.connection, "10")
+        self.assertEqual(json.loads(result.stdout), {"pending": 0, "delivered": 0})
+        self.assertEqual(result.stderr, b"")
+        health = json.loads(
+            self.run_collector("connection-status", self.connection).stdout
+        )
+        self.assertIsNone(health["local_scope_refresh_error"])
+
     def test_a_server_without_v2_pairs_a_v1_installation(self):
         self.connection_shape = {"observation_schema_versions": [1]}
         self.setup_collector()

@@ -31,6 +31,8 @@ const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INT
     CREATE TABLE IF NOT EXISTS self_test (session_id TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;";
 const SELF_TESTS: i64 = 10;
 const MARKS_TABLE: &str = "CREATE TABLE IF NOT EXISTS bracket_marks (session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, checkout_key TEXT NOT NULL, offset INTEGER NOT NULL, ino INTEGER NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, PRIMARY KEY(session_id, tool_use_id)) WITHOUT ROWID;";
+const SCOPE_FAILURE_TABLE: &str = "CREATE TABLE IF NOT EXISTS scope_refresh_failure (singleton INTEGER PRIMARY KEY CHECK(singleton=1), code TEXT NOT NULL);";
+const OFFER_REFUSED: &str = "scope_refresh_offer_refused";
 const MARK_TTL_NANOS: i64 = 6 * 3_600_000_000_000;
 const MAX_MARKS: i64 = 256;
 
@@ -219,9 +221,26 @@ impl Store {
         }
         tx.execute_batch(FOLD_TABLE)?;
         tx.execute_batch(MARKS_TABLE)?;
+        tx.execute_batch(SCOPE_FAILURE_TABLE)?;
         tx.commit()?;
         File::open(state)?.sync_all()?;
         Ok(Self { db, config })
+    }
+    pub fn scope_refresh_failure(&self) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT code FROM scope_refresh_failure", [], |r| r.get(0))
+            .optional()?)
+    }
+    fn note_scope_refresh(&self, failure: Option<&str>) -> Result<()> {
+        match failure {
+            Some(code) => self.db.execute(
+                "INSERT OR REPLACE INTO scope_refresh_failure(singleton,code) VALUES(1,?)",
+                [code],
+            )?,
+            None => self.db.execute("DELETE FROM scope_refresh_failure", [])?,
+        };
+        Ok(())
     }
     pub fn collect(&mut self, raw: &[u8]) -> Result<()> {
         let payload = freeze(raw, &self.config)?;
@@ -589,27 +608,23 @@ fn credential(path: &Path) -> Result<String> {
 }
 
 pub fn sync(state: &Path, key_path: &Path, limit: usize) -> Result<(i64, i64)> {
+    sync_outcome(state, key_path, limit).map(|r| (r.pending, r.delivered))
+}
+pub fn sync_outcome(state: &Path, key_path: &Path, limit: usize) -> Result<Report> {
     // Compatibility entrypoint for existing manually provisioned credentials.
     if key_path.starts_with(state) {
         return Err("separate_credential_required".into());
     }
-    sync_key(state, &credential(key_path)?, limit, None)
+    sync_report(state, &credential(key_path)?, limit, None)
 }
-pub(crate) fn sync_key(
-    state: &Path,
-    key: &str,
-    limit: usize,
-    revoked: Option<&Path>,
-) -> Result<(i64, i64)> {
-    sync_report(state, key, limit, revoked).map(|r| (r.pending, r.delivered))
-}
-pub(crate) struct Report {
+pub struct Report {
     pub pending: i64,
     pub delivered: i64,
     pub attempted: usize,
     pub stopped: Option<String>,
     pub refused: usize,
     pub refusal: Option<String>,
+    pub scope_refresh_error: Option<&'static str>,
 }
 pub(crate) fn sync_report(
     state: &Path,
@@ -645,9 +660,11 @@ pub(crate) fn sync_report(
         .ok_or("invalid_collector")?
         .to_owned();
     let client = client()?;
-    if crate::installation(&store.config) {
-        refresh_scope(&client, &store, state, key, revoked)?;
-    }
+    let scope_refresh_error = if crate::installation(&store.config) {
+        refresh_and_note(&client, &store, state, key, revoked)?
+    } else {
+        None
+    };
     let mut attempted = 0;
     let mut stopped = None;
     let mut refused = 0;
@@ -695,6 +712,7 @@ pub(crate) fn sync_report(
         stopped,
         refused,
         refusal,
+        scope_refresh_error,
     })
 }
 fn client() -> Result<reqwest::blocking::Client> {
@@ -709,17 +727,32 @@ pub(crate) fn scope_now(state: &Path, key: &str, revoked: Option<&Path>) -> Resu
     let lock = create_private(&state.join("sync.lock"))?;
     lock.lock()?;
     let store = Store::open(state, None)?;
-    refresh_scope(&client()?, &store, state, key, revoked)
+    match refresh_and_note(&client()?, &store, state, key, revoked)? {
+        Some(code) => Err(code.into()),
+        None => Ok(()),
+    }
 }
-// A refresh that fails for any reason but revocation or a server-requested
-// wait keeps the last good lists; delivery of spooled rows still proceeds.
+fn refresh_and_note(
+    client: &reqwest::blocking::Client,
+    store: &Store,
+    state: &Path,
+    key: &str,
+    revoked: Option<&Path>,
+) -> Result<Option<&'static str>> {
+    let failure = refresh_scope(client, store, state, key, revoked)?;
+    store.note_scope_refresh(failure)?;
+    Ok(failure)
+}
+// A returned code never stops delivery. A failed refresh keeps refs, offer and
+// approvals; a refused entry holds back only the offer. Err stops the run:
+// revocation, a server-requested wait or a local failure.
 fn refresh_scope(
     client: &reqwest::blocking::Client,
     store: &Store,
     state: &Path,
     key: &str,
     revoked: Option<&Path>,
-) -> Result<()> {
+) -> Result<Option<&'static str>> {
     let mut url = reqwest::Url::parse(
         store.config["endpoint"]
             .as_str()
@@ -732,7 +765,7 @@ fn refresh_scope(
         .header("Accept", "application/json")
         .send()
     else {
-        return Ok(());
+        return Ok(Some("scope_refresh_network_failure"));
     };
     let status = response.status().as_u16();
     if matches!(status, 401 | 403) {
@@ -754,20 +787,29 @@ fn refresh_scope(
         )?;
         return Err("sync_rate_limited".into());
     }
+    if status != 200 {
+        return Ok(Some("scope_refresh_http_failure"));
+    }
     let mut raw = Vec::new();
-    if status != 200
-        || response.take(MAX_REFS + 1).read_to_end(&mut raw).is_err()
-        || raw.len() as u64 > MAX_REFS
-    {
-        return Ok(());
+    if response.take(MAX_REFS + 1).read_to_end(&mut raw).is_err() {
+        return Ok(Some("scope_refresh_read_failure"));
     }
-    if let Ok((refs, offer)) = scope_reply(&raw, &store.config) {
-        replace_refs(state, &refs)?;
-        if let Some(offer) = offer {
-            orchestrators::save_offer(state, &offer)?;
-        }
+    if raw.len() as u64 > MAX_REFS {
+        return Ok(Some("scope_refresh_response_too_large"));
     }
-    Ok(())
+    let Ok((refs, offer)) = scope_reply(&raw, &store.config) else {
+        return Ok(Some("scope_refresh_invalid_response"));
+    };
+    let refused = offer
+        .as_ref()
+        .is_some_and(|o| o["refused"] != serde_json::json!(0));
+    replace_refs(state, &refs)?;
+    // With no saved entries nothing good can be lost, and saving the clean part
+    // lets the hook mark rows of a run that nobody has approved.
+    if let Some(offer) = offer.filter(|_| !refused || !orchestrators::entries_saved(state)) {
+        orchestrators::save_offer(state, &offer)?;
+    }
+    Ok(refused.then_some(OFFER_REFUSED))
 }
 fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde_json::Value>)> {
     serde_json::from_slice::<crate::claude::UniqueKeys>(raw)?;
@@ -785,10 +827,18 @@ fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde
         || doc["schema_version"] != serde_json::json!(1)
         || doc.get("collector_ref") != config.get("collector_ref")
         || doc["scope_kind"] != serde_json::json!("installation")
+        || accepted_versions(doc.get("observation_schema_versions")).is_none()
     {
         return Err("invalid_scope_response".into());
     }
     Ok((repository_refs(&doc["repository_refs"])?, offer))
+}
+pub(crate) fn accepted_versions(
+    versions: Option<&serde_json::Value>,
+) -> Option<&Vec<serde_json::Value>> {
+    versions
+        .and_then(serde_json::Value::as_array)
+        .filter(|v| v.iter().all(|n| n.as_u64().is_some()) && v.contains(&serde_json::json!(1)))
 }
 const MAX_RETRY_AFTER: i64 = 86400;
 fn retry_after(value: &str, now: i64) -> Option<i64> {

@@ -356,11 +356,9 @@ impl Target {
                 (config, None)
             }
             Self::Installation { record_outside } => {
-                let versions = c
-                    .get("observation_schema_versions")
-                    .and_then(|v| v.as_array())
-                    .filter(|v| v.iter().all(|n| n.as_u64().is_some()) && v.contains(&json!(1)))
-                    .ok_or("approved_scope_mismatch")?;
+                let versions =
+                    crate::store::accepted_versions(c.get("observation_schema_versions"))
+                        .ok_or("approved_scope_mismatch")?;
                 if c.get("scope_kind") != Some(&json!("installation"))
                     || c.get("scope_path") != Some(&json!("/ingest/v1/collector/scope"))
                 {
@@ -606,17 +604,7 @@ pub fn plan_with(root: &Path, settings: &Path, plan: &Path, exe: &Path) -> Resul
     initialize(root, &doc)?;
     crate::claude::plan_for(&root.join("outbox"), settings, plan, exe)
 }
-pub fn sync(root: &Path, limit: usize) -> Result<(i64, i64)> {
-    let doc = connection(root)?;
-    initialize(root, &doc)?;
-    crate::store::sync_key(
-        &root.join("outbox"),
-        text(&doc, "token")?,
-        limit,
-        Some(&root.join("revoked")),
-    )
-}
-pub(crate) fn sync_report(root: &Path, limit: usize) -> Result<crate::store::Report> {
+pub fn sync(root: &Path, limit: usize) -> Result<crate::store::Report> {
     let doc = connection(root)?;
     initialize(root, &doc)?;
     crate::store::sync_report(
@@ -653,7 +641,7 @@ pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     let orchestrators = crate::orchestrators::summary(&root.join("outbox"));
     println!(
         "{}",
-        json!({"connection":"saved", "local_repository_refs":refs, "local_orchestrators":orchestrators, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
+        json!({"connection":"saved", "local_repository_refs":refs, "local_orchestrators":orchestrators, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_scope_refresh_error":store.scope_refresh_failure()?,"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
     );
     Ok(())
 }
@@ -662,7 +650,10 @@ pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
     known_diagnostic(error).unwrap_or(SETUP_INCOMPLETE)
 }
 pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
-    Some(match error.to_string().as_str() {
+    guidance(&error.to_string())
+}
+pub fn guidance(code: &str) -> Option<&'static str> {
+    Some(match code {
         "choose_remote" => {
             "Multiple or missing GitHub remotes: choose explicitly with --remote NAME."
         }
@@ -677,6 +668,18 @@ pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
         }
         "pairing_unavailable" => {
             "Pairing endpoint unavailable. Requires server PR #571 deployed; do not assume this backend is enabled."
+        }
+        "scope_refresh_network_failure" | "scope_refresh_read_failure" => {
+            "Scope refresh failed. Check the connection and retry sync. Stored scope remains unchanged."
+        }
+        "scope_refresh_http_failure" => {
+            "The server refused scope refresh. Check server access and retry sync. Stored scope remains unchanged."
+        }
+        "scope_refresh_invalid_response" | "scope_refresh_response_too_large" => {
+            "The scope response is invalid. Check server compatibility and retry sync. Stored scope remains unchanged."
+        }
+        "scope_refresh_offer_refused" => {
+            "The server offered an orchestrator entry that is not allowed. Check server compatibility and retry sync. The refused entry was not saved."
         }
         "revoked" => {
             "The server revoked this connection. Capture and sync have stopped; pair a new connection directory."
