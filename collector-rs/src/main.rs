@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use devdiary_collector::{
     MAX_HOOK_INPUT, MAX_INPUT, Result, drops, install, orchestrators,
-    store::{Store, repair, sync},
+    store::{Report, Store, repair, sync_outcome},
     systemd::Systemctl,
 };
 use std::{io::Read, path::Path, sync::mpsc, time::Duration};
@@ -154,6 +154,20 @@ fn input(limit: usize) -> Result<Vec<u8>> {
     }
     Ok(data)
 }
+fn finish_sync(report: &Report) -> i32 {
+    let failed = report.scope_refresh_error;
+    let scope = failed.map_or(String::new(), |code| {
+        format!(",\"scope_refresh_error\":\"{code}\"")
+    });
+    println!(
+        "{{\"pending\":{},\"delivered\":{}{scope}}}",
+        report.pending, report.delivered
+    );
+    if let Some(hint) = failed.and_then(devdiary_collector::pairing::guidance) {
+        eprintln!("{hint}");
+    }
+    i32::from(report.pending > 0)
+}
 fn run() -> Result<i32> {
     let args: Vec<_> = std::env::args().collect();
     if let Some(code) = lifecycle(&args)? {
@@ -214,10 +228,8 @@ fn run() -> Result<i32> {
             return Ok(0);
         }
         Some("connection-sync") if args.len() == 4 => {
-            let (pending, delivered) =
-                devdiary_collector::pairing::sync(Path::new(&args[2]), args[3].parse()?)?;
-            println!("{{\"pending\":{pending},\"delivered\":{delivered}}}");
-            return Ok(if pending > 0 { 1 } else { 0 });
+            let report = devdiary_collector::pairing::sync(Path::new(&args[2]), args[3].parse()?)?;
+            return Ok(finish_sync(&report));
         }
         _ => {}
     }
@@ -263,7 +275,10 @@ fn run() -> Result<i32> {
             store.collect(&raw)?;
             store.counts()?
         }
-        Some("sync") if args.len() == 5 => sync(state, Path::new(&args[3]), args[4].parse()?)?,
+        Some("sync") if args.len() == 5 => {
+            let report = sync_outcome(state, Path::new(&args[3]), args[4].parse()?)?;
+            return Ok(finish_sync(&report));
+        }
         Some("status") if args.len() == 3 => {
             let store = Store::open(state, None)?;
             let (pending, delivered) = store.counts()?;
@@ -290,11 +305,7 @@ fn run() -> Result<i32> {
         _ => return Err("invalid_command".into()),
     };
     println!("{{\"pending\":{},\"delivered\":{}}}", counts.0, counts.1);
-    Ok(if args[1] == "sync" && counts.0 > 0 {
-        1
-    } else {
-        0
-    })
+    Ok(0)
 }
 fn main() {
     // Dispatch before fallible UTF-8 argument parsing or control diagnostics.
@@ -360,12 +371,12 @@ fn main() {
                     "{}",
                     devdiary_collector::pairing::diagnostic(error.as_ref())
                 );
+            } else if let Some(code) = REPORTED.iter().find(|c| **c == code) {
+                eprintln!("collector_error: {code}");
             } else if let Some(hint) = devdiary_collector::pairing::known_diagnostic(error.as_ref())
             {
                 eprintln!("collector_error");
                 eprintln!("{hint}");
-            } else if let Some(code) = REPORTED.iter().find(|c| **c == code) {
-                eprintln!("collector_error: {code}");
             } else {
                 eprintln!("collector_error");
             }

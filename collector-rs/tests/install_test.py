@@ -628,6 +628,30 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((outbox / "repository-refs.json").read_bytes(), refs)
         self.assertEqual(offer.read_bytes() if offer.exists() else None, before_offer)
         self.assertIsNone(self.approved())
+        self.assertEqual(
+            json.loads(self.run_collector("doctor").stdout)["last_scope_refresh_error"],
+            "scope_refresh_http_failure",
+        )
+
+    def test_install_reports_a_refresh_refusal(self):
+        self.scope_status = 503
+        result = self.install("--yes", code=2)
+        self.assertIn(b"server refused scope refresh", result.stderr)
+        self.assertNotIn(b"response-secret", result.stdout + result.stderr)
+
+    def test_timer_sync_delivers_through_a_failed_refresh_and_doctor_shows_it(self):
+        self.install("--yes")
+        self.spool(3)
+        self.scope_status = 503
+        doctor = self.timer_sync()
+        self.assertEqual(len(self.received), 3)
+        self.assertEqual(doctor["pending"], 0)
+        self.assertIsNone(doctor["last_sync_error"])
+        self.assertEqual(
+            doctor["last_scope_refresh_error"], "scope_refresh_http_failure"
+        )
+        self.scope_status = 200
+        self.assertIsNone(self.timer_sync()["last_scope_refresh_error"])
 
     def test_install_shows_the_names_and_stores_them_only_on_yes(self):
         self.orchestrators = [PAPERCLIP]

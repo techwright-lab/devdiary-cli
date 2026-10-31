@@ -467,6 +467,7 @@ pub fn doctor(runner: &dyn Runner) -> Result<()> {
             "drops": drops::counts(&store, &outbox)?,
             "orchestrators": orchestrators,
             "revoked": connection(&data).join("revoked").exists(),
+            "last_scope_refresh_error": store.scope_refresh_failure()?,
             "last_receipt": receipt,
             "last_sync_error": status.and_then(|s| s.get("last_sync_error").cloned()),
         })
@@ -494,7 +495,7 @@ fn note_sync(root: &Path, error: Option<String>) -> Result<()> {
 /// Server refusals end the run quietly and are left for `doctor`; only local
 /// failures make the service fail.
 pub fn timer_sync(root: &Path) -> Result<()> {
-    match drain(|limit| pairing::sync_report(root, limit)) {
+    match drain(|limit| pairing::sync(root, limit)) {
         Ok(refusal) => note_sync(root, refusal),
         Err(error) => {
             let code = code(error.as_ref());
@@ -540,6 +541,7 @@ mod tests {
             stopped: None,
             refused,
             refusal: (refused > 0).then(|| "http_422".into()),
+            scope_refresh_error: None,
         }
     }
 

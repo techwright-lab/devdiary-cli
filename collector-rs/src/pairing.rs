@@ -606,17 +606,7 @@ pub fn plan_with(root: &Path, settings: &Path, plan: &Path, exe: &Path) -> Resul
     initialize(root, &doc)?;
     crate::claude::plan_for(&root.join("outbox"), settings, plan, exe)
 }
-pub fn sync(root: &Path, limit: usize) -> Result<(i64, i64)> {
-    let doc = connection(root)?;
-    initialize(root, &doc)?;
-    crate::store::sync_key(
-        &root.join("outbox"),
-        text(&doc, "token")?,
-        limit,
-        Some(&root.join("revoked")),
-    )
-}
-pub(crate) fn sync_report(root: &Path, limit: usize) -> Result<crate::store::Report> {
+pub fn sync(root: &Path, limit: usize) -> Result<crate::store::Report> {
     let doc = connection(root)?;
     initialize(root, &doc)?;
     crate::store::sync_report(
@@ -653,7 +643,7 @@ pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
     let orchestrators = crate::orchestrators::summary(&root.join("outbox"));
     println!(
         "{}",
-        json!({"connection":"saved", "local_repository_refs":refs, "local_orchestrators":orchestrators, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
+        json!({"connection":"saved", "local_repository_refs":refs, "local_orchestrators":orchestrators, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_scope_refresh_error":store.scope_refresh_failure()?,"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
     );
     Ok(())
 }
@@ -662,7 +652,10 @@ pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
     known_diagnostic(error).unwrap_or(SETUP_INCOMPLETE)
 }
 pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
-    Some(match error.to_string().as_str() {
+    guidance(&error.to_string())
+}
+pub fn guidance(code: &str) -> Option<&'static str> {
+    Some(match code {
         "choose_remote" => {
             "Multiple or missing GitHub remotes: choose explicitly with --remote NAME."
         }
@@ -686,6 +679,9 @@ pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
         }
         "scope_refresh_invalid_response" | "scope_refresh_response_too_large" => {
             "The scope response is invalid. Check server compatibility and retry sync. Stored scope remains unchanged."
+        }
+        "scope_refresh_offer_refused" => {
+            "The server offered an orchestrator entry that is not allowed. Check server compatibility and retry sync. The refused entry was not saved."
         }
         "revoked" => {
             "The server revoked this connection. Capture and sync have stopped; pair a new connection directory."

@@ -1321,6 +1321,45 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.sync()
         self.assertNotIn(AGENT.encode(), b"".join(self.received))
 
+    def test_a_refused_entry_keeps_the_last_good_offer_and_is_reported(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect()
+        self.sync()
+        offer = self.offered()
+        approved = (self.outbox / "orchestrators-approved.json").read_bytes()
+        refs = (self.outbox / "repository-refs.json").read_bytes()
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        evil = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
+        self.served_orchestrators = [evil, CRON]
+        self.served_refs = ["https://github.com/acme/other"]
+        result = self.sync()
+        self.assertEqual(
+            json.loads(result.stdout)["scope_refresh_error"],
+            "scope_refresh_offer_refused",
+        )
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(self.offered(), offer)
+        self.assertEqual(
+            (self.outbox / "orchestrators-approved.json").read_bytes(), approved
+        )
+        self.assertEqual((self.outbox / "repository-refs.json").read_bytes(), refs)
+        health = self.run_collector("connection-status", self.connection)
+        self.assertEqual(
+            json.loads(health.stdout)["local_scope_refresh_error"],
+            "scope_refresh_offer_refused",
+        )
+
+    def test_a_first_offer_with_a_refused_entry_is_saved_clean_and_reported(self):
+        evil = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
+        self.served_orchestrators = [evil, PAPERCLIP]
+        self.connect(approved=None)
+        result = self.sync()
+        self.assertEqual(
+            json.loads(result.stdout)["scope_refresh_error"],
+            "scope_refresh_offer_refused",
+        )
+        self.assertEqual(self.offered(), {"orchestrators": [PAPERCLIP], "refused": 1})
+
     def test_a_refused_name_in_the_approved_file_stops_the_row_unread(self):
         self.connect()
         self.approve([{"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}])

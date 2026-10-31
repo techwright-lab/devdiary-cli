@@ -35,6 +35,7 @@ class CollectorTest(unittest.TestCase):
         self.row = json.loads((FIXTURES / "local-observation.json").read_bytes())
         self.requests = []
         self.mode = "ok"
+        self.scope = None
         self.entered = threading.Event()
         self.release = threading.Event()
         owner = self
@@ -42,6 +43,19 @@ class CollectorTest(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+
+            def do_GET(self):
+                if owner.scope is None:
+                    return self.send_error(501)
+                if owner.scope == "loss":
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    self.connection.close()
+                    return
+                status, body, *length = owner.scope
+                self.send_response(status)
+                self.send_header("Content-Length", str(*length or [len(body)]))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
@@ -488,6 +502,73 @@ class CollectorTest(unittest.TestCase):
         self.call("sync", self.key, 10)
         self.assertEqual([raw for raw, _ in self.requests], [wire])
         self.assertEqual(json.loads(self.call("status").stdout)["delivered"], 1)
+
+    def good_scope(self, **changes):
+        config = json.loads((FIXTURES / "installation-scope.json").read_bytes())
+        reply = {
+            "schema_version": 1,
+            "collector_ref": config["collector_ref"],
+            "scope_kind": "installation",
+            "repository_refs": ["https://github.com/acme/good"],
+            "observation_schema_versions": [1, 2],
+            "orchestrators": [
+                {"key": "paperclip", "env": {"run_ref": "PAPERCLIP_RUN_ID"}}
+            ],
+        }
+        return (200, json.dumps({**reply, **changes}).encode())
+
+    def collect_v2(self, number):
+        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
+        row = {**local, "observation_id": f"{number:08d}-2222-4222-8222-222222222222"}
+        self.call("collect", data=row)
+
+    def test_a_failed_refresh_keeps_the_scope_and_still_delivers(self):
+        self.installation_state()
+        self.scope = self.good_scope()
+        self.call("sync", self.key, 10)
+        refs = (self.state / "repository-refs.json").read_bytes()
+        offer = (self.state / "orchestrators-offered.json").read_bytes()
+        evil = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
+        failures = {
+            "scope_refresh_network_failure": "loss",
+            "scope_refresh_http_failure": (503, b'{"error":"response-secret"}'),
+            "scope_refresh_read_failure": (200, b"{response-secret", 100),
+            "scope_refresh_response_too_large": (200, b"x" * 262145),
+            "scope_refresh_invalid_response": (200, b"{response-secret"),
+            "scope_refresh_offer_refused": self.good_scope(
+                orchestrators=[evil], repository_refs=["https://github.com/acme/bad"]
+            ),
+        }
+        for number, (code, scope) in enumerate(failures.items(), start=1):
+            with self.subTest(code):
+                self.scope = scope
+                self.collect_v2(number)
+                result = self.call("sync", self.key, 10)
+                (line,) = result.stdout.splitlines()
+                self.assertEqual(
+                    json.loads(line),
+                    {"pending": 0, "delivered": number, "scope_refresh_error": code},
+                )
+                self.assertNotIn(b"response-secret", result.stdout + result.stderr)
+                self.assertEqual(len(self.requests), number)
+                self.assertEqual(
+                    (self.state / "repository-refs.json").read_bytes(), refs
+                )
+                self.assertEqual(
+                    (self.state / "orchestrators-offered.json").read_bytes(), offer
+                )
+
+    def test_revocation_and_a_requested_wait_stop_delivery(self):
+        self.installation_state()
+        self.collect_v2(1)
+        for status in (401, 429):
+            with self.subTest(status):
+                self.scope = (status, b'{"error":"response-secret"}')
+                result = self.call("sync", self.key, 10, code=2)
+                self.assertEqual(result.stdout, b"")
+                self.assertNotIn(b"response-secret", result.stderr)
+                self.assertEqual(self.requests, [])
+                self.db().execute("UPDATE scope SET retry_after=0").connection.commit()
 
     def test_v2_refuses_actor_claims_and_v1_shape(self):
         self.installation_state()
