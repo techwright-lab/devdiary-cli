@@ -264,7 +264,8 @@ unit.
 
 Each `sync`, `connection-sync` and `timer-sync` batch refreshes the scope first. A
 network failure, a non-200 reply, a read failure, or an oversized or invalid reply
-keeps the last good refs, offer and approvals, and spooled rows are still delivered.
+keeps the last good refs, offer, approvals and declared-run answer, and spooled rows
+are still delivered.
 A refused orchestrator entry is reported the same way, but the new refs still apply,
 and an offer is saved without the entry only when no saved offer has entries yet.
 `sync` and `connection-sync` add a `scope_refresh_error`
@@ -309,8 +310,9 @@ names, for example `PAPERCLIP_AGENT_ID` for the `paperclip` preset:
 ```
 
 Every scope refresh stores this list as `orchestrators-offered.json` (0600) in the
-outbox. The hook takes no names from it. The hook reads only the names in
-`orchestrators-approved.json` (0600). Three commands write that file, always after
+outbox. The hook takes no names from it. Of the names a server can choose, the hook
+reads only those in `orchestrators-approved.json` (0600). The one fixed name it also
+reads is `DEVDIARY_RUN_REF`, below. Three commands write that file, always after
 the same prompt on a terminal: `install`, `upgrade` and:
 
 ```sh
@@ -355,7 +357,7 @@ hints used when `cwd` is not a repository; they never leave the machine.
 
 An offer nobody answered fails closed. While the approved list is empty or unreadable
 and the offer has an entry, a refused entry or cannot be read, every row carries
-`orchestrator: "unapproved"`. The hook reads no environment name for these rows, so
+`orchestrator: "unapproved"`. The hook reads no offered name for these rows, so
 they have no refs and use no checkout path. The server keeps them with binding
 unknown, so an agent run never reads as the machine owner's work, and `doctor` says
 runs stay unknown until approved. Outside a repository such a row is dropped
@@ -365,6 +367,46 @@ hook drops the row, as above.
 
 Once an approved list exists, a preset added to the offer is not read until approved.
 Its runs can look like ordinary runs, and `doctor` says so.
+
+### Runs started by `devdiary run`
+
+`devdiary run` exports `DEVDIARY_RUN_REF` (`urn:devdiary:run:<uuid>`) and declares a
+session with that ref. The hook sends the same ref in the optional v2 field
+`declared_run_ref`, so the server can match the observed visit to the declared
+session and show one run once.
+
+The scope request lists the optional reply keys this collector understands:
+
+```text
+DevDiary-Scope-Keys: accepts_declared_run_ref
+```
+
+The server must send `accepts_declared_run_ref` only to a request with that header.
+Older collectors do not send it, and they refuse a scope reply with a key they do not
+know (`scope_refresh_invalid_response`), which keeps their refs and offer stale until
+`upgrade`.
+
+The field needs a `true` answer in the scope reply:
+
+```json
+{"accepts_declared_run_ref": true}
+```
+
+Each good refresh saves the answer in the outbox database. A missing key or `false`
+turns the field off, and a reply that does not list schema v2 does too. A non-boolean
+value makes the reply invalid (`scope_refresh_invalid_response`), so the last good
+answer stays. Until the first `true`, the hook does not read the variable. `collect`
+refuses a row with the field while the answer is not `true`.
+
+The name is fixed and is DevDiary's own, so it needs no local approval and the server
+cannot change it. The hook sends the value only when it exactly matches
+`urn:devdiary:run:` plus a lowercase UUID. Otherwise it leaves the field out and keeps
+the row. The field is independent of `orchestrator`, so an orchestrated or `unapproved`
+row can carry it. Schema v1 and repository-scope connections never send it.
+
+On Claude Code 2.1.314, a stock `claude -p` run passed the variable to the command
+hooks for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop and
+SessionEnd.
 
 Verification: `python3 collector-rs/tests/install_test.py -v` (temp HOME, a mock
 pairing/ingest server and a fake systemctl; debug builds only honour
