@@ -371,7 +371,7 @@ fn show_changes(outbox: &Path, entries: &[Value]) {
 fn offer_orchestrators(data: &Path) -> Result<()> {
     let root = connection(data);
     let outbox = root.join("outbox");
-    let _ = pairing::refresh_scope(&root);
+    pairing::refresh_scope(&root)?;
     if orchestrators::offer_unreadable(&outbox) {
         println!("The saved orchestrator offer cannot be read. The next sync replaces it.");
         return Ok(());

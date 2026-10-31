@@ -678,6 +678,15 @@ pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
         "pairing_unavailable" => {
             "Pairing endpoint unavailable. Requires server PR #571 deployed; do not assume this backend is enabled."
         }
+        "scope_refresh_network_failure" | "scope_refresh_read_failure" => {
+            "Scope refresh failed. Check the connection and retry sync. Stored scope remains unchanged."
+        }
+        "scope_refresh_http_failure" => {
+            "The server refused scope refresh. Check server access and retry sync. Stored scope remains unchanged."
+        }
+        "scope_refresh_invalid_response" | "scope_refresh_response_too_large" => {
+            "The scope response is invalid. Check server compatibility and retry sync. Stored scope remains unchanged."
+        }
         "revoked" => {
             "The server revoked this connection. Capture and sync have stopped; pair a new connection directory."
         }

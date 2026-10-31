@@ -360,6 +360,10 @@ fn main() {
                     "{}",
                     devdiary_collector::pairing::diagnostic(error.as_ref())
                 );
+            } else if let Some(hint) = devdiary_collector::pairing::known_diagnostic(error.as_ref())
+            {
+                eprintln!("collector_error");
+                eprintln!("{hint}");
             } else if let Some(code) = REPORTED.iter().find(|c| **c == code) {
                 eprintln!("collector_error: {code}");
             } else {

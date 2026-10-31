@@ -711,8 +711,6 @@ pub(crate) fn scope_now(state: &Path, key: &str, revoked: Option<&Path>) -> Resu
     let store = Store::open(state, None)?;
     refresh_scope(&client()?, &store, state, key, revoked)
 }
-// A refresh that fails for any reason but revocation or a server-requested
-// wait keeps the last good lists; delivery of spooled rows still proceeds.
 fn refresh_scope(
     client: &reqwest::blocking::Client,
     store: &Store,
@@ -726,14 +724,12 @@ fn refresh_scope(
             .ok_or("invalid_endpoint")?,
     )?;
     url.set_path(SCOPE_PATH);
-    let Ok(response) = client
+    let response = client
         .get(url)
         .bearer_auth(key)
         .header("Accept", "application/json")
         .send()
-    else {
-        return Ok(());
-    };
+        .map_err(|_| "scope_refresh_network_failure")?;
     let status = response.status().as_u16();
     if matches!(status, 401 | 403) {
         if let Some(marker) = revoked {
@@ -754,18 +750,22 @@ fn refresh_scope(
         )?;
         return Err("sync_rate_limited".into());
     }
-    let mut raw = Vec::new();
-    if status != 200
-        || response.take(MAX_REFS + 1).read_to_end(&mut raw).is_err()
-        || raw.len() as u64 > MAX_REFS
-    {
-        return Ok(());
+    if status != 200 {
+        return Err("scope_refresh_http_failure".into());
     }
-    if let Ok((refs, offer)) = scope_reply(&raw, &store.config) {
-        replace_refs(state, &refs)?;
-        if let Some(offer) = offer {
-            orchestrators::save_offer(state, &offer)?;
-        }
+    let mut raw = Vec::new();
+    response
+        .take(MAX_REFS + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| "scope_refresh_read_failure")?;
+    if raw.len() as u64 > MAX_REFS {
+        return Err("scope_refresh_response_too_large".into());
+    }
+    let (refs, offer) =
+        scope_reply(&raw, &store.config).map_err(|_| "scope_refresh_invalid_response")?;
+    replace_refs(state, &refs)?;
+    if let Some(offer) = offer {
+        orchestrators::save_offer(state, &offer)?;
     }
     Ok(())
 }
@@ -780,11 +780,22 @@ fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde
         "observation_schema_versions",
     ];
     let offer = doc.get("orchestrators").map(orchestrators::offer);
+    if offer
+        .as_ref()
+        .is_some_and(|o| o["refused"] != serde_json::json!(0))
+    {
+        return Err("invalid_scope_response".into());
+    }
     if doc.len() != keys.len() + usize::from(offer.is_some())
         || keys.iter().any(|k| !doc.contains_key(*k))
         || doc["schema_version"] != serde_json::json!(1)
         || doc.get("collector_ref") != config.get("collector_ref")
         || doc["scope_kind"] != serde_json::json!("installation")
+    {
+        return Err("invalid_scope_response".into());
+    }
+    if doc["observation_schema_versions"] != serde_json::json!([1])
+        && doc["observation_schema_versions"] != serde_json::json!([1, 2])
     {
         return Err("invalid_scope_response".into());
     }
