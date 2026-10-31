@@ -316,3 +316,51 @@ fn installation_without_advertised_v2_sends_v1() {
     row["schema_version"] = 2.into();
     assert!(frozen(&config, &row).is_none());
 }
+
+const DECLARED_RUN: &str = "urn:devdiary:run:88888888-8888-4888-8888-888888888888";
+
+#[test]
+fn v2_declared_run_ref_freezes_to_exact_bytes() {
+    let wire = freeze(
+        include_bytes!("fixtures/local-observation-declared-run.json"),
+        &installation(),
+    )
+    .unwrap();
+    assert_eq!(wire, include_bytes!("fixtures/wire-declared-run.json"));
+}
+
+#[test]
+fn v2_refuses_a_declared_run_ref_that_is_not_the_exact_urn() {
+    for bad in [
+        serde_json::json!("urn:devdiary:run:88888888-8888-4888-8888-88888888888A"),
+        serde_json::json!("URN:DEVDIARY:RUN:88888888-8888-4888-8888-888888888888"),
+        serde_json::json!("urn:devdiary:event:88888888-8888-4888-8888-888888888888"),
+        serde_json::json!("urn:devdiary:run:88888888-8888-4888-8888-888888888888\n"),
+        serde_json::json!(" urn:devdiary:run:88888888-8888-4888-8888-888888888888"),
+        serde_json::json!("urn:devdiary:run:"),
+        serde_json::json!("urn:devdiary:run:fixed-id"),
+        serde_json::json!("88888888-8888-4888-8888-888888888888"),
+        serde_json::json!(""),
+        serde_json::json!(1),
+        serde_json::json!([DECLARED_RUN]),
+    ] {
+        let mut row = local_v2();
+        row["declared_run_ref"] = bad.clone();
+        assert!(frozen(&installation(), &row).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn only_v2_rows_carry_a_declared_run_ref() {
+    let mut config = installation();
+    config.insert("observation_schema_versions".into(), serde_json::json!([1]));
+    let mut row = local_v2();
+    row["schema_version"] = 1.into();
+    row["declared_run_ref"] = DECLARED_RUN.into();
+    assert!(
+        frozen(&config, &row)
+            .unwrap()
+            .get("declared_run_ref")
+            .is_none()
+    );
+}

@@ -591,6 +591,23 @@ class CollectorTest(unittest.TestCase):
                 self.assertEqual(self.requests, [])
                 self.db().execute("UPDATE scope SET retry_after=0").connection.commit()
 
+    def test_a_declared_run_row_needs_the_scope_to_accept_it(self):
+        self.installation_state()
+        local = json.loads(
+            (FIXTURES / "local-observation-declared-run.json").read_bytes()
+        )
+        wire = (FIXTURES / "wire-declared-run.json").read_bytes()
+        self.call("collect", data=local, code=2)
+        self.scope = self.good_scope(accepts_declared_run_ref=True)
+        self.call("sync", self.key, 10)
+        self.call("collect", data=local)
+        self.call("sync", self.key, 10)
+        self.assertEqual([raw for raw, _ in self.requests], [wire])
+        self.scope = self.good_scope(accepts_declared_run_ref=False)
+        self.call("sync", self.key, 10)
+        fresh = {**local, "observation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+        self.call("collect", data=fresh, code=2)
+
     def test_v2_refuses_actor_claims_and_v1_shape(self):
         self.installation_state()
         local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())

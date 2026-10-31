@@ -34,6 +34,7 @@ pub const EVENTS: [&str; 9] = [
     "SessionEnd",
 ];
 const MAX_PLAN: usize = 65536;
+const DECLARED_RUN_ENV: &str = "DEVDIARY_RUN_REF";
 /// Sessions with this prefix exercise the installed hook end to end but are
 /// recorded only in a local table that sync never reads.
 pub const SELF_TEST: &str = "devdiary-selftest-";
@@ -823,6 +824,13 @@ fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<(Object, Opti
     row.insert("schema_version".into(), crate::wire_version(config).into());
     Ok((row, gitdir))
 }
+// DevDiary's own wrapper sets this fixed name, so unlike an offered name it
+// needs no approval. Rails refuses the whole row on a bad value: leave it out.
+fn declared_run() -> Option<String> {
+    std::env::var(DECLARED_RUN_ENV)
+        .ok()
+        .filter(|value| crate::declared_run_ref(value))
+}
 fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Option<PathBuf>)> {
     let event = text(data, "hook_event_name")?;
     let session = text(data, "session_id")?;
@@ -1048,6 +1056,11 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
     let Some((mut row, gitdir)) = normalized else {
         return store.self_test(session);
     };
+    if store.accepts_declared_run()?
+        && let Some(run) = declared_run()
+    {
+        row.insert("declared_run_ref".into(), run.into());
+    }
     if let Some(gitdir) = gitdir {
         bracket(&store, state, &mut row, &gitdir)?;
     }

@@ -18,6 +18,10 @@ pub(crate) const FINGERPRINT: &str = "executable-fingerprint";
 const REFS: &str = "repository-refs.json";
 const MAX_REFS: u64 = 262144;
 const SCOPE_PATH: &str = "/ingest/v1/collector/scope";
+// Collectors older than this header refuse a scope reply with any key they do not
+// know, so the server may send an optional key only when it is listed here.
+const SCOPE_KEYS_HEADER: &str = "DevDiary-Scope-Keys";
+const SCOPE_KEYS: &str = "accepts_declared_run_ref";
 // Delivered IDs are kept so a late duplicate hook firing is still deduplicated
 // instead of being resent as a conflicting observation.
 const TOMBSTONES: i64 = 4000;
@@ -32,6 +36,7 @@ const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INT
 const SELF_TESTS: i64 = 10;
 const MARKS_TABLE: &str = "CREATE TABLE IF NOT EXISTS bracket_marks (session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, checkout_key TEXT NOT NULL, offset INTEGER NOT NULL, ino INTEGER NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, PRIMARY KEY(session_id, tool_use_id)) WITHOUT ROWID;";
 const SCOPE_FAILURE_TABLE: &str = "CREATE TABLE IF NOT EXISTS scope_refresh_failure (singleton INTEGER PRIMARY KEY CHECK(singleton=1), code TEXT NOT NULL);";
+const DECLARED_RUN_TABLE: &str = "CREATE TABLE IF NOT EXISTS declared_run_accepted (singleton INTEGER PRIMARY KEY CHECK(singleton=1));";
 const OFFER_REFUSED: &str = "scope_refresh_offer_refused";
 const MARK_TTL_NANOS: i64 = 6 * 3_600_000_000_000;
 const MAX_MARKS: i64 = 256;
@@ -222,6 +227,7 @@ impl Store {
         tx.execute_batch(FOLD_TABLE)?;
         tx.execute_batch(MARKS_TABLE)?;
         tx.execute_batch(SCOPE_FAILURE_TABLE)?;
+        tx.execute_batch(DECLARED_RUN_TABLE)?;
         tx.commit()?;
         File::open(state)?.sync_all()?;
         Ok(Self { db, config })
@@ -242,9 +248,28 @@ impl Store {
         };
         Ok(())
     }
+    pub fn accepts_declared_run(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT 1 FROM declared_run_accepted", [], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+    fn note_declared_run(&self, accepted: bool) -> Result<()> {
+        let change = if accepted {
+            "INSERT OR REPLACE INTO declared_run_accepted(singleton) VALUES(1)"
+        } else {
+            "DELETE FROM declared_run_accepted"
+        };
+        self.db.execute(change, [])?;
+        Ok(())
+    }
     pub fn collect(&mut self, raw: &[u8]) -> Result<()> {
         let payload = freeze(raw, &self.config)?;
         let parsed = crate::object(&payload)?;
+        if parsed.contains_key("declared_run_ref") && !self.accepts_declared_run()? {
+            return Err("declared_run_not_accepted".into());
+        }
         if crate::text(&parsed, "session_id")?.starts_with(crate::claude::SELF_TEST) {
             return Err("reserved_session".into());
         }
@@ -763,6 +788,7 @@ fn refresh_scope(
         .get(url)
         .bearer_auth(key)
         .header("Accept", "application/json")
+        .header(SCOPE_KEYS_HEADER, SCOPE_KEYS)
         .send()
     else {
         return Ok(Some("scope_refresh_network_failure"));
@@ -797,21 +823,33 @@ fn refresh_scope(
     if raw.len() as u64 > MAX_REFS {
         return Ok(Some("scope_refresh_response_too_large"));
     }
-    let Ok((refs, offer)) = scope_reply(&raw, &store.config) else {
+    let Ok(reply) = scope_reply(&raw, &store.config) else {
         return Ok(Some("scope_refresh_invalid_response"));
     };
-    let refused = offer
+    let refused = reply
+        .offer
         .as_ref()
         .is_some_and(|o| o["refused"] != serde_json::json!(0));
-    replace_refs(state, &refs)?;
+    replace_refs(state, &reply.refs)?;
     // With no saved entries nothing good can be lost, and saving the clean part
     // lets the hook mark rows of a run that nobody has approved.
-    if let Some(offer) = offer.filter(|_| !refused || !orchestrators::entries_saved(state)) {
+    if let Some(offer) = reply
+        .offer
+        .filter(|_| !refused || !orchestrators::entries_saved(state))
+    {
         orchestrators::save_offer(state, &offer)?;
+    }
+    if !refused {
+        store.note_declared_run(reply.accepts_declared_run)?;
     }
     Ok(refused.then_some(OFFER_REFUSED))
 }
-fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde_json::Value>)> {
+struct ScopeReply {
+    refs: Vec<String>,
+    offer: Option<serde_json::Value>,
+    accepts_declared_run: bool,
+}
+fn scope_reply(raw: &[u8], config: &Object) -> Result<ScopeReply> {
     serde_json::from_slice::<crate::claude::UniqueKeys>(raw)?;
     let doc = crate::object(raw)?;
     let keys = [
@@ -822,7 +860,10 @@ fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde
         "observation_schema_versions",
     ];
     let offer = doc.get("orchestrators").map(orchestrators::offer);
-    if doc.len() != keys.len() + usize::from(offer.is_some())
+    let declared_run = doc.get("accepts_declared_run_ref");
+    let optional = usize::from(offer.is_some()) + usize::from(declared_run.is_some());
+    if doc.len() != keys.len() + optional
+        || declared_run.is_some_and(|answer| !answer.is_boolean())
         || keys.iter().any(|k| !doc.contains_key(*k))
         || doc["schema_version"] != serde_json::json!(1)
         || doc.get("collector_ref") != config.get("collector_ref")
@@ -831,7 +872,14 @@ fn scope_reply(raw: &[u8], config: &Object) -> Result<(Vec<String>, Option<serde
     {
         return Err("invalid_scope_response".into());
     }
-    Ok((repository_refs(&doc["repository_refs"])?, offer))
+    let v2 = accepted_versions(doc.get("observation_schema_versions"))
+        .is_some_and(|versions| versions.contains(&serde_json::json!(2)))
+        && crate::wire_version(config) == 2;
+    Ok(ScopeReply {
+        refs: repository_refs(&doc["repository_refs"])?,
+        offer,
+        accepts_declared_run: v2 && declared_run == Some(&serde_json::Value::Bool(true)),
+    })
 }
 pub(crate) fn accepted_versions(
     versions: Option<&serde_json::Value>,

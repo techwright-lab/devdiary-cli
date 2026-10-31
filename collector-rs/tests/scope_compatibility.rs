@@ -60,7 +60,9 @@ fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let mut request = [0; 8192];
-        let _request_bytes = socket.read(&mut request).unwrap();
+        let request_bytes = socket.read(&mut request).unwrap();
+        let sent = String::from_utf8_lossy(&request[..request_bytes]).to_ascii_lowercase();
+        assert!(sent.contains("\r\ndevdiary-scope-keys: accepts_declared_run_ref\r\n"));
         if status == 0 {
             return;
         }
@@ -227,6 +229,28 @@ fn scope_compatibility_refuses_version_lists_pairing_refuses() {
     ] {
         let mut p = payload();
         p["observation_schema_versions"] = versions;
+        refresh(200, p, INVALID);
+    }
+}
+#[test]
+fn scope_compatibility_declared_run_answer() {
+    for answer in [json!(true), json!(false)] {
+        let mut p = payload();
+        p["accepts_declared_run_ref"] = answer;
+        refresh(200, p, Applied);
+    }
+}
+#[test]
+fn scope_compatibility_declared_run_answer_must_be_boolean() {
+    for answer in [
+        json!(null),
+        json!("true"),
+        json!(1),
+        json!([true]),
+        json!({}),
+    ] {
+        let mut p = payload();
+        p["accepts_declared_run_ref"] = answer;
         refresh(200, p, INVALID);
     }
 }
