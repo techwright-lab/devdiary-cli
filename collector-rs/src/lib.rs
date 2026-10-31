@@ -171,6 +171,9 @@ pub fn repository_ref(s: &str) -> bool {
 pub(crate) fn is_uuid(s: &str) -> bool {
     uuid(s)
 }
+pub(crate) fn declared_run_ref(s: &str) -> bool {
+    s.strip_prefix("urn:devdiary:run:").is_some_and(uuid)
+}
 pub(crate) fn orchestrator_key(s: &str) -> bool {
     s != "none"
         && s.len() <= 64
@@ -198,8 +201,9 @@ const V1_FIELDS: [&str; 17] = [
     "source",
     "reason",
 ];
-const V2_FIELDS: [&str; 8] = [
+const V2_FIELDS: [&str; 9] = [
     "repository_ref",
+    "declared_run_ref",
     "orchestrator",
     "orchestrator_agent_ref",
     "orchestrator_run_ref",
@@ -287,6 +291,12 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     if version == 2 {
         orchestrated(&out)?;
         captured(&out)?;
+        if out
+            .get("declared_run_ref")
+            .is_some_and(|v| !v.as_str().is_some_and(declared_run_ref))
+        {
+            return Err("invalid_declared_run".into());
+        }
     }
     for (k, v) in &out {
         if !["schema_version", "commits", "overlap_count"].contains(&k.as_str())

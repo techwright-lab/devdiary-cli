@@ -274,7 +274,7 @@ fn offer_unanswered(state: &Path) -> bool {
     }
 }
 // An agent run must never read as the machine owner's, so an offer nobody has
-// answered marks every row, and no env name is read until a person approves.
+// answered marks every row, and no offered name is read until a person approves.
 pub(crate) fn declared(state: &Path) -> Result<Option<Declared>> {
     let approved = approved(state);
     if approved.as_ref().map_or(true, Vec::is_empty) && offer_unanswered(state) {

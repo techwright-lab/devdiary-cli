@@ -804,6 +804,7 @@ class ClaudeHookTest(unittest.TestCase):
 AGENT = "22c99d01-c3ee-4041-9066-0a83f34bd2e2"
 RUN = "66666666-6666-4666-8666-666666666666"
 TASK = "77777777-7777-4777-8777-777777777777"
+DECLARED = "urn:devdiary:run:88888888-8888-4888-8888-888888888888"
 PAPERCLIP = {
     "key": "paperclip",
     "env": {
@@ -860,6 +861,8 @@ class InstallationFixture:
         self.received = []
         self.served_refs = list(self.refs)
         self.served_orchestrators = None
+        self.served_declared_run = None
+        self.served_versions = [1, 2]
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -881,10 +884,12 @@ class InstallationFixture:
                     "collector_ref": owner.collector_ref,
                     "scope_kind": "installation",
                     "repository_refs": owner.served_refs,
-                    "observation_schema_versions": [1, 2],
+                    "observation_schema_versions": owner.served_versions,
                 }
                 if owner.served_orchestrators is not None:
                     reply["orchestrators"] = owner.served_orchestrators
+                if owner.served_declared_run is not None:
+                    reply["accepts_declared_run_ref"] = owner.served_declared_run
                 self.reply(200, reply)
 
             def do_POST(self):
@@ -988,7 +993,9 @@ class InstallationFixture:
         base = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith(("PAPERCLIP_", "TRUSTGROWTH_", "WRIGHTBOT_", "TG_"))
+            if not k.startswith(
+                ("PAPERCLIP_", "TRUSTGROWTH_", "WRIGHTBOT_", "TG_", "DEVDIARY_RUN_REF")
+            )
         }
         return {**base, **extra}
 
@@ -1529,6 +1536,131 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
 
 BRACKET_FIELDS = {"commits", "overlap_count", "commit_gap"}
 HOUR_NS = 3_600_000_000_000
+
+
+class DeclaredRunHookTest(InstallationFixture, unittest.TestCase):
+    def accepted(self, **connect):
+        self.served_declared_run = True
+        self.connect(**connect)
+        self.sync()
+
+    def declared(self):
+        return [row.get("declared_run_ref") for row in self.rows()]
+
+    def test_every_event_carries_the_run_once_the_scope_accepts_it(self):
+        self.accepted()
+        for number, event in enumerate(EVENTS):
+            self.hook(
+                self.main,
+                tool_use_id=f"tool-{number}",
+                event=event,
+                DEVDIARY_RUN_REF=DECLARED,
+            )
+        self.assertEqual(self.declared(), [DECLARED] * len(EVENTS))
+
+    def test_the_wire_carries_the_run(self):
+        self.accepted()
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)
+        self.sync()
+        self.assertEqual(json.loads(self.received[0])["declared_run_ref"], DECLARED)
+
+    def test_no_row_carries_the_run_until_a_refresh_says_true(self):
+        self.connect()
+        self.hook(self.main, "before-sync", DEVDIARY_RUN_REF=DECLARED)
+        self.sync()
+        self.hook(self.main, "no-key", DEVDIARY_RUN_REF=DECLARED)
+        self.served_declared_run = False
+        self.sync()
+        self.hook(self.main, "false", DEVDIARY_RUN_REF=DECLARED)
+        self.assertEqual(self.declared(), [None])
+        self.assertEqual(len(self.received), 2)
+        self.assertNotIn(b"declared_run_ref", b"".join(self.received))
+
+    def test_a_later_reply_without_the_key_stops_the_field(self):
+        self.accepted()
+        self.served_declared_run = None
+        self.sync()
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)
+        self.assertEqual(self.declared(), [None])
+
+    def test_a_later_false_stops_the_field(self):
+        self.accepted()
+        self.served_declared_run = False
+        self.sync()
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)
+        self.assertEqual(self.declared(), [None])
+
+    def test_a_refused_reply_keeps_the_last_good_answer(self):
+        self.accepted()
+        self.served_declared_run = "true"
+        result = self.sync()
+        self.assertEqual(
+            json.loads(result.stdout)["scope_refresh_error"],
+            "scope_refresh_invalid_response",
+        )
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)
+        self.assertEqual(self.declared(), [DECLARED])
+
+    def test_a_refused_offer_keeps_the_last_good_answer(self):
+        self.served_orchestrators = []
+        self.accepted(approved=())
+        self.served_declared_run = False
+        self.served_orchestrators = [
+            {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
+        ]
+        self.sync()
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)
+        self.assertEqual(self.declared(), [DECLARED])
+
+    def test_a_bad_value_is_left_out_and_the_row_stays(self):
+        bad = [
+            "",
+            DECLARED.upper(),
+            DECLARED + "\n",
+            " " + DECLARED,
+            "urn:devdiary:run:fixed-id",
+            "urn:devdiary:event:" + DECLARED.rsplit(":", 1)[1],
+            DECLARED.rsplit(":", 1)[1],
+            b"urn:devdiary:run:\xff",
+        ]
+        self.accepted()
+        for number, value in enumerate(bad):
+            self.hook(self.main, f"tool-{number}", DEVDIARY_RUN_REF=value)
+        self.assertEqual(self.declared(), [None] * len(bad))
+        self.assertEqual(self.drops(), {})
+
+    def test_no_variable_means_no_field(self):
+        self.accepted()
+        self.hook(self.main)
+        self.assertEqual(self.declared(), [None])
+
+    def test_the_fixed_name_needs_no_local_approval(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.accepted(approved=())
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED, PAPERCLIP_AGENT_ID=AGENT)
+        (row,) = self.rows()
+        self.assertEqual(row["declared_run_ref"], DECLARED)
+        self.assertEqual(row["orchestrator"], "unapproved")
+
+    def test_an_orchestrated_row_carries_both(self):
+        self.accepted()
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED, PAPERCLIP_AGENT_ID=AGENT)
+        (row,) = self.rows()
+        self.assertEqual(row["declared_run_ref"], DECLARED)
+        self.assertEqual(row["orchestrator"], "paperclip")
+
+    def test_a_v1_connection_never_carries_the_run(self):
+        self.accepted(versions=(1,))
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)
+        self.assertEqual(self.declared(), [None])
+
+    def test_a_reply_without_v2_is_not_an_acceptance(self):
+        self.served_declared_run = True
+        self.served_versions = [1]
+        self.connect()
+        self.sync()
+        self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)
+        self.assertEqual(self.declared(), [None])
 
 
 class CommitBracketHookTest(InstallationFixture, unittest.TestCase):

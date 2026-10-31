@@ -231,6 +231,28 @@ fn scope_compatibility_refuses_version_lists_pairing_refuses() {
     }
 }
 #[test]
+fn scope_compatibility_declared_run_answer() {
+    for answer in [json!(true), json!(false)] {
+        let mut p = payload();
+        p["accepts_declared_run_ref"] = answer;
+        refresh(200, p, Applied);
+    }
+}
+#[test]
+fn scope_compatibility_declared_run_answer_must_be_boolean() {
+    for answer in [
+        json!(null),
+        json!("true"),
+        json!(1),
+        json!([true]),
+        json!({}),
+    ] {
+        let mut p = payload();
+        p["accepts_declared_run_ref"] = answer;
+        refresh(200, p, INVALID);
+    }
+}
+#[test]
 fn scope_compatibility_identity_mismatch() {
     for (field, value) in [
         ("collector_ref", json!("other-collector")),
