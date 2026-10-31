@@ -839,7 +839,9 @@ fn refresh_scope(
     {
         orchestrators::save_offer(state, &offer)?;
     }
-    store.note_declared_run(reply.accepts_declared_run)?;
+    if !refused {
+        store.note_declared_run(reply.accepts_declared_run)?;
+    }
     Ok(refused.then_some(OFFER_REFUSED))
 }
 struct ScopeReply {
