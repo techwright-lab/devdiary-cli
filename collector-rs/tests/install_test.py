@@ -83,6 +83,7 @@ class InstallTest(unittest.TestCase):
         self.received = []
         self.observation_status = 201
         self.orchestrators = None
+        self.scope_status = 200
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -97,6 +98,8 @@ class InstallTest(unittest.TestCase):
                 self.wfile.write(raw)
 
             def do_GET(self):
+                if owner.scope_status != 200:
+                    return self.reply(owner.scope_status, {"error": "response-secret"})
                 reply = {
                     "schema_version": 1,
                     "collector_ref": COLLECTOR_REF,
@@ -610,6 +613,45 @@ class InstallTest(unittest.TestCase):
 
     def waiting(self):
         return json.loads(self.run_collector("doctor").stdout)["orchestrators"]
+
+    def test_scope_compatibility_upgrade_reports_refresh_refusal(self):
+        self.install("--yes")
+        outbox = self.data / "connection/outbox"
+        refs = (outbox / "repository-refs.json").read_bytes()
+        offer = outbox / "orchestrators-offered.json"
+        before_offer = offer.read_bytes() if offer.exists() else None
+        self.scope_status = 503
+        result = self.run_collector("upgrade", "--yes", code=2)
+        self.assertIn(b"server refused scope refresh", result.stderr)
+        self.assertIn(b"retry", result.stderr)
+        self.assertNotIn(b"response-secret", result.stdout + result.stderr)
+        self.assertEqual((outbox / "repository-refs.json").read_bytes(), refs)
+        self.assertEqual(offer.read_bytes() if offer.exists() else None, before_offer)
+        self.assertIsNone(self.approved())
+        self.assertEqual(
+            json.loads(self.run_collector("doctor").stdout)["last_scope_refresh_error"],
+            "scope_refresh_http_failure",
+        )
+
+    def test_install_reports_a_refresh_refusal(self):
+        self.scope_status = 503
+        result = self.install("--yes", code=2)
+        self.assertIn(b"server refused scope refresh", result.stderr)
+        self.assertNotIn(b"response-secret", result.stdout + result.stderr)
+
+    def test_timer_sync_delivers_through_a_failed_refresh_and_doctor_shows_it(self):
+        self.install("--yes")
+        self.spool(3)
+        self.scope_status = 503
+        doctor = self.timer_sync()
+        self.assertEqual(len(self.received), 3)
+        self.assertEqual(doctor["pending"], 0)
+        self.assertIsNone(doctor["last_sync_error"])
+        self.assertEqual(
+            doctor["last_scope_refresh_error"], "scope_refresh_http_failure"
+        )
+        self.scope_status = 200
+        self.assertIsNone(self.timer_sync()["last_scope_refresh_error"])
 
     def test_install_shows_the_names_and_stores_them_only_on_yes(self):
         self.orchestrators = [PAPERCLIP]

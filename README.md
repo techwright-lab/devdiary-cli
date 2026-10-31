@@ -262,9 +262,21 @@ per run. Server refusals and rejections end the run with exit 0 and are kept for
 `doctor` as `last_sync_error` (for example `http_422`); local failures fail the
 unit.
 
+Each `sync`, `connection-sync` and `timer-sync` batch refreshes the scope first. A
+network failure, a non-200 reply, a read failure, or an oversized or invalid reply
+keeps the last good refs, offer and approvals, and spooled rows are still delivered.
+A refused orchestrator entry is reported the same way, but the new refs still apply,
+and an offer is saved without the entry only when no saved offer has entries yet.
+`sync` and `connection-sync` add a `scope_refresh_error`
+code to their JSON line and print guidance to stderr. The last code is kept for
+`doctor` as `last_scope_refresh_error` and for `connection-status` as
+`local_scope_refresh_error`, until a good refresh clears it. Revocation and a
+server-requested wait still stop the run. `install` and `upgrade` fail on any
+refresh error.
+
 `doctor` prints the registration state, `systemctl --user is-enabled/is-active` for
-the timer, pending and delivered counts, drops, the last receipt and
-`last_sync_error`. `upgrade` first checks that the settings would accept a fresh
+the timer, pending and delivered counts, drops, the last receipt,
+`last_sync_error` and `last_scope_refresh_error`. `upgrade` first checks that the settings would accept a fresh
 plan once the old entries are gone and that the connection was not revoked, prints
 the 9 new entries and asks once; only then does it remove the old registration, copy
 the new binary over the pinned one and install the fresh plan. Declining leaves the

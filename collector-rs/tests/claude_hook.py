@@ -820,6 +820,7 @@ CRON = {
     "key": "cron",
     "env": {"agent_ref": "CRONTOOL_AGENT", "run_ref": "CRONTOOL_RUN"},
 }
+EVIL = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
 CANARIES = (
     "PAPERCLIP_API_KEY",
     "PAPERCLIP_AGENT_PRIVATE_KEY",
@@ -958,6 +959,9 @@ class InstallationFixture:
 
     def offered(self):
         return json.loads((self.outbox / "orchestrators-offered.json").read_bytes())
+
+    def saved_refs(self):
+        return json.loads((self.outbox / "repository-refs.json").read_bytes())
 
     def status(self):
         return json.loads(
@@ -1320,6 +1324,71 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.assertEqual(self.status()["refused"], 1)
         self.sync()
         self.assertNotIn(AGENT.encode(), b"".join(self.received))
+
+    def test_a_refused_entry_keeps_the_last_good_offer_but_applies_refs(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect()
+        self.sync()
+        offer = self.offered()
+        approved = (self.outbox / "orchestrators-approved.json").read_bytes()
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        self.served_orchestrators = [EVIL, CRON]
+        self.served_refs = ["https://github.com/acme/other"]
+        result = self.sync()
+        self.assertEqual(
+            json.loads(result.stdout)["scope_refresh_error"],
+            "scope_refresh_offer_refused",
+        )
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(self.offered(), offer)
+        self.assertEqual(
+            (self.outbox / "orchestrators-approved.json").read_bytes(), approved
+        )
+        self.assertEqual(self.saved_refs(), self.served_refs)
+        health = self.run_collector("connection-status", self.connection)
+        self.assertEqual(
+            json.loads(health.stdout)["local_scope_refresh_error"],
+            "scope_refresh_offer_refused",
+        )
+
+    def test_a_refused_entry_does_not_freeze_the_repository_refs(self):
+        self.served_orchestrators = [PAPERCLIP]
+        self.connect()
+        self.sync()
+        added = "https://github.com/acme/added"
+        added_repo = self.repo("added", "git@github.com:acme/added.git")
+        self.served_orchestrators = [EVIL]
+        self.served_refs = [added]
+        self.sync()
+        self.hook(added_repo)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {})
+        self.hook(self.main, tool_use_id="tool-2")
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {"unknown_repository": 1})
+
+    def test_a_refused_entry_over_an_empty_offer_offers_the_clean_part(self):
+        self.served_orchestrators = []
+        self.connect(approved=None)
+        self.sync()
+        self.assertEqual(self.offered(), {"orchestrators": [], "refused": 0})
+        self.served_orchestrators = [PAPERCLIP, EVIL]
+        self.sync()
+        self.assertEqual(self.offered(), {"orchestrators": [PAPERCLIP], "refused": 1})
+        self.assertTrue(self.status()["waiting_for_approval"])
+        self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
+        (row,) = self.rows()
+        self.assertEqual(row["orchestrator"], "unapproved")
+
+    def test_a_first_offer_with_a_refused_entry_is_saved_clean_and_reported(self):
+        self.served_orchestrators = [EVIL, PAPERCLIP]
+        self.connect(approved=None)
+        result = self.sync()
+        self.assertEqual(
+            json.loads(result.stdout)["scope_refresh_error"],
+            "scope_refresh_offer_refused",
+        )
+        self.assertEqual(self.offered(), {"orchestrators": [PAPERCLIP], "refused": 1})
 
     def test_a_refused_name_in_the_approved_file_stops_the_row_unread(self):
         self.connect()
