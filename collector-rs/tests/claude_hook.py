@@ -1724,7 +1724,7 @@ class HookLossTest(InstallationFixture, unittest.TestCase):
             time.sleep(0.6)
             db.execute("COMMIT")
             running.result()
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 1, self.drops())
         self.assertNotIn("busy", self.drops())
 
     def test_a_large_tool_result_is_still_a_row(self):
@@ -1951,7 +1951,7 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
                 for call in calls:
                     call.result()
         self.assertEqual(self.drops(), {})
-        self.assertEqual(len(self.rows()), 2 * len(sessions))
+        self.assertEqual(len(self.rows()), 2 * len(sessions), self.drops())
         self.assertEqual(len(self.marks()), len(sessions))
 
     def test_sibling_worktrees_each_get_only_their_own_sha(self):

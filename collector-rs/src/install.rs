@@ -22,6 +22,8 @@ const BINARY: &str = "devdiary-collector";
 const RECORD: &str = "install.json";
 const SYNC_STATUS: &str = "sync-status.json";
 const BATCH: usize = 100;
+const INTEGRATIONS: &str =
+    "https://github.com/techwright-lab/devdiary-cli/blob/main/docs/integrations/README.md";
 const OUTSIDE_ON: &str = "Your sessions outside repositories are now recorded: event, time and tool name, never a path. Temp folders stay out.";
 const BATCHES: usize = 10;
 
@@ -348,6 +350,7 @@ fn ask_orchestrators(outbox: &Path) -> Result<()> {
         println!("{refused} more refused: a name is not allowed or the entry is malformed.");
     }
     println!("IDs that are UUIDs are sent to the server. Paths stay on this machine.");
+    println!("Each tool may need its own setup, or its agents record nothing. See {INTEGRATIONS}");
     consent(false, "Let the hook read these names?")?;
     orchestrators::approve(outbox, &entries)?;
     println!("Approved.");
