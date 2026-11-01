@@ -1667,6 +1667,34 @@ class DeclaredRunHookTest(InstallationFixture, unittest.TestCase):
         self.assertEqual(self.declared(), [None])
 
 
+class OutsideReposHookTest(InstallationFixture, unittest.TestCase):
+    def consent(self):
+        (self.outbox / "record-outside-repos").write_bytes(b"")
+
+    def plain_folder(self):
+        folder = Path.home() / f"devdiary-outside-{os.getpid()}"
+        folder.mkdir(exist_ok=True)
+        self.addCleanup(folder.rmdir)
+        return folder
+
+    def test_an_owner_row_outside_a_repository_needs_consent(self):
+        self.connect()
+        folder = self.plain_folder()
+        self.hook(folder)
+        self.assertEqual(self.rows(), [])
+        self.consent()
+        self.hook(folder)
+        row = self.rows()[0]
+        self.assertNotIn("repository_ref", row)
+        self.assertNotIn(str(folder), json.dumps(row))
+
+    def test_temp_folders_stay_out_even_with_consent(self):
+        self.connect()
+        self.consent()
+        self.hook(tempfile.gettempdir())
+        self.assertEqual(self.rows(), [])
+
+
 class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
     """Commits are linked only from one Bash tool call's own checkout reflog."""
 

@@ -134,6 +134,7 @@ fn state_check(state: &Path) -> Result<()> {
         ]
         .iter()
         .chain(&orchestrators::STATE_FILES)
+        .chain(&[crate::outside::CONSENT])
         .any(|n| name == *n)
         {
             return Err("separate_empty_rust_state_required".into());

@@ -8,6 +8,7 @@ pub mod drops;
 pub mod install;
 pub mod orchestrators;
 mod ordered;
+pub mod outside;
 pub mod pairing;
 pub mod reflog;
 pub mod store;
