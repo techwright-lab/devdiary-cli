@@ -1,5 +1,9 @@
 # devdiary
 
+> [!IMPORTANT]
+> **Using a control plane such as Paperclip? It needs its own setup, or its agents record nothing.**
+> See [Integrations](docs/integrations/README.md) and the [Paperclip guide](docs/integrations/paperclip.md).
+
 A runtime-dependency-free Python launcher for the DevDiary Agent Attribution Contract.
 It keeps stable actor identity separate from runtime/model metadata, removes the
 actor-bound ingest key from child environments, writes a read-only context file
@@ -308,6 +312,10 @@ change and no new pairing is needed. The server must accept rows with no reposit
 first; older servers refuse them and they stay pending.
 
 ### Orchestrator names need local approval
+
+Approval alone is not enough. Each control plane must also start sessions that load the
+collector hooks. Paperclip needs one service setting: see the
+[Paperclip guide](docs/integrations/paperclip.md).
 
 A control plane (an orchestrator, a tool that starts agents) marks its runs with
 environment variables. The collector holds no list of these tools. A workspace
