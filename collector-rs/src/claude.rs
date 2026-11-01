@@ -859,7 +859,13 @@ fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Op
     for (key, value) in json!({"installation_id": config["installation_id"], "runtime": "claude-code", "session_id": session, "event": event, "actor_ref": null, "attribution_basis": "unknown", "observed_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()}).as_object().ok_or("invalid_metadata")? {
         out.insert(key.clone(), value.clone());
     }
-    for key in ["prompt_id", "tool_use_id", "agent_id", "agent_type"] {
+    if let Some(label) = data
+        .get("agent_type")
+        .filter(|v| v.as_str().is_some_and(token))
+    {
+        out.insert("agent_type".into(), label.clone());
+    }
+    for key in ["prompt_id", "tool_use_id", "agent_id"] {
         if let Some(value) = data.get(key) {
             if !value.as_str().is_some_and(token) {
                 return Err(format!("invalid_{key}").into());
@@ -1010,7 +1016,6 @@ fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
         "invalid_prompt_id" => "invalid_prompt_id",
         "invalid_tool_use_id" => "invalid_tool_use_id",
         "invalid_agent_id" => "invalid_agent_id",
-        "invalid_agent_type" => "invalid_agent_type",
         "input_too_large" => "input_too_large",
         "invalid_event" | "invalid_cwd" | "reserved_session" => "invalid",
         "owned_entry_missing"
