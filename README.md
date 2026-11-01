@@ -295,6 +295,18 @@ and any pending rows stay; revoke the connection in the browser to retire the
 credential. Headless machines need `loginctl enable-linger` for the timer to run
 while logged out.
 
+### Sessions outside repositories
+
+By default your own sessions outside a git repository are not recorded.
+`devdiary-collector outside-repos on`, in a terminal, or `install --record-outside-repos`
+turns that on. A row holds the event, the time and the tool name, never a path. Rows
+under `/tmp`, `/var/tmp` and the system temp folder stay out, because background tools
+run throwaway sessions there. A run with an unanswered orchestrator offer stays out too.
+`devdiary-collector outside-repos off` turns it off, with no terminal needed. `doctor`
+shows the choice as `outside_repos`. It is a local file, so the saved scope does not
+change and no new pairing is needed. The server must accept rows with no repository
+first; older servers refuse them and they stay pending.
+
 ### Orchestrator names need local approval
 
 A control plane (an orchestrator, a tool that starts agents) marks its runs with

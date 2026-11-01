@@ -89,6 +89,7 @@ fn install_options(args: &[String]) -> Result<install::Options<'_>> {
         trust_origin: false,
         settings: None,
         record_orchestrated_outside_repos: false,
+        record_outside_repos: false,
         yes: false,
         browser: true,
         new_pair: false,
@@ -110,6 +111,7 @@ fn install_options(args: &[String]) -> Result<install::Options<'_>> {
             }
             "--trust-origin" => o.trust_origin = true,
             "--record-orchestrated-outside-repos" => o.record_orchestrated_outside_repos = true,
+            "--record-outside-repos" => o.record_outside_repos = true,
             "--new-pair" => o.new_pair = true,
             "--yes" => o.yes = true,
             "--no-browser" => o.browser = false,
@@ -129,6 +131,11 @@ fn lifecycle(args: &[String]) -> Result<Option<i32>> {
         Some("uninstall") if rest.is_empty() => install::uninstall(&Systemctl)?,
         Some("doctor") if rest.is_empty() => install::doctor(&Systemctl)?,
         Some("timer-sync") if rest.len() == 1 => install::timer_sync(Path::new(&rest[0]))?,
+        Some("outside-repos") => match rest {
+            [choice] if choice == "on" => install::outside_repos(true)?,
+            [choice] if choice == "off" => install::outside_repos(false)?,
+            _ => return Err("invalid_command".into()),
+        },
         Some("orchestrators") if rest.first().is_some_and(|c| c == "approve") => match &rest[1..] {
             [] => install::approve_orchestrators(None)?,
             [dir] if dir.starts_with('/') => install::approve_orchestrators(Some(Path::new(dir)))?,
@@ -235,7 +242,7 @@ fn run() -> Result<i32> {
     }
     if args.len() == 2 && args[1] == "--help" {
         println!(
-            "install [--origin ORIGIN --trust-origin] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--yes] [--no-browser] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the 9 hook entries, then enables a systemd user timer that syncs every 2 minutes.\n  --yes never approves orchestrator names.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)\norchestrators approve [CONNECTION_DIR]\n  Shows the environment names the server offers and asks. Needs a terminal."
+            "install [--origin ORIGIN --trust-origin] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--record-outside-repos] [--yes] [--no-browser] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the 9 hook entries, then enables a systemd user timer that syncs every 2 minutes.\n  --yes never approves orchestrator names.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)\noutside-repos on|off\n  Also records your sessions outside git repositories: event, time and tool name, never a path. Temp folders stay out.\norchestrators approve [CONNECTION_DIR]\n  Shows the environment names the server offers and asks. Needs a terminal."
         );
         println!(
             "setup PRIVATE_CONNECTION_DIR [REPOSITORY [--remote NAME]] [--record-orchestrated-outside-repos] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\n  Without REPOSITORY the connection covers every active repository of the workspace (installation scope).\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."

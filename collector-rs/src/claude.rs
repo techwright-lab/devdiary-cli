@@ -786,7 +786,13 @@ fn workspace_checkout(cwd: &Path, hints: &[String]) -> (Checkout, Option<PathBuf
 }
 type Located = Option<(String, Option<PathBuf>)>;
 // The stamped ref is the server's spelling; GitHub names are case-insensitive.
-fn locate(cwd: &Path, config: &Object, state: &Path, run: Option<&Declared>) -> Result<Located> {
+fn locate(
+    cwd: &Path,
+    config: &Object,
+    state: &Path,
+    run: Option<&Declared>,
+    unanswered: bool,
+) -> Result<Located> {
     let hints = run.map_or(&[][..], |run| &run.checkout);
     let (found, gitdir) = workspace_checkout(cwd, hints);
     match found {
@@ -803,8 +809,18 @@ fn locate(cwd: &Path, config: &Object, state: &Path, run: Option<&Declared>) -> 
         {
             Ok(None)
         }
+        Checkout::Absent
+            if !unanswered && run.is_none() && owner_outside_repos(cwd, config, state) =>
+        {
+            Ok(None)
+        }
         Checkout::Absent => Err("outside_scope".into()),
     }
+}
+fn owner_outside_repos(cwd: &Path, config: &Object, state: &Path) -> bool {
+    crate::wire_version(config) == 2
+        && crate::outside::allowed(state)
+        && !crate::outside::temporary(cwd)
 }
 fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<(Object, Option<PathBuf>)> {
     if !crate::installation(config) {
@@ -815,7 +831,8 @@ fn scoped_row(cwd: &Path, config: &Object, state: &Path) -> Result<(Object, Opti
     let run = orchestrators::declared(state)?;
     let mut gitdir = None;
     let named = run.as_ref().filter(|run| run.named);
-    let located = locate(cwd, config, state, named)?;
+    let unanswered = run.is_some() && named.is_none();
+    let located = locate(cwd, config, state, named, unanswered)?;
     let mut row = run.map(|run| run.row).unwrap_or_default();
     if let Some((reference, found)) = located {
         row.insert("repository_ref".into(), reference.into());
