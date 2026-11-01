@@ -467,7 +467,8 @@ class ClaudeHookTest(unittest.TestCase):
                 "outside_scope": 2,
                 "invalid": 3,
                 "invalid_json": 4,
-                "invalid_metadata": 2,
+                "invalid_prompt_id": 1,
+                "invalid_tool_use_id": 1,
             },
         )
         child = self.repo / "sub"
