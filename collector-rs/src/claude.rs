@@ -862,7 +862,7 @@ fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Op
     for key in ["prompt_id", "tool_use_id", "agent_id", "agent_type"] {
         if let Some(value) = data.get(key) {
             if !value.as_str().is_some_and(token) {
-                return Err("invalid_metadata".into());
+                return Err(format!("invalid_{key}").into());
             }
             out.insert(key.into(), value.clone());
         }
@@ -1007,6 +1007,10 @@ fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
         "observation_conflict" => "observation_conflict",
         "revoked" => "revoked",
         "invalid_metadata" => "invalid_metadata",
+        "invalid_prompt_id" => "invalid_prompt_id",
+        "invalid_tool_use_id" => "invalid_tool_use_id",
+        "invalid_agent_id" => "invalid_agent_id",
+        "invalid_agent_type" => "invalid_agent_type",
         "input_too_large" => "input_too_large",
         "invalid_event" | "invalid_cwd" | "reserved_session" => "invalid",
         "owned_entry_missing"

@@ -18,7 +18,7 @@ pub(crate) const LOG: &str = "drops.log";
 pub(crate) const FOLDING: &str = "drops.log.folding";
 const CAP: u64 = 1 << 20;
 // Append only: a reason's index is its byte in the log.
-pub const REASONS: [&str; 14] = [
+pub const REASONS: [&str; 18] = [
     "outside_scope",
     "unknown_repository",
     "spool_full",
@@ -33,6 +33,10 @@ pub const REASONS: [&str; 14] = [
     "invalid_json",
     "invalid_metadata",
     "input_too_large",
+    "invalid_prompt_id",
+    "invalid_tool_use_id",
+    "invalid_agent_id",
+    "invalid_agent_type",
 ];
 
 /// Best effort and silent: a drop that cannot be counted is not an error.

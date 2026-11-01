@@ -10,14 +10,16 @@ import subprocess
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 import uuid
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-BIN = Path(__file__).resolve().parents[1] / "target/debug/devdiary-collector"
-VERSION = "0.1.0"
+CRATE = Path(__file__).resolve().parents[1]
+BIN = CRATE / "target/debug/devdiary-collector"
+VERSION = tomllib.loads((CRATE / "Cargo.toml").read_text())["package"]["version"]
 EVENTS = [
     "SessionStart",
     "UserPromptSubmit",
