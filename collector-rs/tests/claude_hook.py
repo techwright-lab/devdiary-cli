@@ -1690,6 +1690,12 @@ class OutsideReposHookTest(InstallationFixture, unittest.TestCase):
         self.assertNotIn("repository_ref", row)
         self.assertNotIn(str(folder), json.dumps(row))
 
+    def test_owner_consent_does_not_admit_a_named_run(self):
+        self.connect(opt_in=False)
+        self.consent()
+        self.hook(self.plain_folder(), PAPERCLIP_AGENT_ID=str(uuid.uuid4()))
+        self.assertEqual(self.rows(), [])
+
     def test_temp_folders_stay_out_even_with_consent(self):
         self.connect()
         self.consent()

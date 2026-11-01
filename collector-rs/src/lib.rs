@@ -285,7 +285,7 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     }
     out.insert("observed_at".into(), timestamp.into());
     if installation(config) {
-        located(&out, version)?;
+        located(&out, config, version)?;
     } else {
         out.insert("repository_ref".into(), config["repository_ref"].clone());
     }
@@ -312,13 +312,19 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-// Consent is checked when a row is captured. A spooled row must still leave
-// after its owner turns the choice off, so only the wire shape is checked here.
-fn located(out: &Object, version: u64) -> Result<()> {
+// Two consents: an owner row is gated at capture, an orchestrated row by the saved opt-in.
+fn located(out: &Object, config: &Object, version: u64) -> Result<()> {
     match out.get("repository_ref") {
         Some(r) if r.as_str().is_some_and(repository) => Ok(()),
-        None if version == 2 && out.get("orchestrator") != Some(&json!("unapproved")) => Ok(()),
+        None if version == 2 && repo_less_allowed(out, config) => Ok(()),
         _ => Err("invalid_repository".into()),
+    }
+}
+fn repo_less_allowed(out: &Object, config: &Object) -> bool {
+    match out.get("orchestrator") {
+        None => true,
+        Some(key) if key == "unapproved" => false,
+        Some(_) => config["record_orchestrated_outside_repos"] == json!(true),
     }
 }
 fn orchestrated(out: &Object) -> Result<()> {

@@ -809,7 +809,11 @@ fn locate(
         {
             Ok(None)
         }
-        Checkout::Absent if !unanswered && owner_outside_repos(cwd, config, state) => Ok(None),
+        Checkout::Absent
+            if !unanswered && run.is_none() && owner_outside_repos(cwd, config, state) =>
+        {
+            Ok(None)
+        }
         Checkout::Absent => Err("outside_scope".into()),
     }
 }

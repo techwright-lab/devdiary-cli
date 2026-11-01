@@ -274,17 +274,18 @@ fn merged(change: serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-fn v2_repository_is_optional_unless_the_offer_is_unanswered() {
+fn v2_repo_less_rows_keep_the_two_consents_apart() {
     let mut row = local_v2();
     row.as_object_mut().unwrap().remove("repository_ref");
-    let config = installation();
-    assert!(frozen(&config, &row).is_none(), "repo-less commits");
+    let mut opted_in = installation();
+    opted_in.insert("record_orchestrated_outside_repos".into(), true.into());
+    assert!(frozen(&opted_in, &row).is_none(), "repo-less commits");
     for key in ["commits", "overlap_count"] {
         row.as_object_mut().unwrap().remove(key);
     }
-    let wire = frozen(&config, &row).unwrap();
+    assert!(frozen(&installation(), &row).is_none(), "no agent opt-in");
+    let wire = frozen(&opted_in, &row).unwrap();
     assert!(wire.get("repository_ref").is_none());
-    row["orchestrator"] = "unapproved".into();
     for key in [
         "orchestrator_agent_ref",
         "orchestrator_run_ref",
@@ -292,9 +293,10 @@ fn v2_repository_is_optional_unless_the_offer_is_unanswered() {
     ] {
         row.as_object_mut().unwrap().remove(key);
     }
-    assert!(frozen(&config, &row).is_none(), "unanswered offer");
+    row["orchestrator"] = "unapproved".into();
+    assert!(frozen(&opted_in, &row).is_none(), "unanswered offer");
     row.as_object_mut().unwrap().remove("orchestrator");
-    assert!(frozen(&config, &row).is_some(), "owner row");
+    assert!(frozen(&installation(), &row).is_some(), "owner row");
 }
 
 #[test]
