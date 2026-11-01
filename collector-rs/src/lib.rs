@@ -8,6 +8,7 @@ pub mod drops;
 pub mod install;
 pub mod orchestrators;
 mod ordered;
+pub mod outside;
 pub mod pairing;
 pub mod reflog;
 pub mod store;
@@ -311,17 +312,19 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-// Only an orchestrated run the customer opted in for may leave the repository out.
+// Two consents: an owner row is gated at capture, an orchestrated row by the saved opt-in.
 fn located(out: &Object, config: &Object, version: u64) -> Result<()> {
     match out.get("repository_ref") {
         Some(r) if r.as_str().is_some_and(repository) => Ok(()),
-        None if version == 2
-            && config["record_orchestrated_outside_repos"] == json!(true)
-            && out.contains_key("orchestrator") =>
-        {
-            Ok(())
-        }
+        None if version == 2 && repo_less_allowed(out, config) => Ok(()),
         _ => Err("invalid_repository".into()),
+    }
+}
+fn repo_less_allowed(out: &Object, config: &Object) -> bool {
+    match out.get("orchestrator") {
+        None => true,
+        Some(key) if key == "unapproved" => false,
+        Some(_) => config["record_orchestrated_outside_repos"] == json!(true),
     }
 }
 fn orchestrated(out: &Object) -> Result<()> {

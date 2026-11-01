@@ -22,6 +22,7 @@ const BINARY: &str = "devdiary-collector";
 const RECORD: &str = "install.json";
 const SYNC_STATUS: &str = "sync-status.json";
 const BATCH: usize = 100;
+const OUTSIDE_ON: &str = "Your sessions outside repositories are now recorded: event, time and tool name, never a path. Temp folders stay out.";
 const BATCHES: usize = 10;
 
 pub struct Options<'a> {
@@ -29,6 +30,7 @@ pub struct Options<'a> {
     pub trust_origin: bool,
     pub settings: Option<&'a Path>,
     pub record_orchestrated_outside_repos: bool,
+    pub record_outside_repos: bool,
     pub yes: bool,
     pub browser: bool,
     pub new_pair: bool,
@@ -191,6 +193,10 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
         return Err(error);
     }
     registration.finish(runner)?;
+    if o.record_outside_repos {
+        crate::outside::set(&connection(&data).join("outbox"), true)?;
+        println!("{OUTSIDE_ON}");
+    }
     offer_orchestrators(&data)
 }
 fn revoked(data: &Path) -> bool {
@@ -395,6 +401,22 @@ fn offer_orchestrators(data: &Path) -> Result<()> {
         other => other,
     }
 }
+pub fn outside_repos(on: bool) -> Result<()> {
+    if on && !std::io::stdin().is_terminal() {
+        return Err("approval_required".into());
+    }
+    crate::outside::set(&connection(&data_dir()?).join("outbox"), on)?;
+    println!(
+        "{}",
+        if on {
+            OUTSIDE_ON
+        } else {
+            "Sessions outside repositories are no longer recorded."
+        }
+    );
+    Ok(())
+}
+
 pub fn approve_orchestrators(root: Option<&Path>) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         return Err("approval_required".into());
@@ -466,6 +488,7 @@ pub fn doctor(runner: &dyn Runner) -> Result<()> {
             "delivered": delivered,
             "drops": drops::counts(&store, &outbox)?,
             "orchestrators": orchestrators,
+            "outside_repos": crate::outside::allowed(&outbox),
             "revoked": connection(&data).join("revoked").exists(),
             "last_scope_refresh_error": store.scope_refresh_failure()?,
             "last_receipt": receipt,
