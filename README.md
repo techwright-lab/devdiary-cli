@@ -58,7 +58,7 @@ auto-vacuum. Repair holds the sync lock and is safe to re-run after a crash. Sco
 is immutable from initialization, including after delivery. Keys stay in separate
 0600 regular files and are read only by explicit sync; rotating the key file does
 not retarget evidence. Owner-only state, no symlink ancestors or hardlinks, FULL
-SQLite commits, 250 ms lock waits, 10,000 retained rows and a 16 MiB database ceiling
+SQLite commits, 1400 ms lock waits, 10,000 retained rows and a 16 MiB database ceiling
 bound storage. Capacity/lock failures leave existing evidence unchanged; callers
 must retry failed collection with the same UUID. A delivered row is deleted in the
 same transaction that records its validated receipt; the delivered counter, the
@@ -519,7 +519,7 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   without delivery IDs get random UUIDs: repeated starts/resumes/ends are not
   collapsed. Stop remains a **turn** observation, not SessionEnd; no completion,
   authorship, human minutes or duration is inferred. No binding support is added.
-- Raw stdin is capped at 4 MiB; fields outside the allowlist (prompts, tool input
+- Raw stdin is capped at 16 MiB; fields outside the allowlist (prompts, tool input
   and responses) are skipped without being parsed into memory. The hook runs its
   cheap checks first: parse and event allowlist, plan, registration receipt,
   revocation, repository scope, executable fingerprint, and only then the settings

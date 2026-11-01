@@ -461,7 +461,15 @@ class ClaudeHookTest(unittest.TestCase):
         ):
             self.hook(raw=raw)
         self.assertEqual(self.rows(), [])
-        self.assertEqual(self.drops(), {"outside_scope": 2, "invalid": 9})
+        self.assertEqual(
+            self.drops(),
+            {
+                "outside_scope": 2,
+                "invalid": 3,
+                "invalid_json": 4,
+                "invalid_metadata": 2,
+            },
+        )
         child = self.repo / "sub"
         child.mkdir()
         self.hook(dict(self.raw, cwd=str(child)))
@@ -731,12 +739,12 @@ class ClaudeHookTest(unittest.TestCase):
         self.assertEqual(len(self.rows()), 2)
         self.assertEqual(self.drops(), {})
 
-    def test_large_tool_payload_is_skipped_up_to_four_mebibytes(self):
+    def test_large_tool_payload_is_skipped_up_to_sixteen_mebibytes(self):
         self.hook(dict(self.raw, tool_response="PRIVATE_SENTINEL" * 200_000))
         self.assertEqual(len(self.rows()), 1)
-        self.hook(raw=b'{"pad":"' + b"x" * (4 * 1024 * 1024) + b'"}')
+        self.hook(raw=b'{"pad":"' + b"x" * (16 * 1024 * 1024) + b'"}')
         self.assertEqual(len(self.rows()), 1)
-        self.assertEqual(self.drops(), {"invalid": 1})
+        self.assertEqual(self.drops(), {"input_too_large": 1})
         for file in self.state.iterdir():
             self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
 
@@ -1701,6 +1709,46 @@ class OutsideReposHookTest(InstallationFixture, unittest.TestCase):
         self.consent()
         self.hook(tempfile.gettempdir())
         self.assertEqual(self.rows(), [])
+
+
+class HookLossTest(InstallationFixture, unittest.TestCase):
+    def test_a_hook_waits_out_a_short_write_lock(self):
+        self.connect()
+        db = sqlite3.connect(
+            self.outbox / "collector-rust-v1.sqlite3", isolation_level=None
+        )
+        self.addCleanup(db.close)
+        db.execute("BEGIN IMMEDIATE")
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            running = pool.submit(self.hook, self.main)
+            time.sleep(0.6)
+            db.execute("COMMIT")
+            running.result()
+        self.assertEqual(len(self.rows()), 1)
+        self.assertNotIn("busy", self.drops())
+
+    def test_a_large_tool_result_is_still_a_row(self):
+        self.connect()
+        event = {
+            "hook_event_name": "PostToolUse",
+            "session_id": "session-1",
+            "cwd": str(self.main),
+            "tool_use_id": "tool-1",
+            "tool_name": "Read",
+            "tool_response": "x" * (6 * 1024 * 1024),
+        }
+        self.run_collector(
+            "claude-hook",
+            self.plan,
+            data=json.dumps(event).encode(),
+            env=self.env(),
+        )
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_each_kind_of_bad_input_has_its_own_count(self):
+        self.connect()
+        self.run_collector("claude-hook", self.plan, data=b"{", env=self.env())
+        self.assertIn("invalid_json", self.drops())
 
 
 class CommitBracketHookTest(InstallationFixture, unittest.TestCase):

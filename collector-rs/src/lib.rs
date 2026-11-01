@@ -20,7 +20,7 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub const MAX_INPUT: usize = 65536;
-pub const MAX_HOOK_INPUT: usize = 4 * 1024 * 1024;
+pub const MAX_HOOK_INPUT: usize = 16 * 1024 * 1024;
 pub const MAX_WIRE: usize = 16384;
 pub type Object = Map<String, Value>;
 
