@@ -285,7 +285,7 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     }
     out.insert("observed_at".into(), timestamp.into());
     if installation(config) {
-        located(&out, config, version)?;
+        located(&out, version)?;
     } else {
         out.insert("repository_ref".into(), config["repository_ref"].clone());
     }
@@ -312,16 +312,12 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-// Only an orchestrated run the customer opted in for may leave the repository out.
-fn located(out: &Object, config: &Object, version: u64) -> Result<()> {
+// Consent is checked when a row is captured. A spooled row must still leave
+// after its owner turns the choice off, so only the wire shape is checked here.
+fn located(out: &Object, version: u64) -> Result<()> {
     match out.get("repository_ref") {
         Some(r) if r.as_str().is_some_and(repository) => Ok(()),
-        None if version == 2
-            && config["record_orchestrated_outside_repos"] == json!(true)
-            && out.contains_key("orchestrator") =>
-        {
-            Ok(())
-        }
+        None if version == 2 && out.get("orchestrator") != Some(&json!("unapproved")) => Ok(()),
         _ => Err("invalid_repository".into()),
     }
 }

@@ -1669,7 +1669,9 @@ class DeclaredRunHookTest(InstallationFixture, unittest.TestCase):
 
 class OutsideReposHookTest(InstallationFixture, unittest.TestCase):
     def consent(self):
-        (self.outbox / "record-outside-repos").write_bytes(b"")
+        consent = self.outbox / "record-outside-repos"
+        consent.write_bytes(b"")
+        consent.chmod(0o600)
 
     def plain_folder(self):
         folder = Path.home() / f"devdiary-outside-{os.getpid()}"

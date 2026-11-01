@@ -11,7 +11,7 @@ pub fn allowed(state: &Path) -> bool {
 pub fn set(state: &Path, on: bool) -> Result<()> {
     let path = state.join(CONSENT);
     if on {
-        fs::write(path, b"")?;
+        crate::store::create_private(&path)?;
     } else if allowed(state) {
         fs::remove_file(path)?;
     }
@@ -28,13 +28,23 @@ pub fn temporary(cwd: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn consent_is_a_file_that_comes_and_goes() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!allowed(dir.path()));
         set(dir.path(), true).unwrap();
+        set(dir.path(), true).unwrap();
         assert!(allowed(dir.path()));
+        let mode = fs::metadata(dir.path().join(CONSENT))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            mode.mode() & 0o077,
+            0,
+            "the state check refuses a shared file"
+        );
         set(dir.path(), false).unwrap();
         set(dir.path(), false).unwrap();
         assert!(!allowed(dir.path()));
