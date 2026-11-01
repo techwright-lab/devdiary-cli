@@ -476,6 +476,13 @@ class ClaudeHookTest(unittest.TestCase):
         self.hook(dict(self.raw, cwd=str(child)))
         self.assertEqual(len(self.rows()), 1)
 
+    def test_a_bad_agent_type_costs_the_label_and_not_the_row(self):
+        for tool, value in enumerate(("has space", None, "")):
+            self.hook(dict(self.raw, tool_use_id=f"tool-{tool}", agent_type=value))
+        self.assertEqual(len(self.rows()), 3)
+        self.assertFalse(any("agent_type" in row for row in self.rows()))
+        self.assertEqual(self.drops(), {})
+
     def test_open_stdin_deadline_and_locked_spool(self):
         start = time.monotonic()
         process = subprocess.Popen(
