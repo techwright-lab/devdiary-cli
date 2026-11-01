@@ -971,7 +971,7 @@ fn linked(state: &Path, row: &mut Object, appended: Appended, overlap: u64) {
 }
 fn input_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
     if error.is::<serde_json::Error>() {
-        return "invalid";
+        return "invalid_json";
     }
     drop_reason(error)
 }
@@ -1006,8 +1006,9 @@ fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
         "spool_full" => "spool_full",
         "observation_conflict" => "observation_conflict",
         "revoked" => "revoked",
-        "invalid_event" | "invalid_cwd" | "invalid_metadata" | "input_too_large"
-        | "reserved_session" => "invalid",
+        "invalid_metadata" => "invalid_metadata",
+        "input_too_large" => "input_too_large",
+        "invalid_event" | "invalid_cwd" | "reserved_session" => "invalid",
         "owned_entry_missing"
         | "owned_entry_changed"
         | "executable_changed"

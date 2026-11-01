@@ -159,9 +159,12 @@ fn state_entry(path: &Path, transient: bool) -> Result<()> {
         Err(e) => Err(e),
     }
 }
+// Full fsync on a journaled spool makes parallel hooks queue. A row given up on is
+// lost for good, so wait most of the hook's 2 second budget.
+const BUSY_WAIT: Duration = Duration::from_millis(1400);
 fn connect(path: &Path, page_limit: bool) -> Result<Connection> {
     let db = Connection::open(path)?;
-    db.busy_timeout(Duration::from_millis(250))?;
+    db.busy_timeout(BUSY_WAIT)?;
     db.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE;")?;
     if page_limit {
         db.execute_batch("PRAGMA max_page_count=4096;")?;
