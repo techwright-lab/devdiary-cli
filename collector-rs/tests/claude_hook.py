@@ -476,6 +476,19 @@ class ClaudeHookTest(unittest.TestCase):
         self.hook(dict(self.raw, cwd=str(child)))
         self.assertEqual(len(self.rows()), 1)
 
+    def test_a_permission_prompt_records_its_moment_and_nothing_private(self):
+        self.hook(
+            {
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "cwd": str(self.repo),
+                "tool_name": "Bash",
+                "tool_input": {"command": "PRIVATE_SENTINEL"},
+            }
+        )
+        self.assertEqual([row["event"] for row in self.rows()], ["PermissionRequest"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(self.rows()))
+
     def test_a_bad_agent_type_costs_the_label_and_not_the_row(self):
         for tool, value in enumerate(("has space", None, "")):
             self.hook(dict(self.raw, tool_use_id=f"tool-{tool}", agent_type=value))

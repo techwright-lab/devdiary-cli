@@ -242,7 +242,7 @@ devdiary-collector uninstall
    interrupted.
 3. Copies the running binary to `~/.local/share/devdiary/collector/VERSION/` (0700),
    so the registered hook survives rebuilds and `cargo clean`.
-4. `setup-plan` for that copy, prints the 9 hook entries, and asks `[y/N]` on the
+4. `setup-plan` for that copy, prints the 10 hook entries, and asks `[y/N]` on the
    terminal (or takes `--yes`). Declining removes the plan and changes nothing.
 5. `claude-apply`. Settings edited after the plan give `stale_plan` and are left
    exactly as they are; run `install` again.
@@ -283,7 +283,7 @@ refresh error.
 the timer, pending and delivered counts, drops, the last receipt,
 `last_sync_error` and `last_scope_refresh_error`. `upgrade` first checks that the settings would accept a fresh
 plan once the old entries are gone and that the connection was not revoked, prints
-the 9 new entries and asks once; only then does it remove the old registration, copy
+the 10 new entries and asks once; only then does it remove the old registration, copy
 the new binary over the pinned one and install the fresh plan. Declining leaves the
 running hooks and their pinned binary untouched. The install
 record is replaced only on success, so after a failed upgrade `uninstall` still
@@ -437,7 +437,7 @@ pairing/ingest server and a fake systemctl; debug builds only honour
 
 This is a distinct `claude-hook PLAN` command, not registration of the normalized
 `collect` command. It accepts stock Claude command-hook stdin for SessionStart,
-UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop, SubagentStart,
+UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, Stop, SubagentStart,
 SubagentStop and SessionEnd, following `src/devdiary/observer_hook.py`. It uses
 only the existing isolated Rust outbox and explicit `sync`; it never invokes
 Python, reads a transcript, makes a network call, or reads provider credentials.
