@@ -263,7 +263,8 @@ fn owned(doc: &Object, expected: &Value) -> Result<()> {
         let items = hook
             .and_then(Value::as_array)
             .ok_or("owned_entry_missing")?;
-        if items.iter().filter(|e| *e == expected).count() != 1 {
+        let count = items.iter().filter(|e| *e == expected).count();
+        if count != 1 && !(count == 0 && ADDED_LATER.contains(&event)) {
             return Err("owned_entry_changed".into());
         }
     }
