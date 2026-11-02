@@ -26,6 +26,7 @@ EVENTS = [
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
+    "PermissionRequest",
     "Stop",
     "SubagentStart",
     "SubagentStop",
@@ -295,12 +296,12 @@ class InstallTest(unittest.TestCase):
         doc = json.loads(self.settings.read_bytes())
         self.assertEqual(doc["hooks"]["UserPromptSubmit"][0], CODEGRAPH)
         entries = self.owned_entries()
-        self.assertEqual(sum(len(v) for v in entries.values()), 9)
+        self.assertEqual(sum(len(v) for v in entries.values()), len(EVENTS))
         exe = self.data / VERSION / "devdiary-collector"
         for (entry,) in entries.values():
             self.assertIn(f"'{exe}' claude-hook ", entry["hooks"][0]["command"])
         self.assertEqual(exe.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(out.count(" claude-hook "), 9)
+        self.assertEqual(out.count(" claude-hook "), len(EVENTS))
         self.assertIn("Self-test passed", out)
         self.assertEqual(
             self.systemctl_log(),
@@ -380,7 +381,7 @@ class InstallTest(unittest.TestCase):
         out = self.run_collector("upgrade", "--yes").stdout.decode()
         self.assertIn("Self-test passed", out)
         entries = self.owned_entries()
-        self.assertEqual(sum(len(v) for v in entries.values()), 9)
+        self.assertEqual(sum(len(v) for v in entries.values()), len(EVENTS))
         self.assertNotEqual(entries["Stop"][0]["hooks"][0]["command"], before)
         self.assertEqual(
             json.loads(self.settings.read_bytes())["hooks"]["UserPromptSubmit"][0],
@@ -678,7 +679,9 @@ class InstallTest(unittest.TestCase):
         self.orchestrators = [PAPERCLIP]
         code, _, err = self.converse(self.install_args(), [b"y\n", b"n\n"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 9)
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
         self.assertIsNone(self.approved())
         self.assertTrue(self.waiting()["waiting_for_approval"])
 
@@ -687,7 +690,9 @@ class InstallTest(unittest.TestCase):
         out = self.install("--yes").stdout
         self.assertIn(b"orchestrators approve", out)
         self.assertIsNone(self.approved())
-        self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 9)
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
         self.assertTrue(self.waiting()["waiting_for_approval"])
 
     def test_install_with_nothing_offered_asks_nothing_about_names(self):
@@ -801,7 +806,9 @@ class InstallTest(unittest.TestCase):
     def test_consent_on_a_tty_installs_then_enables(self):
         code, err = self.interactive(b"y\n")
         self.assertEqual(code, 0, err)
-        self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 9)
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
         self.assertEqual(
             self.systemctl_log()[-1],
             "--user enable --now devdiary-collector-sync.timer",
@@ -814,7 +821,7 @@ class InstallTest(unittest.TestCase):
         code, err = self.interactive(b"n\n", args=[str(BIN), "upgrade"])
         self.assertEqual(code, 2)
         self.assertIn(b"consent_declined", err)
-        self.assertEqual(self.seen.count(b" claude-hook "), 9)
+        self.assertEqual(self.seen.count(b" claude-hook "), len(EVENTS))
         self.assertEqual(self.settings.read_bytes(), before)
         self.assertEqual(self.systemctl_log(), log)
 

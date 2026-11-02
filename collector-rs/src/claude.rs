@@ -22,12 +22,13 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const EVENTS: [&str; 9] = [
+pub const EVENTS: [&str; 10] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
+    "PermissionRequest",
     "Stop",
     "SubagentStart",
     "SubagentStop",

@@ -189,7 +189,7 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     registration.show()?;
     if let Err(error) = consent(
         o.yes,
-        "Append these 9 entries and enable the devdiary-collector-sync user timer?",
+        "Append these 10 entries and enable the devdiary-collector-sync user timer?",
     ) {
         let _ = fs::remove_file(&registration.plan);
         return Err(error);
@@ -325,7 +325,7 @@ pub fn upgrade(yes: bool, runner: &dyn Runner) -> Result<()> {
     consent(
         yes,
         &format!(
-            "Replace the hook entries of version {} with these 9 entries of version {VERSION}?",
+            "Replace the hook entries of version {} with these 10 entries of version {VERSION}?",
             old.version
         ),
     )?;
