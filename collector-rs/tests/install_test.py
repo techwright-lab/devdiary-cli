@@ -5,6 +5,8 @@ import json
 import os
 import pty
 import select
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -83,6 +85,9 @@ class InstallTest(unittest.TestCase):
         self.settings.write_bytes(self.original)
         self.settings.chmod(0o644)
         self.data = self.home / ".local/share/devdiary/collector"
+        self.runtime = "claude-code"
+        self.requested_runtime = None
+        self.received_raw = []
         self.received = []
         self.observation_status = 201
         self.orchestrators = None
@@ -115,9 +120,11 @@ class InstallTest(unittest.TestCase):
                 self.reply(200, reply)
 
             def do_POST(self):
-                data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                data = json.loads(raw)
                 if self.path.endswith("/collector_pairings"):
                     owner.installation = data["installation_id"]
+                    owner.requested_runtime = data["runtime"]
                     return self.reply(
                         201,
                         {
@@ -141,7 +148,7 @@ class InstallTest(unittest.TestCase):
                                 "collector_ref": COLLECTOR_REF,
                                 "token": "dc_live_" + "s" * 43,
                                 "installation_id": owner.installation,
-                                "runtime": "claude-code",
+                                "runtime": owner.runtime,
                                 "endpoint_path": "/ingest/v1/observations",
                                 "scope_kind": "installation",
                                 "scope_path": "/ingest/v1/collector/scope",
@@ -150,6 +157,7 @@ class InstallTest(unittest.TestCase):
                             },
                         },
                     )
+                owner.received_raw.append(raw)
                 owner.received.append(data)
                 if owner.observation_status != 201:
                     return self.reply(owner.observation_status, {"error": "refused"})
@@ -210,6 +218,109 @@ class InstallTest(unittest.TestCase):
 
     def install(self, *extra, code=0):
         return self.run_collector(*self.install_args(*extra)[1:], code=code)
+
+    @unittest.skipUnless(
+        os.environ.get("DEVDIARY_UPGRADE_FROM"),
+        "set DEVDIARY_UPGRADE_FROM to a released 0.3.1 binary",
+    )
+    def test_real_released_binary_upgrades_and_uninstalls_without_losing_hooks(self):
+        # Mount the fake at the release binary's fixed systemctl path. Its
+        # debug-only environment override deliberately does not exist in releases.
+        self.assertIsNotNone(shutil.which("bwrap"))
+        released = self.root / "collector-0.3.1"
+        shutil.copyfile(os.environ["DEVDIARY_UPGRADE_FROM"], released)
+        released.chmod(0o700)
+        wrapper = self.root / "released-install"
+        wrapper.write_text(
+            "#!/bin/sh\nexec bwrap --tmpfs / --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --ro-bind /etc /etc --dev /dev --proc /proc --tmpfs /tmp --chdir / --bind "
+            + shlex.quote(str(self.root))
+            + " "
+            + shlex.quote(str(self.root))
+            + " --ro-bind "
+            + shlex.quote(str(self.fake))
+            + " /usr/bin/systemctl -- "
+            + shlex.quote(str(released))
+            + ' "$@"\n'
+        )
+        wrapper.chmod(0o700)
+        self.run_collector(*self.install_args("--yes")[1:], exe=wrapper)
+        self.assertEqual(self.record()["version"], "0.3.1")
+        doc = json.loads(self.settings.read_bytes())
+        extra = {"hooks": [{"type": "command", "command": "keep-after-old-install"}]}
+        doc["hooks"]["Stop"].append(extra)
+        self.settings.write_text(json.dumps(doc))
+        self.run_collector("upgrade", "--yes")
+        self.assertEqual(self.record()["version"], VERSION)
+        self.run_collector("uninstall")
+        expected = json.loads(self.original)
+        expected["hooks"]["Stop"] = [extra]
+        self.assertEqual(json.loads(self.settings.read_bytes()), expected)
+
+    def test_codex_uses_its_active_configuration_home(self):
+        self.runtime = "codex"
+        custom = self.home / "control-plane-codex"
+        result = subprocess.run(
+            self.install_args("--vendor", "codex", "--yes"),
+            env={**self.env(), "CODEX_HOME": str(custom)},
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((custom / "hooks.json").is_file())
+        self.assertFalse((self.home / ".codex/hooks.json").exists())
+
+    def test_codex_can_add_hooks_to_an_existing_owner_writable_config_directory(self):
+        self.runtime = "codex"
+        directory = self.home / ".codex"
+        directory.mkdir(mode=0o755)
+        (directory / "config.toml").write_text('model = "fixture"\n')
+        self.install("--vendor", "codex", "--yes")
+        self.assertTrue((directory / "hooks.json").is_file())
+        self.assertEqual((directory / "config.toml").read_text(), 'model = "fixture"\n')
+
+    def test_codex_creation_preserves_a_file_added_during_consent(self):
+        self.runtime = "codex"
+        self.settings = self.home / ".codex/hooks.json"
+        self.settings.parent.mkdir(mode=0o700)
+        added = b'{"hooks":{"Stop":[]},"description":"concurrent-owner-edit"}'
+        code, _ = self.interactive(
+            b"y\nn\n", edit=added, args=self.install_args("--vendor", "codex")
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(self.settings.read_bytes(), added)
+
+    def test_declining_codex_setup_does_not_create_hooks_file(self):
+        self.runtime = "codex"
+        code, _, err = self.converse(self.install_args("--vendor", "codex"), [b"n\n"])
+        self.assertEqual(code, 2, err)
+        self.assertFalse((self.home / ".codex/hooks.json").exists())
+        self.assertEqual(self.systemctl_log(), [])
+
+    def test_codex_installs_alongside_claude_without_replacing_it(self):
+        self.install("--yes")
+        claude_settings = self.settings.read_bytes()
+        claude_service = self.config / "systemd/user/devdiary-collector-sync.service"
+        original_service = claude_service.read_bytes()
+        self.runtime = "codex"
+        settings = self.home / ".codex/hooks.json"
+        settings.parent.mkdir()
+        settings.write_text(
+            '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}}'
+        )
+        self.install("--yes", "--vendor", "codex")
+        self.assertEqual(self.requested_runtime, "codex")
+        self.assertEqual(self.settings.read_bytes(), claude_settings)
+        self.assertEqual(claude_service.read_bytes(), original_service)
+        hooks = json.loads(settings.read_bytes())["hooks"]
+        self.assertIn("Interrupt", hooks)
+        self.assertIn("PermissionRequest", hooks)
+        self.assertNotIn("PostToolUseFailure", hooks)
+        self.assertIn(" codex-hook ", hooks["Interrupt"][0]["hooks"][0]["command"])
+        self.assertTrue((self.data / "codex/install.json").is_file())
+        self.assertTrue(
+            (self.config / "systemd/user/devdiary-collector-codex-sync.timer").is_file()
+        )
 
     def systemctl_log(self):
         log = self.fake.parent / "systemctl.log"
@@ -637,7 +748,8 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.settings.read_bytes(), compact)
 
     def interactive(self, answer, edit=None, args=None):
-        log, before = self.systemctl_log(), self.settings.read_bytes()
+        log = self.systemctl_log()
+        before = self.settings.read_bytes() if self.settings.exists() else None
         master, slave = pty.openpty()
         self.addCleanup(os.close, master)
         process = subprocess.Popen(
@@ -657,7 +769,9 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"[y/N]", seen)
         self.seen = seen
         self.assertEqual(self.systemctl_log(), log)
-        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertEqual(
+            self.settings.read_bytes() if self.settings.exists() else None, before
+        )
         if edit is not None:
             self.settings.write_bytes(edit)
         os.write(master, answer)

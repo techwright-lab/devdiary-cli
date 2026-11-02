@@ -5,6 +5,7 @@ use crate::{
     store::{Report, Store, private},
     systemd::{self, Runner},
     text,
+    vendor::Vendor,
 };
 use serde_json::{Value, json};
 use std::{
@@ -28,6 +29,7 @@ const OUTSIDE_ON: &str = "Your sessions outside repositories are now recorded: e
 const BATCHES: usize = 10;
 
 pub struct Options<'a> {
+    pub vendor: Vendor,
     pub origin: Option<&'a str>,
     pub trust_origin: bool,
     pub settings: Option<&'a Path>,
@@ -46,8 +48,13 @@ fn home() -> Result<PathBuf> {
 }
 // Fixed under HOME, not XDG_DATA_HOME: a shell without that variable must still
 // find the same install record, connection and pinned binary.
-fn data_dir() -> Result<PathBuf> {
-    Ok(home()?.join(".local/share/devdiary/collector"))
+fn data_dir(vendor: Vendor) -> Result<PathBuf> {
+    let root = home()?.join(".local/share/devdiary/collector");
+    Ok(if vendor == Vendor::Codex {
+        root.join("codex")
+    } else {
+        root
+    })
 }
 fn connection(data: &Path) -> PathBuf {
     data.join("connection")
@@ -60,6 +67,9 @@ fn private_dir(path: &Path) -> Result<()> {
     private(path, true)
 }
 fn save(path: &Path, value: &Value) -> Result<()> {
+    save_using(path, value, true)
+}
+fn save_using(path: &Path, value: &Value, overwrite: bool) -> Result<()> {
     let parent = path.parent().ok_or("invalid_path")?;
     let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
@@ -70,7 +80,17 @@ fn save(path: &Path, value: &Value) -> Result<()> {
             .open(&temporary)?;
         file.write_all(&serde_json::to_vec(value)?)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        if overwrite {
+            fs::rename(&temporary, path)?;
+        } else {
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &temporary,
+                rustix::fs::CWD,
+                path,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )?;
+        }
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -157,10 +177,15 @@ fn consent(yes: bool, question: &str) -> Result<()> {
 
 pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     require_consent_channel(o.yes)?;
-    let data = data_dir()?;
+    let data = data_dir(o.vendor)?;
     let settings = match o.settings {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(_) => return Err("unsupported_path".into()),
+        None if o.vendor == Vendor::Codex => match std::env::var_os("CODEX_HOME") {
+            Some(root) if Path::new(&root).is_absolute() => PathBuf::from(root).join("hooks.json"),
+            Some(_) => return Err("unsupported_path".into()),
+            None => home()?.join(".codex/hooks.json"),
+        },
         None => home()?.join(".claude/settings.json"),
     };
     if record(&data)?.is_some() {
@@ -168,10 +193,30 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     }
     let origin = o.origin.unwrap_or(pairing::DEFAULT_ORIGIN);
     pairing::origin(origin, o.trust_origin)?;
+    if o.vendor == Vendor::Codex && settings.extension().is_some_and(|e| e == "toml") {
+        return Err("codex_hooks_json_required".into());
+    }
+    // Codex need not have a hooks file yet. Never initialize or rewrite config.toml.
+    if o.vendor == Vendor::Codex && !settings.exists() {
+        consent(
+            o.yes,
+            &format!(
+                "Create an empty Codex hooks file at {}?",
+                settings.display()
+            ),
+        )?;
+        let parent = settings.parent().ok_or("invalid_path")?;
+        if !parent.exists() {
+            private_dir(parent)?;
+        }
+        crate::store::owner_writable(parent, true)?;
+        save_using(&settings, &json!({}), false)?;
+    }
     claude::preflight(&settings)?;
     private_dir(&data)?;
     reuse_or_retire(&data, o.new_pair)?;
     pairing::setup(pairing::Options {
+        vendor: o.vendor,
         root: &connection(&data),
         repository: None,
         remote: None,
@@ -184,7 +229,7 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     })
     .map_err(setup_failure)?;
     let exe = pin_binary(&data)?;
-    let registration = Registration::new(&data, &settings, &exe)?;
+    let registration = Registration::new(&data, &settings, &exe, o.vendor)?;
     registration.plan()?;
     registration.show()?;
     if let Err(error) = consent(
@@ -231,18 +276,20 @@ fn setup_failure(error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error
 }
 
 struct Registration<'a> {
+    vendor: Vendor,
     data: &'a Path,
     settings: &'a Path,
     exe: &'a Path,
     plan: PathBuf,
 }
 impl<'a> Registration<'a> {
-    fn new(data: &'a Path, settings: &'a Path, exe: &'a Path) -> Result<Self> {
+    fn new(data: &'a Path, settings: &'a Path, exe: &'a Path, vendor: Vendor) -> Result<Self> {
         let plans = data.join("plans");
         private_dir(&plans)?;
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let plan = plans.join(format!("claude-{nanos}.json"));
+        let plan = plans.join(format!("{}-{nanos}.json", vendor.slug()));
         Ok(Self {
+            vendor,
             data,
             settings,
             exe,
@@ -251,7 +298,7 @@ impl<'a> Registration<'a> {
     }
     fn show(&self) -> Result<()> {
         println!("Hook entries to append to {}:", self.settings.display());
-        for line in claude::entry_lines(&self.plan, self.exe)? {
+        for line in claude::entry_lines_for(&self.plan, self.exe, self.vendor)? {
             println!("  {line}");
         }
         Ok(())
@@ -259,7 +306,9 @@ impl<'a> Registration<'a> {
     // Consent is given to the lines `show` printed, so the saved plan must match them.
     fn plan(&self) -> Result<()> {
         pairing::plan_with(&connection(self.data), self.settings, &self.plan, self.exe)?;
-        if claude::entries(&self.plan)? != claude::entry_lines(&self.plan, self.exe)? {
+        if claude::entries(&self.plan)?
+            != claude::entry_lines_for(&self.plan, self.exe, self.vendor)?
+        {
             let _ = fs::remove_file(&self.plan);
             return Err("stale_plan".into());
         }
@@ -268,24 +317,35 @@ impl<'a> Registration<'a> {
     fn finish(&self, runner: &dyn Runner) -> Result<()> {
         let (data, exe, plan) = (self.data, self.exe, &self.plan);
         claude::apply(plan)?;
+        if self.vendor == Vendor::Codex {
+            println!(
+                "Codex: review and trust these exact definitions in /hooks before capture can run. An upgrade changes definitions and requires review again. Stock runtime qualification is unverified."
+            );
+        }
         save(
             &data.join(RECORD),
             &json!({"version": VERSION, "executable": exe, "plan": plan, "settings": self.settings}),
         )?;
-        systemd::enable(runner, &systemd::unit_dir()?, exe, &connection(data))?;
-        self_test(exe, plan, &connection(data).join("outbox"))?;
+        systemd::enable_for(
+            runner,
+            &systemd::unit_dir()?,
+            exe,
+            &connection(data),
+            self.vendor,
+        )?;
+        self_test(exe, plan, &connection(data).join("outbox"), self.vendor)?;
         println!(
-            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\nThe timer syncs every 2 minutes. Run `devdiary-collector doctor` to check it."
+            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\nThe timer syncs every 2 minutes. Run `devdiary-collector doctor` (add `--vendor codex` for Codex) to check it."
         );
         Ok(())
     }
 }
 
-fn self_test(exe: &Path, plan: &Path, outbox: &Path) -> Result<()> {
+fn self_test(exe: &Path, plan: &Path, outbox: &Path, vendor: Vendor) -> Result<()> {
     let session = format!("{}{}", claude::SELF_TEST, Uuid::new_v4());
     let event = json!({"hook_event_name": "SessionStart", "session_id": session, "cwd": "/"});
     let mut child = Command::new(exe)
-        .arg("claude-hook")
+        .arg(vendor.hook())
         .arg(plan)
         .env_clear()
         .stdin(Stdio::piped())
@@ -311,16 +371,16 @@ fn self_test(exe: &Path, plan: &Path, outbox: &Path) -> Result<()> {
 
 // The live hooks run the pinned path, so it is overwritten only after consent and
 // removal. The old record stays until replaced, so uninstall still works on failure.
-pub fn upgrade(yes: bool, runner: &dyn Runner) -> Result<()> {
+pub fn upgrade(yes: bool, runner: &dyn Runner, vendor: Vendor) -> Result<()> {
     require_consent_channel(yes)?;
-    let data = data_dir()?;
+    let data = data_dir(vendor)?;
     let old = record(&data)?.ok_or("not_installed")?;
     if revoked(&data) {
         return Err("connection_revoked".into());
     }
     claude::preflight_replacing(&old.plan)?;
     let exe = pinned(&data);
-    let registration = Registration::new(&data, &old.settings, &exe)?;
+    let registration = Registration::new(&data, &old.settings, &exe, vendor)?;
     registration.show()?;
     consent(
         yes,
@@ -404,11 +464,11 @@ fn offer_orchestrators(data: &Path) -> Result<()> {
         other => other,
     }
 }
-pub fn outside_repos(on: bool) -> Result<()> {
+pub fn outside_repos(on: bool, vendor: Vendor) -> Result<()> {
     if on && !std::io::stdin().is_terminal() {
         return Err("approval_required".into());
     }
-    crate::outside::set(&connection(&data_dir()?).join("outbox"), on)?;
+    crate::outside::set(&connection(&data_dir(vendor)?).join("outbox"), on)?;
     println!(
         "{}",
         if on {
@@ -420,13 +480,13 @@ pub fn outside_repos(on: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn approve_orchestrators(root: Option<&Path>) -> Result<()> {
+pub fn approve_orchestrators(root: Option<&Path>, vendor: Vendor) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         return Err("approval_required".into());
     }
     let outbox = match root {
         Some(root) => root.join("outbox"),
-        None => connection(&data_dir()?).join("outbox"),
+        None => connection(&data_dir(vendor)?).join("outbox"),
     };
     orchestrators::pending(&outbox)?;
     if !orchestrators::waiting(&outbox) {
@@ -436,10 +496,10 @@ pub fn approve_orchestrators(root: Option<&Path>) -> Result<()> {
     ask_orchestrators(&outbox)
 }
 
-pub fn uninstall(runner: &dyn Runner) -> Result<()> {
-    let data = data_dir()?;
+pub fn uninstall(runner: &dyn Runner, vendor: Vendor) -> Result<()> {
+    let data = data_dir(vendor)?;
     let old = record(&data)?;
-    let timer = systemd::disable(runner, &systemd::unit_dir()?);
+    let timer = systemd::disable_for(runner, &systemd::unit_dir()?, vendor);
     if let Some(old) = &old {
         claude::remove(&old.plan)?;
         fs::remove_file(data.join(RECORD))?;
@@ -459,12 +519,12 @@ pub fn uninstall(runner: &dyn Runner) -> Result<()> {
     Ok(())
 }
 
-pub fn doctor(runner: &dyn Runner) -> Result<()> {
-    let data = data_dir()?;
+pub fn doctor(runner: &dyn Runner, vendor: Vendor) -> Result<()> {
+    let data = data_dir(vendor)?;
     let Some(current) = record(&data)? else {
         println!(
             "{}",
-            json!({"installed": false, "timer": systemd::state(runner)})
+            json!({"installed": false, "timer": systemd::state_for(runner, vendor)})
         );
         return Ok(());
     };
@@ -484,9 +544,12 @@ pub fn doctor(runner: &dyn Runner) -> Result<()> {
         "{}",
         json!({
             "installed": true,
+            "runtime": vendor.runtime(),
+            "host_trust": "unknown",
+            "runtime_qualification": "unverified",
             "version": current.version,
             "registration": claude::registration_status(&current.plan, &outbox)?,
-            "timer": systemd::state(runner),
+            "timer": systemd::state_for(runner, vendor),
             "pending": pending,
             "delivered": delivered,
             "drops": drops::counts(&store, &outbox)?,

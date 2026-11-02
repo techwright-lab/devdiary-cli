@@ -1,5 +1,5 @@
 //! A user timer delivers the spool; the hook itself never performs HTTP.
-use crate::Result;
+use crate::{Result, vendor::Vendor};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -73,8 +73,12 @@ pub fn service(exe: &Path, connection: &Path) -> Result<String> {
 }
 // OnUnitActiveSec counts from the last run, so OnActiveSec starts the first one.
 pub fn timer() -> String {
+    timer_for(Vendor::Claude)
+}
+fn timer_for(vendor: Vendor) -> String {
+    let service = vendor.service();
     format!(
-        "[Unit]\nDescription=DevDiary collector sync every 2 minutes\n\n[Timer]\nOnActiveSec=30s\nOnUnitActiveSec=2min\nRandomizedDelaySec=30\nPersistent=true\nUnit={SERVICE}\n\n[Install]\nWantedBy=timers.target\n"
+        "[Unit]\nDescription=DevDiary collector sync every 2 minutes\n\n[Timer]\nOnActiveSec=30s\nOnUnitActiveSec=2min\nRandomizedDelaySec=30\nPersistent=true\nUnit={service}\n\n[Install]\nWantedBy=timers.target\n"
     )
 }
 
@@ -102,21 +106,33 @@ fn check(runner: &dyn Runner, args: &[&str]) -> Result<()> {
     Ok(())
 }
 pub fn enable(runner: &dyn Runner, dir: &Path, exe: &Path, connection: &Path) -> Result<()> {
+    enable_for(runner, dir, exe, connection, Vendor::Claude)
+}
+pub fn enable_for(
+    runner: &dyn Runner,
+    dir: &Path,
+    exe: &Path,
+    connection: &Path,
+    vendor: Vendor,
+) -> Result<()> {
     let service = service(exe, connection)?;
     fs::create_dir_all(dir)?;
-    write(dir, SERVICE, &service)?;
-    write(dir, TIMER, &timer())?;
+    write(dir, vendor.service(), &service)?;
+    write(dir, vendor.timer(), &timer_for(vendor))?;
     check(runner, &["daemon-reload"])?;
-    check(runner, &["enable", "--now", TIMER])
+    check(runner, &["enable", "--now", vendor.timer()])
 }
 /// Returns false when no timer unit was installed. The unit files go even when
 /// systemctl fails, so nothing restarts the timer at the next login.
 pub fn disable(runner: &dyn Runner, dir: &Path) -> Result<bool> {
-    if !dir.join(TIMER).exists() && !dir.join(SERVICE).exists() {
+    disable_for(runner, dir, Vendor::Claude)
+}
+pub fn disable_for(runner: &dyn Runner, dir: &Path, vendor: Vendor) -> Result<bool> {
+    if !dir.join(vendor.timer()).exists() && !dir.join(vendor.service()).exists() {
         return Ok(false);
     }
-    let stopped = check(runner, &["disable", "--now", TIMER]);
-    for name in [TIMER, SERVICE] {
+    let stopped = check(runner, &["disable", "--now", vendor.timer()]);
+    for name in [vendor.timer(), vendor.service()] {
         match fs::remove_file(dir.join(name)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
@@ -129,9 +145,12 @@ pub fn disable(runner: &dyn Runner, dir: &Path) -> Result<bool> {
     Ok(true)
 }
 pub fn state(runner: &dyn Runner) -> serde_json::Value {
+    state_for(runner, Vendor::Claude)
+}
+pub fn state_for(runner: &dyn Runner, vendor: Vendor) -> serde_json::Value {
     let ask = |verb: &str| {
         runner
-            .run(&[verb, TIMER])
+            .run(&[verb, vendor.timer()])
             .map(|(_, out)| out.trim().to_owned())
             .unwrap_or_else(|_| "unknown".into())
     };

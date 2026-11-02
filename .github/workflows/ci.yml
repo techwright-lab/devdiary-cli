@@ -55,6 +55,8 @@ jobs:
         run: PYTHONPATH=src python3 collector-rs/tests/conformance.py -v
       - name: Claude raw-hook fixtures and reversible setup (not stock runtime)
         run: PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
+      - name: Codex raw-hook fixtures (not stock runtime qualification)
+        run: python3 collector-rs/tests/codex_hook.py -v
       - name: Customer pairing transport and setup fixtures (not Rails or runtime)
         run: |
           python3 collector-rs/tests/pairing.py -v

@@ -13,6 +13,7 @@ pub mod pairing;
 pub mod reflog;
 pub mod store;
 pub mod systemd;
+pub mod vendor;
 use chrono::{DateTime, Datelike, Utc};
 use serde::de::{MapAccess, Visitor};
 use serde_json::{Map, Value, json};
@@ -109,7 +110,16 @@ pub fn scope(raw: &[u8]) -> Result<Object> {
     if raw.len() > MAX_WIRE {
         return Err("scope_too_large".into());
     }
-    let o = object(raw)?;
+    let mut o = object(raw)?;
+    let runtime = o.remove("runtime");
+    if let Some(runtime) = &runtime {
+        if !matches!(runtime.as_str(), Some("claude-code" | "codex")) {
+            return Err("invalid_scope".into());
+        }
+        let mut validated = scope(&serde_json::to_vec(&o)?)?;
+        validated.insert("runtime".into(), runtime.clone());
+        return Ok(validated);
+    }
     if o.contains_key("scope_kind") {
         return installation_scope(o);
     }
@@ -227,6 +237,12 @@ pub fn freeze(raw: &[u8], config: &Object) -> Result<Vec<u8>> {
     }
     let input = object(raw)?;
     let version = wire_version(config);
+    if config
+        .get("runtime")
+        .is_some_and(|r| input.get("runtime") != Some(r))
+    {
+        return Err("invalid_scope_or_identity".into());
+    }
     let repository_matches = if installation(config) {
         !input.contains_key("repository")
     } else {
