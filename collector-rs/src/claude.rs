@@ -1,4 +1,6 @@
-//! Consented Linux command hooks. Raw input is never persisted or logged.
+//! Consented Linux command hooks selected by immutable harness scope.
+//! The module name remains compatible with the original Claude control API.
+//! Raw input is never persisted or logged.
 //! Registration uses an atomic settings replacement and a private hash-only
 //! receipt binding the validated plan. Crashes leave all hooks or none installed.
 use crate::{
@@ -10,6 +12,7 @@ use crate::{
     reflog::{self, Appended},
     store::{Bracket, FINGERPRINT, SETTINGS_LOCK, Store, create_private, owner_writable, private},
     text, token,
+    vendor::Vendor,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -34,9 +37,6 @@ pub const EVENTS: [&str; 10] = [
     "SubagentStop",
     "SessionEnd",
 ];
-// Events a registration from an older version never held. A registration missing one
-// is still ours, or upgrade and uninstall would refuse to touch it.
-const ADDED_LATER: [&str; 1] = ["PermissionRequest"];
 const MAX_PLAN: usize = 65536;
 const DECLARED_RUN_ENV: &str = "DEVDIARY_RUN_REF";
 /// Sessions with this prefix exercise the installed hook end to end but are
@@ -164,9 +164,13 @@ fn trusted_executable(p: &Object, state: &Path) -> Result<()> {
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
+#[cfg(test)]
 fn entry(plan: &Path, exe: &str) -> Result<Value> {
+    entry_for(plan, exe, Vendor::Claude)
+}
+fn entry_for(plan: &Path, exe: &str, vendor: Vendor) -> Result<Value> {
     Ok(
-        json!({"hooks": [{"type": "command", "command": format!("{} claude-hook {} >/dev/null 2>&1 || :", quote(exe), quote(plan.to_str().ok_or("invalid_path")?)), "timeout": 2}]}),
+        json!({"hooks": [{"type": "command", "command": format!("{} {} {} >/dev/null 2>&1 || :", quote(exe), vendor.hook(), quote(plan.to_str().ok_or("invalid_path")?)), "timeout": 2}]}),
     )
 }
 fn lock(state: &Path, shared: bool) -> Result<File> {
@@ -246,7 +250,7 @@ fn settings(path: &Path) -> Result<(Vec<u8>, Object)> {
         return Err("invalid_hooks".into());
     }
     if let Some(hooks) = doc.get("hooks").and_then(Value::as_object) {
-        for event in EVENTS {
+        for event in EVENTS.iter().copied().chain(["Interrupt"]) {
             if hooks.get(event).is_some_and(|v| !v.is_array()) {
                 return Err("invalid_hooks".into());
             }
@@ -254,17 +258,26 @@ fn settings(path: &Path) -> Result<(Vec<u8>, Object)> {
     }
     Ok((raw, doc))
 }
-fn owned(doc: &Object, expected: &Value) -> Result<()> {
-    for event in EVENTS {
+fn vendor(p: &Object) -> Result<Vendor> {
+    Vendor::from_scope(
+        p.get("scope")
+            .and_then(Value::as_object)
+            .ok_or("invalid_scope")?,
+    )
+}
+fn owned_plan(doc: &Object, p: &Object) -> Result<()> {
+    let vendor = vendor(p)?;
+    let expected = &p["entry"];
+    for &event in vendor.events() {
         let hook = doc.get("hooks").and_then(|v| v.get(event));
-        if hook.is_none() && ADDED_LATER.contains(&event) {
+        if hook.is_none() && vendor.added_later().contains(&event) {
             continue;
         }
         let items = hook
             .and_then(Value::as_array)
             .ok_or("owned_entry_missing")?;
         let count = items.iter().filter(|e| *e == expected).count();
-        if count != 1 && !(count == 0 && ADDED_LATER.contains(&event)) {
+        if count != 1 && !(count == 0 && vendor.added_later().contains(&event)) {
             return Err("owned_entry_changed".into());
         }
     }
@@ -346,8 +359,13 @@ pub fn plan_for(state: &Path, settings_path: &Path, plan_path: &Path, exe: &Path
         }
     }
     let (current, digest) = executable(exe)?;
-    let expected = entry(plan_path, exe.to_str().ok_or("invalid_path")?)?;
-    let absent: Vec<_> = EVENTS
+    let vendor = Vendor::from_scope(&store.config)?;
+    if vendor == Vendor::Codex && settings_path.extension().is_some_and(|e| e == "toml") {
+        return Err("codex_hooks_json_required".into());
+    }
+    let expected = entry_for(plan_path, exe.to_str().ok_or("invalid_path")?, vendor)?;
+    let absent: Vec<_> = vendor
+        .events()
         .iter()
         .filter(|e| doc.get("hooks").and_then(|h| h.get(**e)).is_none())
         .collect();
@@ -375,7 +393,9 @@ fn refusal(raw: &[u8]) -> Result<()> {
         return Err("python_observer_registered".into());
     }
     // Do not stack registrations or silently take over another Rust adapter.
-    if String::from_utf8_lossy(raw).contains(" claude-hook ") {
+    if String::from_utf8_lossy(raw).contains(" claude-hook ")
+        || String::from_utf8_lossy(raw).contains(" codex-hook ")
+    {
         return Err("already_registered".into());
     }
     Ok(())
@@ -397,23 +417,33 @@ pub fn preflight(settings_path: &Path) -> Result<()> {
 pub fn preflight_replacing(plan_path: &Path) -> Result<()> {
     let p = load(plan_path)?;
     let (raw, doc) = settings(Path::new(text(&p, "settings")?)).map_err(preflight_code)?;
-    if owned(&doc, &p["entry"]).is_err() {
+    if owned_plan(&doc, &p).is_err() {
         return refusal(&raw);
     }
     refusal(&without(&p, &raw)?)
 }
 pub fn entries(plan_path: &Path) -> Result<Vec<String>> {
     let p = load(plan_path)?;
-    lines(&p["entry"])
+    lines(&p["entry"], vendor(&p)?)
 }
 pub fn entry_lines(plan_path: &Path, exe: &Path) -> Result<Vec<String>> {
-    lines(&entry(plan_path, exe.to_str().ok_or("invalid_path")?)?)
+    entry_lines_for(plan_path, exe, Vendor::Claude)
 }
-fn lines(entry: &Value) -> Result<Vec<String>> {
+pub fn entry_lines_for(plan_path: &Path, exe: &Path, vendor: Vendor) -> Result<Vec<String>> {
+    lines(
+        &entry_for(plan_path, exe.to_str().ok_or("invalid_path")?, vendor)?,
+        vendor,
+    )
+}
+fn lines(entry: &Value, vendor: Vendor) -> Result<Vec<String>> {
     let command = entry["hooks"][0]["command"]
         .as_str()
         .ok_or("invalid_entry")?;
-    Ok(EVENTS.iter().map(|e| format!("{e}: {command}")).collect())
+    Ok(vendor
+        .events()
+        .iter()
+        .map(|e| format!("{e}: {command}"))
+        .collect())
 }
 fn load(plan_path: &Path) -> Result<Object> {
     let raw = read(plan_path)?;
@@ -475,38 +505,48 @@ fn load(plan_path: &Path) -> Result<Object> {
     if crate::scope(&serde_json::to_vec(scope)?)? != *scope {
         return Err("invalid_scope".into());
     }
-    if p.get("entry") != Some(&entry(plan_path, text(&p, "executable")?)?) {
+    if p.get("entry") != Some(&entry_for(plan_path, text(&p, "executable")?, vendor(&p)?)?) {
         return Err("invalid_entry".into());
     }
     let absent = p["absent_events"].as_array().ok_or("invalid_plan")?;
     let mut seen = std::collections::HashSet::new();
     for event in absent {
         let event = event.as_str().ok_or("invalid_plan")?;
-        if !EVENTS.contains(&event) || !seen.insert(event) {
+        if !vendor(&p)?.events().contains(&event) || !seen.insert(event) {
             return Err("invalid_plan".into());
         }
     }
     let absent_hooks = p["absent_hooks"].as_bool().ok_or("invalid_plan")?;
-    if absent_hooks && ![EVENTS.len(), EVENTS.len() - ADDED_LATER.len()].contains(&absent.len()) {
+    if absent_hooks
+        && ![
+            vendor(&p)?.events().len(),
+            vendor(&p)?.events().len() - vendor(&p)?.added_later().len(),
+        ]
+        .contains(&absent.len())
+    {
         return Err("invalid_plan".into());
     }
     Ok(p)
 }
 
-fn original(events: Vec<&str>) -> Vec<&str> {
+fn original(events: Vec<&str>, vendor: Vendor) -> Vec<&str> {
     events
         .into_iter()
-        .filter(|e| !ADDED_LATER.contains(e))
+        .filter(|e| !vendor.added_later().contains(e))
         .collect()
 }
 fn original_presence(p: &Object, doc: &Object) -> Result<()> {
     let planned = p["absent_events"].as_array().ok_or("invalid_plan")?;
-    let absent: Vec<_> = EVENTS
+    let absent: Vec<_> = vendor(p)?
+        .events()
         .iter()
         .copied()
         .filter(|e| doc.get("hooks").and_then(|h| h.get(*e)).is_none())
         .collect();
-    if original(planned.iter().filter_map(Value::as_str).collect()) != original(absent)
+    if original(
+        planned.iter().filter_map(Value::as_str).collect(),
+        vendor(p)?,
+    ) != original(absent, vendor(p)?)
         || p["absent_hooks"] != json!(!doc.contains_key("hooks"))
     {
         return Err("invalid_original_presence".into());
@@ -591,7 +631,7 @@ pub fn apply(plan_path: &Path) -> Result<()> {
     let path = Path::new(text(&p, "settings")?);
     let _lock = lock(Path::new(text(&p, "state")?), false)?;
     let (raw, doc) = settings(path)?;
-    if owned(&doc, &p["entry"]).is_ok() {
+    if owned_plan(&doc, &p).is_ok() {
         let mut m = manifest(plan_path, &p)?;
         if !["prepared", "installed"].contains(&text(&m, "status")?) {
             return Err("registration_not_active".into());
@@ -620,7 +660,7 @@ pub fn apply(plan_path: &Path) -> Result<()> {
     }))?)?;
     let mut ordered = ordered::parse(&raw)?;
     let hooks = ordered.entry("hooks", Json::Object(vec![]))?;
-    for event in EVENTS {
+    for &event in vendor(&p)?.events() {
         match hooks.entry(event, Json::Array(vec![]))? {
             Json::Array(items) => items.push(Json::from_value(&p["entry"])),
             _ => return Err("invalid_hooks".into()),
@@ -647,7 +687,7 @@ pub fn registration_status(plan_path: &Path, state: &Path) -> Result<Object> {
     let status = if manifest_path(plan_path).exists() {
         let m = manifest(plan_path, &p)?;
         let status = text(&m, "status")?;
-        if status == "installed" && owned(&doc, &p["entry"]).is_err() {
+        if status == "installed" && owned_plan(&doc, &p).is_err() {
             "changed".to_owned()
         } else {
             status.to_owned()
@@ -657,8 +697,8 @@ pub fn registration_status(plan_path: &Path, state: &Path) -> Result<Object> {
     };
     object(&serde_json::to_vec(&json!({
         "registration": status,
-        "target_settings_block": doc.get("disableAllHooks") == Some(&json!(true))
-            || doc.get("allowManagedHooksOnly") == Some(&json!(true))
+        "target_settings_block": vendor(&p)? == Vendor::Claude && (doc.get("disableAllHooks") == Some(&json!(true))
+            || doc.get("allowManagedHooksOnly") == Some(&json!(true)))
     }))?)
 }
 pub fn remove(plan_path: &Path) -> Result<()> {
@@ -692,7 +732,7 @@ pub fn remove(plan_path: &Path) -> Result<()> {
         return Err("invalid_registration".into());
     }
     // Removal must remain possible after executable upgrades or spool failure.
-    owned(&doc, &p["entry"])?;
+    owned_plan(&doc, &p)?;
     let bytes = without(&p, &raw)?;
     m.insert("status".into(), json!("removing"));
     m.insert("removed_sha256".into(), json!(hash(&bytes)));
@@ -711,9 +751,9 @@ fn without(p: &Object, raw: &[u8]) -> Result<Vec<u8>> {
         .ok_or("invalid_plan")?;
     let mut ordered = ordered::parse(raw)?;
     let hooks = ordered.get_mut("hooks").ok_or("invalid_hooks")?;
-    for event in EVENTS {
+    for &event in vendor(p)?.events() {
         let Some(Json::Array(items)) = hooks.get_mut(event) else {
-            if ADDED_LATER.contains(&event) {
+            if vendor(p)?.added_later().contains(&event) {
                 continue;
             }
             return Err("invalid_hooks".into());
@@ -729,11 +769,12 @@ fn without(p: &Object, raw: &[u8]) -> Result<Vec<u8>> {
     ordered::render(&ordered, raw)
 }
 
-const HOOK_FIELDS: [&str; 11] = [
+const HOOK_FIELDS: [&str; 12] = [
     "hook_event_name",
     "session_id",
     "cwd",
     "prompt_id",
+    "turn_id",
     "tool_use_id",
     "agent_id",
     "agent_type",
@@ -742,7 +783,7 @@ const HOOK_FIELDS: [&str; 11] = [
     "reason",
     "tool_name",
 ];
-fn fields(raw: &[u8]) -> Result<Object> {
+fn fields(raw: &[u8], vendor: Vendor) -> Result<Object> {
     struct Known;
     impl<'de> serde::de::Visitor<'de> for Known {
         type Value = Object;
@@ -775,7 +816,7 @@ fn fields(raw: &[u8]) -> Result<Object> {
     let data = serde::Deserializer::deserialize_map(&mut de, Known)?;
     de.end()?;
     let event = text(&data, "hook_event_name")?;
-    if !EVENTS.contains(&event) || !token(text(&data, "session_id")?) {
+    if !vendor.events().contains(&event) || !token(text(&data, "session_id")?) {
         return Err("invalid_event".into());
     }
     Ok(data)
@@ -874,8 +915,9 @@ fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Op
     if cwd.len() > 4096 || !Path::new(cwd).is_absolute() {
         return Err("invalid_cwd".into());
     }
+    let vendor = Vendor::from_scope(config)?;
     let (mut out, gitdir) = scoped_row(Path::new(cwd), config, state)?;
-    for (key, value) in json!({"installation_id": config["installation_id"], "runtime": "claude-code", "session_id": session, "event": event, "actor_ref": null, "attribution_basis": "unknown", "observed_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()}).as_object().ok_or("invalid_metadata")? {
+    for (key, value) in json!({"installation_id": config["installation_id"], "runtime": vendor.runtime(), "session_id": session, "event": event, "actor_ref": null, "attribution_basis": "unknown", "observed_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()}).as_object().ok_or("invalid_metadata")? {
         out.insert(key.clone(), value.clone());
     }
     if let Some(label) = data
@@ -884,7 +926,12 @@ fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Op
     {
         out.insert("agent_type".into(), label.clone());
     }
-    for key in ["prompt_id", "tool_use_id", "agent_id"] {
+    let turn_key = if vendor == Vendor::Codex {
+        "turn_id"
+    } else {
+        "prompt_id"
+    };
+    for key in [turn_key, "tool_use_id", "agent_id"] {
         if let Some(value) = data.get(key) {
             if !value.as_str().is_some_and(token) {
                 return Err(format!("invalid_{key}").into());
@@ -911,7 +958,8 @@ fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Op
     {
         out.insert("reason".into(), data["reason"].clone());
     }
-    if ["PreToolUse", "PostToolUse", "PostToolUseFailure"].contains(&event)
+    if (["PreToolUse", "PostToolUse", "PostToolUseFailure"].contains(&event)
+        || (vendor == Vendor::Codex && event == "PermissionRequest"))
         && data
             .get("tool_name")
             .and_then(Value::as_str)
@@ -920,9 +968,13 @@ fn normalize(data: &Object, config: &Object, state: &Path) -> Result<(Object, Op
         out.insert("tool_name".into(), data["tool_name"].clone());
     }
     let identity = match event {
-        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => out.get("tool_use_id"),
-        "UserPromptSubmit" | "Stop" => out.get("prompt_id"),
-        "SubagentStart" | "SubagentStop" => out.get("agent_id"),
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => out.get("tool_use_id").cloned(),
+        "UserPromptSubmit" | "Stop" | "Interrupt" => out.get(turn_key).cloned(),
+        "SubagentStart" | "SubagentStop" if vendor == Vendor::Codex => out
+            .get("agent_id")
+            .zip(out.get("turn_id"))
+            .map(|(agent, turn)| json!([agent, turn])),
+        "SubagentStart" | "SubagentStop" => out.get("agent_id").cloned(),
         _ => None,
     };
     let id = if let Some(identity) = identity {
@@ -1058,8 +1110,14 @@ fn drop_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
 /// Cheap checks run first so out-of-scope events never hash the executable,
 /// parse settings or open SQLite. Every refusal after the plan loads is counted.
 pub fn hook(plan_path: &Path, raw: Result<Vec<u8>>) -> Result<()> {
-    let data = raw.and_then(|raw| fields(&raw));
+    hook_for(plan_path, raw, Vendor::Claude)
+}
+pub fn hook_for(plan_path: &Path, raw: Result<Vec<u8>>, selected: Vendor) -> Result<()> {
     let p = load(plan_path)?;
+    if vendor(&p)? != selected {
+        return Err("scope_changed".into());
+    }
+    let data = raw.and_then(|raw| fields(&raw, selected));
     let state = Path::new(text(&p, "state")?);
     let data = data.inspect_err(|error| drops::note(state, input_reason(error.as_ref())))?;
     let outcome = capture(plan_path, &p, state, &data);
@@ -1094,7 +1152,7 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
     let _lock = lock(state, true)?;
     active(plan_path, p)?;
     let (_, doc) = settings(Path::new(text(p, "settings")?))?;
-    owned(&doc, &p["entry"])?;
+    owned_plan(&doc, p)?;
     let mut store = Store::open(state, None)?;
     if *scope != store.config {
         return Err("scope_changed".into());
@@ -1110,7 +1168,7 @@ fn capture(plan_path: &Path, p: &Object, state: &Path, data: &Object) -> Result<
     if let Some(gitdir) = gitdir {
         bracket(&store, state, &mut row, &gitdir)?;
     }
-    if ["UserPromptSubmit", "Stop", "SessionEnd"].contains(&text(&row, "event")?) {
+    if ["UserPromptSubmit", "Stop", "SessionEnd", "Interrupt"].contains(&text(&row, "event")?) {
         store.release_brackets(text(&row, "session_id")?, nanos_now()?)?;
     }
     // A racing duplicate has the same UUID but a new observation timestamp.
@@ -1203,9 +1261,9 @@ mod recovery_tests {
                 assert_eq!(m["status"], expected_status);
                 let (_, doc) = settings(&settings_path).unwrap();
                 if ["applied_settings", "removing"].contains(&stage) {
-                    owned(&doc, &p["entry"]).unwrap();
+                    owned_plan(&doc, &p).unwrap();
                 } else {
-                    assert!(owned(&doc, &p["entry"]).is_err());
+                    assert!(owned_plan(&doc, &p).is_err());
                 }
                 if ["removing", "removed_settings", "removed"].contains(&stage) {
                     // An inactive registration blocks capture before any store work.

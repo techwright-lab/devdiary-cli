@@ -14,7 +14,9 @@ const REPORTED: [&str; 5] = [
     "stale_plan",
     "repair_required",
 ];
-const INSTALL_REPORTED: [&str; 19] = [
+const INSTALL_REPORTED: [&str; 21] = [
+    "unsupported_vendor",
+    "codex_hooks_json_required",
     "approval_required",
     "offered_list_unreadable",
     "connection_revoked",
@@ -37,6 +39,8 @@ const INSTALL_REPORTED: [&str; 19] = [
 ];
 fn install_hint(code: &str) -> &'static str {
     match code {
+        "unsupported_vendor" => "Use --vendor claude or --vendor codex.",
+        "codex_hooks_json_required" => "Use a Codex hooks.json file, not config.toml.",
         "approval_required" => {
             "Approving orchestrator names needs a person at a terminal. No flag replaces this. Run this command in a terminal."
         }
@@ -51,18 +55,18 @@ fn install_hint(code: &str) -> &'static str {
             "Settings changed after the plan was made and were left as they are. Run install again."
         }
         "invalid_settings" => {
-            "The Claude settings file is not valid JSON. Fix it, then run install again."
+            "The selected harness settings file is not valid JSON. Fix it, then run install again."
         }
         "already_installed" => "Already installed. Use upgrade to re-register, or uninstall.",
         "not_installed" => "Not installed. Use install.",
         "settings_missing" => {
-            "No Claude settings file at that path. Start Claude Code once, or pass --settings with an absolute path, then run install again."
+            "No settings file at that path. Start the harness once, or pass --settings with an absolute path, then run install again."
         }
         "timer_unavailable" => {
             "Hooks are registered but systemctl --user could not enable the timer. Run doctor."
         }
         "timer_unconfirmed" => {
-            "Hooks and timer unit files are removed, but systemctl --user could not confirm the timer stopped. In a user session run: systemctl --user disable --now devdiary-collector-sync.timer"
+            "Hooks and timer unit files are removed, but systemctl --user could not confirm the timer stopped. In a user session disable the selected harness timer: devdiary-collector-sync.timer for Claude or devdiary-collector-codex-sync.timer for Codex"
         }
         "unsupported_path" => {
             "Use an absolute path without the characters \" \\ % or $, which systemd would reinterpret."
@@ -83,8 +87,12 @@ fn install_hint(code: &str) -> &'static str {
         _ => "",
     }
 }
-fn install_options(args: &[String]) -> Result<install::Options<'_>> {
+fn install_options(
+    args: &[String],
+    vendor: devdiary_collector::vendor::Vendor,
+) -> Result<install::Options<'_>> {
     let mut o = install::Options {
+        vendor,
         origin: None,
         trust_origin: false,
         settings: None,
@@ -122,23 +130,36 @@ fn install_options(args: &[String]) -> Result<install::Options<'_>> {
     Ok(o)
 }
 fn lifecycle(args: &[String]) -> Result<Option<i32>> {
-    let rest = &args[2.min(args.len())..];
-    match args.get(1).map(String::as_str) {
-        Some("install") => install::install(install_options(rest)?, &Systemctl)?,
-        Some("upgrade") if rest.is_empty() || rest == ["--yes"] => {
-            install::upgrade(!rest.is_empty(), &Systemctl)?
+    let mut rest = args[2.min(args.len())..].to_vec();
+    let mut vendor = devdiary_collector::vendor::Vendor::Claude;
+    if let Some(index) = rest.iter().position(|a| a == "--vendor") {
+        vendor = devdiary_collector::vendor::Vendor::parse(
+            rest.get(index + 1).ok_or("invalid_command")?,
+        )?;
+        rest.drain(index..index + 2);
+        if rest.iter().any(|a| a == "--vendor") {
+            return Err("invalid_command".into());
         }
-        Some("uninstall") if rest.is_empty() => install::uninstall(&Systemctl)?,
-        Some("doctor") if rest.is_empty() => install::doctor(&Systemctl)?,
+    }
+    let rest = rest.as_slice();
+    match args.get(1).map(String::as_str) {
+        Some("install") => install::install(install_options(rest, vendor)?, &Systemctl)?,
+        Some("upgrade") if rest.is_empty() || rest == ["--yes"] => {
+            install::upgrade(!rest.is_empty(), &Systemctl, vendor)?
+        }
+        Some("uninstall") if rest.is_empty() => install::uninstall(&Systemctl, vendor)?,
+        Some("doctor") if rest.is_empty() => install::doctor(&Systemctl, vendor)?,
         Some("timer-sync") if rest.len() == 1 => install::timer_sync(Path::new(&rest[0]))?,
         Some("outside-repos") => match rest {
-            [choice] if choice == "on" => install::outside_repos(true)?,
-            [choice] if choice == "off" => install::outside_repos(false)?,
+            [choice] if choice == "on" => install::outside_repos(true, vendor)?,
+            [choice] if choice == "off" => install::outside_repos(false, vendor)?,
             _ => return Err("invalid_command".into()),
         },
         Some("orchestrators") if rest.first().is_some_and(|c| c == "approve") => match &rest[1..] {
-            [] => install::approve_orchestrators(None)?,
-            [dir] if dir.starts_with('/') => install::approve_orchestrators(Some(Path::new(dir)))?,
+            [] => install::approve_orchestrators(None, vendor)?,
+            [dir] if dir.starts_with('/') => {
+                install::approve_orchestrators(Some(Path::new(dir)), vendor)?
+            }
             _ => return Err("invalid_command".into()),
         },
         _ => return Ok(None),
@@ -183,6 +204,7 @@ fn run() -> Result<i32> {
     if args.get(1).is_some_and(|s| s == "setup") && args.len() >= 3 {
         let repository = args.get(3).filter(|a| !a.starts_with("--"));
         let mut options = devdiary_collector::pairing::Options {
+            vendor: Default::default(),
             root: Path::new(&args[2]),
             repository: repository.map(Path::new),
             remote: None,
@@ -200,6 +222,12 @@ fn run() -> Result<i32> {
                 return Err("invalid_command".into());
             }
             match args[i].as_str() {
+                "--vendor" => {
+                    i += 1;
+                    options.vendor = devdiary_collector::vendor::Vendor::parse(
+                        args.get(i).ok_or("invalid_command")?,
+                    )?;
+                }
                 "--remote" => {
                     i += 1;
                     options.remote = Some(args.get(i).ok_or("invalid_command")?);
@@ -242,13 +270,16 @@ fn run() -> Result<i32> {
     }
     if args.len() == 2 && args[1] == "--help" {
         println!(
-            "install [--origin ORIGIN --trust-origin] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--record-outside-repos] [--yes] [--no-browser] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the 9 hook entries, then enables a systemd user timer that syncs every 2 minutes.\n  --yes never approves orchestrator names.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)\noutside-repos on|off\n  Also records your sessions outside git repositories: event, time and tool name, never a path. Temp folders stay out.\norchestrators approve [CONNECTION_DIR]\n  Shows the environment names the server offers and asks. Needs a terminal."
+            "Harness selector: --vendor claude|codex on install, setup, upgrade, doctor, uninstall, outside-repos and orchestrators approve. Claude is the default. Codex hooks must be reviewed in /hooks; runtime qualification is unverified."
+        );
+        println!(
+            "install [--origin ORIGIN --trust-origin] [--settings SETTINGS] [--record-orchestrated-outside-repos] [--record-outside-repos] [--yes] [--no-browser] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/collector/VERSION, asks before appending the selected harness hook entries, then enables a systemd user timer that syncs every 2 minutes.\n  --yes never approves orchestrator names.\ndoctor\nupgrade [--yes]\nuninstall\ntimer-sync CONNECTION_DIR (run by the timer: up to 10 batches of 100)\noutside-repos on|off\n  Also records your sessions outside git repositories: event, time and tool name, never a path. Temp folders stay out.\norchestrators approve [CONNECTION_DIR]\n  Shows the environment names the server offers and asks. Needs a terminal."
         );
         println!(
             "setup PRIVATE_CONNECTION_DIR [REPOSITORY [--remote NAME]] [--record-orchestrated-outside-repos] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\n  Without REPOSITORY the connection covers every active repository of the workspace (installation scope).\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
         );
         println!(
-            "Experimental Linux collector; Claude adapter runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nrepair STATE (migrates an older spool; pending rows keep their bytes)\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
+            "Experimental Linux collector; harness adapters runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nrepair STATE (migrates an older spool; pending rows keep their bytes)\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nhook-apply PLAN --consent (either harness)\nhook-remove PLAN --consent (either harness)\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
         );
         return Ok(0);
     }
@@ -261,8 +292,10 @@ fn run() -> Result<i32> {
             )?;
             return Ok(0);
         }
-        Some("claude-apply" | "claude-remove") if args.len() == 4 && args[3] == "--consent" => {
-            if args[1] == "claude-apply" {
+        Some("claude-apply" | "claude-remove" | "hook-apply" | "hook-remove")
+            if args.len() == 4 && args[3] == "--consent" =>
+        {
+            if args[1] == "claude-apply" || args[1] == "hook-apply" {
                 devdiary_collector::claude::apply(Path::new(&args[2]))?;
             } else {
                 devdiary_collector::claude::remove(Path::new(&args[2]))?;
@@ -318,7 +351,7 @@ fn main() {
     // Dispatch before fallible UTF-8 argument parsing or control diagnostics.
     if std::env::args_os()
         .nth(1)
-        .is_some_and(|a| a == "claude-hook")
+        .is_some_and(|a| a == "claude-hook" || a == "codex-hook")
     {
         std::panic::set_hook(Box::new(|_| {}));
         // Whole-process deadline includes blocked stdin, filesystem and SQLite.
@@ -337,7 +370,15 @@ fn main() {
             if args.len() != 3 {
                 return Ok(());
             }
-            devdiary_collector::claude::hook(Path::new(&args[2]), input(MAX_HOOK_INPUT))
+            devdiary_collector::claude::hook_for(
+                Path::new(&args[2]),
+                input(MAX_HOOK_INPUT),
+                if args[1] == "codex-hook" {
+                    devdiary_collector::vendor::Vendor::Codex
+                } else {
+                    devdiary_collector::vendor::Vendor::Claude
+                },
+            )
         });
         std::process::exit(0);
     }

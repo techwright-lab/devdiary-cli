@@ -221,7 +221,8 @@ fn connection(root: &Path) -> Result<Object> {
     } else {
         &["installation_id", "repository", "repository_ref"]
     };
-    if frozen.iter().any(|key| config.get(*key) != saved.get(*key))
+    if crate::vendor::Vendor::from_scope(&config)? != crate::vendor::Vendor::from_scope(&saved)?
+        || frozen.iter().any(|key| config.get(*key) != saved.get(*key))
         || (installation && config["record_orchestrated_outside_repos"] != outside(&saved, &config))
     {
         return Err("frozen_scope_conflict".into());
@@ -251,6 +252,7 @@ fn initialize(root: &Path, doc: &Object) -> Result<()> {
 }
 
 pub struct Options<'a> {
+    pub vendor: crate::vendor::Vendor,
     pub root: &'a Path,
     pub repository: Option<&'a Path>,
     pub remote: Option<&'a str>,
@@ -293,12 +295,12 @@ impl Target {
     fn matches(&self, saved: &Object, origin: &str) -> bool {
         let same = match self {
             Self::Repository { path, reference } => {
-                saved.len() == 5
+                saved.len() == 5 + usize::from(saved.contains_key("runtime"))
                     && saved["repository"] == *path
                     && saved["repository_ref"] == *reference
             }
             Self::Installation { record_outside } => {
-                saved.len() == 4
+                saved.len() == 4 + usize::from(saved.contains_key("runtime"))
                     && saved.get("scope_kind") == Some(&json!("installation"))
                     && saved.get("record_orchestrated_outside_repos")
                         == Some(&json!(record_outside))
@@ -306,9 +308,12 @@ impl Target {
         };
         same && saved.get("origin") == Some(&json!(origin))
     }
-    fn start(&self, installation_id: &serde_json::Value) -> serde_json::Value {
-        let mut body =
-            json!({"schema_version":1,"installation_id":installation_id,"runtime":"claude-code"});
+    fn start(
+        &self,
+        installation_id: &serde_json::Value,
+        vendor: crate::vendor::Vendor,
+    ) -> serde_json::Value {
+        let mut body = json!({"schema_version":1,"installation_id":installation_id,"runtime":vendor.runtime()});
         if let Self::Installation { .. } = self {
             body["scope_kind"] = json!("installation");
         }
@@ -327,6 +332,7 @@ impl Target {
         c: &Object,
         installation: &Object,
         origin: &str,
+        vendor: crate::vendor::Vendor,
     ) -> Result<serde_json::Value> {
         let keys = match self {
             Self::Repository { .. } => 6,
@@ -334,7 +340,7 @@ impl Target {
         };
         if c.len() != keys
             || c.get("installation_id") != installation.get("installation_id")
-            || c.get("runtime") != Some(&json!("claude-code"))
+            || c.get("runtime") != Some(&json!(vendor.runtime()))
             || c.get("endpoint_path") != Some(&json!("/ingest/v1/observations"))
             || !secret(text(c, "token")?, "dc_live_")
             || !text(c, "collector_ref")?
@@ -344,7 +350,10 @@ impl Target {
             return Err("approved_scope_mismatch".into());
         }
         let endpoint = format!("{origin}/ingest/v1/observations");
-        let common = json!({"endpoint":endpoint,"collector_ref":c["collector_ref"],"installation_id":installation["installation_id"]});
+        let mut common = json!({"endpoint":endpoint,"collector_ref":c["collector_ref"],"installation_id":installation["installation_id"]});
+        if vendor == crate::vendor::Vendor::Codex {
+            common["runtime"] = json!(vendor.runtime());
+        }
         let (config, refs) = match self {
             Self::Repository { path, reference } => {
                 if c.get("repository_ref") != Some(&json!(reference)) {
@@ -404,13 +413,15 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         if fs::read_dir(o.root)?.count() != 1 {
             return Err("new_private_directory_required".into());
         }
-        save_new(
-            &installation_path,
-            &serde_json::to_vec(&target.installation_record(&origin, o.remote))?,
-        )?;
+        let mut saved = target.installation_record(&origin, o.remote);
+        if o.vendor == crate::vendor::Vendor::Codex {
+            saved["runtime"] = json!(o.vendor.runtime());
+        }
+        save_new(&installation_path, &serde_json::to_vec(&saved)?)?;
     }
     let installation = object(&read(&installation_path)?)?;
-    if !target.matches(&installation, &origin)
+    if crate::vendor::Vendor::from_scope(&installation)? != o.vendor
+        || !target.matches(&installation, &origin)
         || !crate::uuid(text(&installation, "installation_id")?)
     {
         return Err("frozen_scope_conflict".into());
@@ -453,7 +464,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         .post(format!("{origin}{START}"))
         .header("Content-Type", "application/json")
         .body(serde_json::to_vec(
-            &target.start(&installation["installation_id"]),
+            &target.start(&installation["installation_id"], o.vendor),
         )?)
         .send()?;
     if r.status().as_u16() == 429 {
@@ -556,7 +567,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
             .get("connection")
             .and_then(|v| v.as_object())
             .ok_or("repair_new_pair")?;
-        let saved = target.approved(c, &installation, &origin)?;
+        let saved = target.approved(c, &installation, &origin, o.vendor)?;
         save_new(
             &o.root.join("connection.json"),
             &serde_json::to_vec(&saved)?,
@@ -569,7 +580,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
             return Ok(());
         }
         println!(
-            "Connection saved privately. Hooks remain unchanged. Next: setup-plan CONNECTION_DIR SETTINGS NEW_PLAN, review the plan, then claude-apply NEW_PLAN --consent. If a control plane starts agents here, after the first connection-sync run orchestrators approve CONNECTION_DIR in a terminal. Host trust and managed policy remain controlled by Claude; runtime coverage is unverified."
+            "Connection saved privately. Hooks remain unchanged. Next: setup-plan CONNECTION_DIR SETTINGS NEW_PLAN, review the plan, then hook-apply NEW_PLAN --consent. If a control plane starts agents here, after the first connection-sync run orchestrators approve CONNECTION_DIR in a terminal. Host trust and managed policy remain controlled by the harness; review Codex definitions in /hooks. Runtime coverage is unverified."
         );
         return Ok(());
     }
@@ -585,7 +596,7 @@ pub(crate) fn revoked(state: &Path) -> bool {
 pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
     plan_with(root, settings, plan, &std::env::current_exe()?)?;
     println!(
-        "Plan saved, settings unchanged. Metadata-only Claude lifecycle/tool IDs; no prompts, transcripts or tool contents; unknown actor. Review NEW_PLAN before claude-apply NEW_PLAN --consent. Browser approval is not local hook consent or host trust. Managed policy may block hooks; no policy-absence claim is made."
+        "Plan saved, settings unchanged. Metadata-only harness lifecycle/tool IDs; no prompts, transcripts or tool contents; unknown actor. Review NEW_PLAN before hook-apply NEW_PLAN --consent. Browser approval is not local hook consent or host trust. Managed policy may block hooks; no policy-absence claim is made."
     );
     Ok(())
 }

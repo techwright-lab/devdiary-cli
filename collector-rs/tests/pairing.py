@@ -34,6 +34,7 @@ class PairingTest(unittest.TestCase):
         )
         self.calls = []
         self.mode = "ok"
+        self.runtime = "claude-code"
         self.installation = ""
         owner = self
 
@@ -88,7 +89,7 @@ class PairingTest(unittest.TestCase):
                             "collector_ref": "urn:devdiary:collector:11111111-1111-4111-8111-111111111111",
                             "token": "dc_live_" + "s" * 43,
                             "installation_id": owner.installation,
-                            "runtime": "claude-code",
+                            "runtime": owner.runtime,
                             "repository_ref": "https://github.com/acme/"
                             + ("other" if owner.mode == "mismatch" else "demo"),
                             "endpoint_path": "/ingest/v1/observations",
@@ -172,6 +173,31 @@ class PairingTest(unittest.TestCase):
         self.assertNotIn(b"dc_live_", p.stdout + p.stderr)
         return p
 
+    def test_codex_connection_is_bound_to_its_requested_harness(self):
+        self.runtime = "codex"
+        result = self.run_setup("--vendor", "codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls[0][1]["runtime"], "codex")
+        path = self.root / "connection/connection.json"
+        saved = path.read_bytes()
+        self.assertEqual(json.loads(saved)["scope"]["runtime"], "codex")
+        self.assertEqual(self.run_setup("--vendor", "codex").returncode, 0)
+        self.assertEqual(self.run_setup().returncode, 2)
+        self.assertEqual(path.read_bytes(), saved)
+
+    def test_invalid_saved_harness_is_not_treated_as_legacy_claude(self):
+        self.assertEqual(self.run_setup().returncode, 0)
+        saved = self.root / "connection/installation.json"
+        doc = json.loads(saved.read_bytes())
+        doc["runtime"] = None
+        saved.write_text(json.dumps(doc))
+        self.assertEqual(self.run_setup().returncode, 2)
+
+    def test_codex_setup_refuses_a_claude_exchange_response(self):
+        result = self.run_setup("--vendor", "codex")
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((self.root / "connection/connection.json").exists())
+
     def test_pair_and_pin_without_hooks(self):
         p = self.run_setup()
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -217,6 +243,7 @@ class PairingTest(unittest.TestCase):
         self.assertEqual(len(self.calls), count)
         installation = self.installation
         self.mode = "ok"
+        self.runtime = "claude-code"
         self.assertEqual(self.run_setup("--new-pair").returncode, 0)
         self.assertEqual(self.installation, installation)
 
@@ -237,6 +264,7 @@ class PairingTest(unittest.TestCase):
         self.mode = "start-rate"
         self.assertNotEqual(self.run_setup().returncode, 0)
         self.mode = "ok"
+        self.runtime = "claude-code"
         self.assertNotEqual(self.run_setup("--new-pair").returncode, 0)
         self.assertEqual(len(self.calls), 1)
 
@@ -322,7 +350,7 @@ class PairingTest(unittest.TestCase):
             "observation_id": "22222222-2222-4222-8222-222222222222",
             "installation_id": data["scope"]["installation_id"],
             "repository": str(self.repo),
-            "runtime": "claude-code",
+            "runtime": self.runtime,
             "session_id": "fixture",
             "event": "SessionStart",
             "observed_at": time.time(),

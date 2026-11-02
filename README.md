@@ -209,6 +209,16 @@ qualification. The stricter qualification harness below remains blocked, unchang
 
 ## One-command install (Linux, systemd user timer)
 
+The Rust candidate also accepts `--vendor codex` on `install`, `setup`, `doctor`,
+`upgrade`, `uninstall`, `outside-repos` and `orchestrators approve`. Claude remains
+the default. Codex uses its active `CODEX_HOME/hooks.json` (otherwise
+`~/.codex/hooks.json`), a separate connection/spool under `collector/codex`, and a
+separate `devdiary-collector-codex-sync.timer`. Review changed definitions in
+Codex's ordinary `/hooks` screen after install or upgrade. Registration and
+fixture success do not qualify stock lifecycle coverage or counted minutes.
+C1 acceptance and current evidence live in the canonical vault plan:
+`_vault/products/devdiary/docs/harness-plan.md` in the TechWright workspace.
+
 `install` runs the browser pairing, plan, consent and apply steps above in one
 command for an installation-scope connection, then delivers the spool from a
 systemd user timer. The hook contract does not change: it stays silent, exits 0
