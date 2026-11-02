@@ -422,6 +422,83 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.data / "install.json").exists())
         self.assertIn(b"Not installed", self.run_collector("uninstall").stdout)
 
+    def older_registration(self, event="PermissionRequest"):
+        doc = json.loads(self.settings.read_bytes())
+        del doc["hooks"][event]
+        self.settings.write_text(json.dumps(doc))
+
+    def test_upgrade_takes_over_a_registration_without_a_newer_hook(self):
+        self.install("--yes")
+        self.older_registration()
+        self.assertEqual(
+            json.loads(self.run_collector("doctor").stdout)["registration"][
+                "registration"
+            ],
+            "installed",
+        )
+        self.run_collector("upgrade", "--yes")
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
+        self.run_collector("uninstall")
+        self.assertEqual(
+            json.loads(self.settings.read_bytes()), json.loads(self.original)
+        )
+
+    def test_foreign_newer_hook_survives_upgrade_and_uninstall(self):
+        self.install("--yes")
+        doc = json.loads(self.settings.read_bytes())
+        foreign = {"hooks": [{"type": "command", "command": "customer permission"}]}
+        doc["hooks"]["PermissionRequest"] = [foreign]
+        self.settings.write_text(json.dumps(doc))
+        self.assertEqual(
+            json.loads(self.run_collector("doctor").stdout)["registration"][
+                "registration"
+            ],
+            "installed",
+        )
+        self.run_collector("upgrade", "--yes")
+        self.assertEqual(
+            sum(e != foreign for v in self.owned_entries().values() for e in v),
+            len(EVENTS),
+        )
+        self.assertIn(
+            foreign,
+            json.loads(self.settings.read_bytes())["hooks"]["PermissionRequest"],
+        )
+        self.run_collector("uninstall")
+        expected = json.loads(self.original)
+        expected["hooks"]["PermissionRequest"] = [foreign]
+        self.assertEqual(json.loads(self.settings.read_bytes()), expected)
+
+    def test_uninstall_keeps_a_foreign_newer_hook_without_upgrade(self):
+        self.install("--yes")
+        doc = json.loads(self.settings.read_bytes())
+        foreign = {"hooks": [{"type": "command", "command": "customer permission"}]}
+        doc["hooks"]["PermissionRequest"] = [foreign]
+        self.settings.write_text(json.dumps(doc))
+        self.run_collector("uninstall")
+        expected = json.loads(self.original)
+        expected["hooks"]["PermissionRequest"] = [foreign]
+        self.assertEqual(json.loads(self.settings.read_bytes()), expected)
+        self.assertFalse((self.data / "install.json").exists())
+
+    def test_uninstall_removes_a_registration_without_a_newer_hook(self):
+        self.install("--yes")
+        self.older_registration()
+        self.run_collector("uninstall")
+        self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 0)
+
+    def test_a_missing_original_hook_still_reads_as_changed(self):
+        self.install("--yes")
+        self.older_registration("Stop")
+        self.assertEqual(
+            json.loads(self.run_collector("doctor").stdout)["registration"][
+                "registration"
+            ],
+            "changed",
+        )
+
     def test_upgrade_refused_by_the_settings_changes_nothing(self):
         self.install("--yes")
         doc = json.loads(self.settings.read_bytes())

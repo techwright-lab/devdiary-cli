@@ -34,6 +34,9 @@ pub const EVENTS: [&str; 10] = [
     "SubagentStop",
     "SessionEnd",
 ];
+// Events a registration from an older version never held. A registration missing one
+// is still ours, or upgrade and uninstall would refuse to touch it.
+const ADDED_LATER: [&str; 1] = ["PermissionRequest"];
 const MAX_PLAN: usize = 65536;
 const DECLARED_RUN_ENV: &str = "DEVDIARY_RUN_REF";
 /// Sessions with this prefix exercise the installed hook end to end but are
@@ -253,12 +256,15 @@ fn settings(path: &Path) -> Result<(Vec<u8>, Object)> {
 }
 fn owned(doc: &Object, expected: &Value) -> Result<()> {
     for event in EVENTS {
-        let items = doc
-            .get("hooks")
-            .and_then(|v| v.get(event))
+        let hook = doc.get("hooks").and_then(|v| v.get(event));
+        if hook.is_none() && ADDED_LATER.contains(&event) {
+            continue;
+        }
+        let items = hook
             .and_then(Value::as_array)
             .ok_or("owned_entry_missing")?;
-        if items.iter().filter(|e| *e == expected).count() != 1 {
+        let count = items.iter().filter(|e| *e == expected).count();
+        if count != 1 && !(count == 0 && ADDED_LATER.contains(&event)) {
             return Err("owned_entry_changed".into());
         }
     }
@@ -481,18 +487,27 @@ fn load(plan_path: &Path) -> Result<Object> {
         }
     }
     let absent_hooks = p["absent_hooks"].as_bool().ok_or("invalid_plan")?;
-    if absent_hooks && absent.len() != EVENTS.len() {
+    if absent_hooks && ![EVENTS.len(), EVENTS.len() - ADDED_LATER.len()].contains(&absent.len()) {
         return Err("invalid_plan".into());
     }
     Ok(p)
 }
 
+fn original(events: Vec<&str>) -> Vec<&str> {
+    events
+        .into_iter()
+        .filter(|e| !ADDED_LATER.contains(e))
+        .collect()
+}
 fn original_presence(p: &Object, doc: &Object) -> Result<()> {
+    let planned = p["absent_events"].as_array().ok_or("invalid_plan")?;
     let absent: Vec<_> = EVENTS
         .iter()
-        .filter(|e| doc.get("hooks").and_then(|h| h.get(**e)).is_none())
+        .copied()
+        .filter(|e| doc.get("hooks").and_then(|h| h.get(*e)).is_none())
         .collect();
-    if p["absent_events"] != json!(absent) || p["absent_hooks"] != json!(!doc.contains_key("hooks"))
+    if original(planned.iter().filter_map(Value::as_str).collect()) != original(absent)
+        || p["absent_hooks"] != json!(!doc.contains_key("hooks"))
     {
         return Err("invalid_original_presence".into());
     }
@@ -698,6 +713,9 @@ fn without(p: &Object, raw: &[u8]) -> Result<Vec<u8>> {
     let hooks = ordered.get_mut("hooks").ok_or("invalid_hooks")?;
     for event in EVENTS {
         let Some(Json::Array(items)) = hooks.get_mut(event) else {
+            if ADDED_LATER.contains(&event) {
+                continue;
+            }
             return Err("invalid_hooks".into());
         };
         items.retain(|e| !e.matches(&p["entry"]));
