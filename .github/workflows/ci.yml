@@ -64,7 +64,9 @@ jobs:
       - name: One-command install, timer units and uninstall (fake systemctl)
         run: python3 collector-rs/tests/install_test.py -v
       - name: Qualification harness control-flow fixtures (no provider calls)
-        run: python3 collector-rs/tests/qualification_test.py -v
+        run: |
+          python3 collector-rs/tests/qualification_test.py -v
+          python3 collector-rs/tests/codex_qualification_test.py CodexQualificationTest -v
       - name: Dependency advisories
         run: |
           cargo +1.98.1 install cargo-audit --version 0.22.2 --locked
