@@ -219,6 +219,15 @@ fixture success do not qualify stock lifecycle coverage or counted minutes.
 C1 acceptance and current evidence live in the canonical vault plan:
 `_vault/products/devdiary/docs/harness-plan.md` in the TechWright workspace.
 
+Build the debug collector first with
+`cargo build --locked --manifest-path collector-rs/Cargo.toml`.
+Pinned stock qualification is opt-in through
+`python3 collector-rs/tests/qualify_codex.py --help`; without provider consent it
+runs no vendor process. It requires the complete Codex 0.166.0 package and pinned
+SHA, preserves the resolver symlink target in its isolated filesystem, and uses
+the ordinary hook-trust UI. CI runs only its network-inert control tests. Passing
+capture gates does not establish server minute correctness.
+
 `install` runs the browser pairing, plan, consent and apply steps above in one
 command for an installation-scope connection, then delivers the spool from a
 systemd user timer. The hook contract does not change: it stays silent, exits 0
