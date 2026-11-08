@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from devdiary import note_validation as validation
 
@@ -27,8 +30,7 @@ class NoteValidationTest(unittest.TestCase):
         self.assertTrue(str(raised.exception) == code, "stable error required")
         self.assertIsNone(raised.exception.__cause__)
 
-    def test_guard_is_retained_and_valid_setup_preserves_exact_scope(self):
-        self.assertTrue(getattr(sys, "_devdiary_qualification_network_guard", False))
+    def test_valid_setup_preserves_exact_scope(self):
         value = setup()
         self.assertTrue(validation.read_setup(io.BytesIO(json.dumps(value).encode())) == value)
         self.assertTrue(validation.validate_scope(scope()) == scope())
@@ -119,6 +121,55 @@ class NoteValidationTest(unittest.TestCase):
         validation.require_matching_scope(scope(), scope())
         self.rejects(lambda: validation.require_matching_scope(scope(), scope("scope_b")), "binding_mismatch")
         self.rejects(lambda: validation.require_matching_scope(scope(), {**scope(), "subject_ref": scope()["subject_ref"].lower()}), "binding_mismatch")
+
+
+class NoteQualificationTest(unittest.TestCase):
+    def setUp(self):
+        if os.environ.get("DEVDIARY_PROFILE_QUALIFICATION") != "1":
+            self.skipTest("private profile qualification lane only")
+
+    def test_retained_network_guard_is_enabled(self):
+        self.assertTrue(getattr(sys, "_devdiary_qualification_network_guard", False))
+
+
+class NoteValidationPortabilityTest(unittest.TestCase):
+    def run_case(self, case, *, qualification=False, marker=None):
+        environment = {"DEVDIARY_PROFILE_QUALIFICATION": "1"} if qualification else {}
+        local_sys = SimpleNamespace()
+        if marker is not None:
+            local_sys._devdiary_qualification_network_guard = marker
+        result = unittest.TestResult()
+        with (
+            mock.patch(f"{__name__}.sys", local_sys),
+            mock.patch(f"{__name__}.os", SimpleNamespace(environ=environment)),
+        ):
+            case.run(result)
+        return result
+
+    def test_portable_validator_does_not_require_private_guard_marker(self):
+        result = self.run_case(NoteValidationTest("test_valid_setup_preserves_exact_scope"))
+        self.assertTrue(result.wasSuccessful() and not result.skipped,
+                        "portable validator must not require the qualification harness")
+
+    def test_qualification_check_is_explicitly_opted_in(self):
+        result = self.run_case(NoteQualificationTest("test_retained_network_guard_is_enabled"))
+        self.assertTrue(result.wasSuccessful() and len(result.skipped) == 1,
+                        "ordinary discovery must not require a private harness")
+
+    def test_requested_qualification_without_guard_is_a_failure_not_a_skip(self):
+        result = self.run_case(
+            NoteQualificationTest("test_retained_network_guard_is_enabled"), qualification=True,
+        )
+        self.assertTrue(len(result.failures) == 1 and not result.errors and not result.skipped,
+                        "an explicitly requested qualification must require its guard")
+
+    def test_requested_qualification_with_guard_runs(self):
+        result = self.run_case(
+            NoteQualificationTest("test_retained_network_guard_is_enabled"),
+            qualification=True, marker=True,
+        )
+        self.assertTrue(result.wasSuccessful() and not result.skipped,
+                        "guarded qualification must run")
 
 
 if __name__ == "__main__":

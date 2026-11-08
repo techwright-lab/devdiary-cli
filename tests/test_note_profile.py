@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from devdiary import note_profile as profile
@@ -17,6 +18,8 @@ from test_note_validation import scope
 
 class NoteProfileTest(unittest.TestCase):
     def setUp(self):
+        if os.name != "posix":
+            self.skipTest("notes profile integration requires POSIX")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -236,6 +239,36 @@ class NoteProfileTest(unittest.TestCase):
         replacement = profile.BoundProfile(origin=self.bound.origin, key_file=str(self.key), **scope("scope_b"))
         self.rejects(lambda: profile.create_profile(self.state, replacement), "profile_exists")
         self.assertTrue((self.state / "notes-profile.json").read_bytes() == raw)
+
+
+class NoteProfilePlatformTest(unittest.TestCase):
+    def test_non_posix_integration_skips_before_temporary_fixture(self):
+        result = unittest.TestResult()
+        with (
+            mock.patch(f"{__name__}.os", SimpleNamespace(name="nt")),
+            mock.patch(f"{__name__}.tempfile.TemporaryDirectory",
+                       side_effect=AssertionError("POSIX fixture entered")) as temporary,
+        ):
+            NoteProfileTest("test_bound_value_is_frozen_validated_and_locator_is_not_repr").run(result)
+        self.assertTrue(result.wasSuccessful() and len(result.skipped) == 1,
+                        "non-POSIX integration must skip before fixtures")
+        temporary.assert_not_called()
+
+    def test_non_posix_profile_operations_fail_closed_before_file_io(self):
+        bound = profile.BoundProfile(
+            origin="https://example.test", key_file="/synthetic/key", **scope(),
+        )
+        operations = (
+            lambda: profile.read_key_file("/synthetic/key"),
+            lambda: profile.create_profile("/synthetic/state", bound),
+            lambda: profile.check_profile_available("/synthetic/state"),
+            lambda: profile.require_bound_profile("/synthetic/state"),
+        )
+        with mock.patch.object(profile, "os", SimpleNamespace(name="nt")):
+            for operation in operations:
+                with self.assertRaises(NoteError) as raised:
+                    operation()
+                self.assertTrue(raised.exception.code == "platform_unsupported")
 
 
 if __name__ == "__main__":

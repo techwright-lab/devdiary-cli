@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from devdiary import note_profile as profile
 from devdiary import notes
 from devdiary.cli import main
 from devdiary.note_profile import require_bound_profile
@@ -19,6 +20,8 @@ from test_note_validation import scope
 
 class NotesTest(unittest.TestCase):
     def setUp(self):
+        if os.name != "posix":
+            self.skipTest("notes configure integration requires POSIX")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -157,6 +160,37 @@ class NotesTest(unittest.TestCase):
                     main(arguments)
             load.assert_called_once()
             self.assertTrue(output.getvalue() == "")
+
+
+class NotesPlatformTest(unittest.TestCase):
+    def test_non_posix_integration_skips_before_temporary_fixture(self):
+        result = unittest.TestResult()
+        with (
+            mock.patch(f"{__name__}.os", SimpleNamespace(name="nt")),
+            mock.patch(f"{__name__}.tempfile.TemporaryDirectory",
+                       side_effect=AssertionError("POSIX fixture entered")) as temporary,
+        ):
+            NotesTest("test_configure_matches_metadata_and_never_uses_registry_or_runner").run(result)
+        self.assertTrue(result.wasSuccessful() and len(result.skipped) == 1,
+                        "non-POSIX integration must skip before fixtures")
+        temporary.assert_not_called()
+
+    def test_non_posix_configure_fails_before_input_key_network_or_state(self):
+        class Unreadable:
+            def read(self, size=-1):
+                raise AssertionError("configure read input on unsupported platform")
+        with (
+            mock.patch.object(profile, "os", SimpleNamespace(name="nt")),
+            mock.patch.object(notes, "check_profile_available") as check,
+            mock.patch.object(notes, "read_key_file") as read,
+            mock.patch.object(notes, "get_scope") as get,
+            mock.patch.object(notes, "create_profile") as create,
+            self.assertRaises(NoteError) as raised,
+        ):
+            notes.configure("/synthetic/state", Unreadable())
+        self.assertTrue(raised.exception.code == "platform_unsupported")
+        for effect in (check, read, get, create):
+            effect.assert_not_called()
 
 
 if __name__ == "__main__":

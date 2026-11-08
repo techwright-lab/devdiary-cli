@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import signal
 import threading
 import time
@@ -10,6 +11,7 @@ import urllib.error
 import urllib.request
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from unittest import mock
 
 from devdiary import note_transport as transport
@@ -37,6 +39,10 @@ class Response(io.BytesIO):
 
 
 class NoteTransportTest(unittest.TestCase):
+    def setUp(self):
+        if os.name != "posix":
+            self.skipTest("notes scope integration requires POSIX")
+
     def rejects(self, action, code):
         with self.assertRaises(NoteError) as raised:
             action()
@@ -198,6 +204,31 @@ class NoteTransportTest(unittest.TestCase):
         self.assertTrue(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0))
         for bad in (f"http://localhost:{port}", f"http://127.0.0.2:{port}", f"http://127.0.0.1:{port + 1}"):
             self.rejects(lambda: transport.get_scope(bad, KEY, _loopback_port=port), "invalid_origin")
+
+
+class NoteTransportPlatformTest(unittest.TestCase):
+    def test_non_posix_integration_skips_before_scope_get(self):
+        result = unittest.TestResult()
+        with (
+            mock.patch(f"{__name__}.os", SimpleNamespace(name="nt")),
+            mock.patch.object(transport, "get_scope",
+                              side_effect=AssertionError("POSIX scope fixture entered")) as get,
+        ):
+            NoteTransportTest("test_fixed_get_headers_no_proxy_no_redirect_and_default_tls").run(result)
+        self.assertTrue(result.wasSuccessful() and len(result.skipped) == 1,
+                        "non-POSIX integration must skip before fixtures")
+        get.assert_not_called()
+
+    def test_non_posix_scope_get_fails_closed_before_opener_or_timer(self):
+        with (
+            mock.patch.object(transport, "os", SimpleNamespace(name="nt")),
+            mock.patch.object(transport.urllib.request, "build_opener") as build,
+            mock.patch.object(transport, "signal", SimpleNamespace()),
+            self.assertRaises(NoteError) as raised,
+        ):
+            transport.get_scope("https://example.test", KEY)
+        self.assertTrue(raised.exception.code == "platform_unsupported")
+        build.assert_not_called()
 
 
 if __name__ == "__main__":
