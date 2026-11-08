@@ -7,8 +7,14 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 
 from devdiary.note_validation import (
-    METADATA_LIMIT, SCOPE_FIELDS, NoteError, decode_object, encode_object,
-    validate_locator, validate_origin, validate_scope,
+    METADATA_LIMIT,
+    SCOPE_FIELDS,
+    NoteError,
+    decode_object,
+    encode_object,
+    validate_locator,
+    validate_origin,
+    validate_scope,
 )
 
 PROFILE_NAME = "notes-profile.json"
@@ -34,12 +40,29 @@ class BoundProfile:
 
 
 def require_posix() -> None:
-    if (os.name != "posix" or not all(getattr(os, name, None) for name in
-            ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
-            or not all(callable(getattr(os, name, None)) for name in
-                       ("open", "stat", "fstat", "mkdir", "read", "write", "close", "getuid", "fsync"))
-            or not {os.open, os.stat, os.mkdir} <= getattr(os, "supports_dir_fd", set())
-            or os.stat not in getattr(os, "supports_follow_symlinks", set())):
+    if (
+        os.name != "posix"
+        or not all(
+            getattr(os, name, None)
+            for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+        )
+        or not all(
+            callable(getattr(os, name, None))
+            for name in (
+                "open",
+                "stat",
+                "fstat",
+                "mkdir",
+                "read",
+                "write",
+                "close",
+                "getuid",
+                "fsync",
+            )
+        )
+        or not {os.open, os.stat, os.mkdir} <= getattr(os, "supports_dir_fd", set())
+        or os.stat not in getattr(os, "supports_follow_symlinks", set())
+    ):
         raise NoteError("platform_unsupported")
 
 
@@ -91,15 +114,21 @@ def _parent(path):
             os.close(fd)
             fd = next_fd
             info = os.fstat(fd)
-            private_seen |= info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+            private_seen |= (
+                info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+            )
         yield fd, parts[-1]
     finally:
         os.close(fd)
 
 
 def _file_check(info):
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+    ):
         raise NoteError("unsafe_path")
 
 
@@ -129,7 +158,9 @@ def read_key_file(locator: str) -> str:
         with _parent(locator) as (directory, name):
             _directory_check(os.fstat(directory), private=True)
             raw = _read_file(directory, name)
-        if len(raw) > METADATA_LIMIT or not re.fullmatch(rb"dn_live_[A-Za-z0-9_-]{43}\n?", raw):
+        if len(raw) > METADATA_LIMIT or not re.fullmatch(
+            rb"dn_live_[A-Za-z0-9_-]{43}\n?", raw
+        ):
             raise NoteError("invalid_key")
         return raw.removesuffix(b"\n").decode("ascii")
     except OSError:
@@ -171,8 +202,16 @@ def create_profile(directory, profile: BoundProfile) -> None:
             state = _open_directory(parent, name, private=True)
             try:
                 try:
-                    fd = os.open(PROFILE_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                                 | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=state)
+                    fd = os.open(
+                        PROFILE_NAME,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_NOFOLLOW
+                        | os.O_NONBLOCK,
+                        0o600,
+                        dir_fd=state,
+                    )
                 except FileExistsError:
                     raise NoteError("profile_exists") from None
                 try:
@@ -183,12 +222,17 @@ def create_profile(directory, profile: BoundProfile) -> None:
                             raise OSError
                         raw = raw[written:]
                     _file_check(os.fstat(fd))
-                    _same(os.fstat(fd), os.stat(PROFILE_NAME, dir_fd=state, follow_symlinks=False))
+                    _same(
+                        os.fstat(fd),
+                        os.stat(PROFILE_NAME, dir_fd=state, follow_symlinks=False),
+                    )
                     os.fsync(fd)
                 finally:
                     os.close(fd)
                 _directory_check(os.fstat(state), private=True)
-                _same(os.fstat(state), os.stat(name, dir_fd=parent, follow_symlinks=False))
+                _same(
+                    os.fstat(state), os.stat(name, dir_fd=parent, follow_symlinks=False)
+                )
                 os.fsync(state)
                 # Another initializer may have created the leaf before our mkdir.
                 os.fsync(parent)
