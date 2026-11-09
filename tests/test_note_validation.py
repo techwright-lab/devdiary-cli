@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import unittest
+from http.client import HTTPResponse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -364,13 +365,23 @@ class NoteWriteValidationTest(unittest.TestCase):
                     ),
                     "invalid_ack",
                 )
-        for status in (200, 202, 204, 301, 409, True, 201.0):
+        for status in (200, 202, 204, 301, 409, True):
             self.rejects(
                 lambda status=status: validation.validate_receipt(
                     validation.encode_object(receipt), status, request
                 ),
                 "invalid_ack",
             )
+        response: HTTPResponse = mock.create_autospec(HTTPResponse, instance=True)
+        response.status = 201
+        with mock.patch.object(response, "status", 201.0):
+            self.assertIs(type(response.status), float)
+            self.assertEqual(response.status, 201.0)
+            with self.assertRaises(validation.NoteError) as raised:
+                validation.validate_receipt(
+                    validation.encode_object(receipt), response.status, request
+                )
+            self.assertEqual(raised.exception.code, "invalid_ack")
         self.rejects(
             lambda: validation.validate_receipt(
                 validation.encode_object(receipt), 201, request, "note_different"
