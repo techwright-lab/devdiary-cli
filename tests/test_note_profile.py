@@ -11,9 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from test_note_validation import scope
+
 from devdiary import note_profile as profile
 from devdiary.note_validation import NoteError
-from test_note_validation import scope
 
 
 class NoteProfileTest(unittest.TestCase):
@@ -46,8 +47,9 @@ class NoteProfileTest(unittest.TestCase):
     def test_bound_value_is_frozen_validated_and_locator_is_not_repr(self):
         self.assertTrue(str(self.key) not in repr(self.bound), "locator escaped")
         self.assertTrue(self.secret not in repr(self.bound), "secret escaped")
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            setattr(self.bound, "subject_ref", "other")
+        for profile_field in dataclasses.fields(self.bound):
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                setattr(self.bound, profile_field.name, "other")
         self.rejects(
             lambda: dataclasses.replace(self.bound, capability="offline"),
             "invalid_scope",
@@ -118,7 +120,9 @@ class NoteProfileTest(unittest.TestCase):
             if index == 0:
                 self.assertTrue(profile.read_key_file(str(path)) == self.secret)
             else:
-                self.rejects(lambda: profile.read_key_file(str(path)), "invalid_key")
+                self.rejects(
+                    lambda path=path: profile.read_key_file(str(path)), "invalid_key"
+                )
 
     def test_symlink_components_and_hardlinks_are_rejected(self):
         link = self.root / "link"
@@ -177,7 +181,7 @@ class NoteProfileTest(unittest.TestCase):
         )
         self.assertFalse((self.root / "missing").exists())
         for path in ("relative/key", str(self.root) + "/../key"):
-            self.rejects(lambda: profile.read_key_file(path), "unsafe_path")
+            self.rejects(lambda path=path: profile.read_key_file(path), "unsafe_path")
 
     def test_guard_rejects_unqualified_partial_and_oversized_files(self):
         self.state.mkdir(mode=0o700)
@@ -285,7 +289,7 @@ class NoteProfileTest(unittest.TestCase):
             real_sync = os.fsync
             calls = 0
 
-            def sync(fd):
+            def sync(fd, failing=failing, real_sync=real_sync):
                 nonlocal calls
                 calls += 1
                 if calls == failing:
@@ -294,7 +298,8 @@ class NoteProfileTest(unittest.TestCase):
 
             with mock.patch.object(profile.os, "fsync", side_effect=sync):
                 self.rejects(
-                    lambda: profile.create_profile(state, self.bound), "profile_failed"
+                    lambda state=state: profile.create_profile(state, self.bound),
+                    "profile_failed",
                 )
             self.assertTrue((state / "notes-profile.json").is_file())
             self.assertTrue(
@@ -302,7 +307,8 @@ class NoteProfileTest(unittest.TestCase):
                 "current valid bytes are not a configure durability receipt",
             )
             self.rejects(
-                lambda: profile.create_profile(state, self.bound), "profile_exists"
+                lambda state=state: profile.create_profile(state, self.bound),
+                "profile_exists",
             )
 
     def test_concurrent_exclusive_creates_have_exactly_one_winner(self):
@@ -342,23 +348,21 @@ class NoteProfileTest(unittest.TestCase):
                 return os.stat_result(values)
             return info
 
-        with mock.patch.object(profile.os, "stat", side_effect=wrong_owner):
-            # Preserve primitive capability detection while testing descriptor checks.
-            with (
-                mock.patch.object(
-                    profile.os,
-                    "supports_dir_fd",
-                    os.supports_dir_fd | {profile.os.stat},
-                ),
-                mock.patch.object(
-                    profile.os,
-                    "supports_follow_symlinks",
-                    os.supports_follow_symlinks | {profile.os.stat},
-                ),
-            ):
-                self.rejects(
-                    lambda: profile.read_key_file(str(self.key)), "unsafe_path"
-                )
+        # Enter the stat patch before registering its identity as a supported primitive.
+        with (
+            mock.patch.object(profile.os, "stat", side_effect=wrong_owner),
+            mock.patch.object(
+                profile.os,
+                "supports_dir_fd",
+                os.supports_dir_fd | {profile.os.stat},
+            ),
+            mock.patch.object(
+                profile.os,
+                "supports_follow_symlinks",
+                os.supports_follow_symlinks | {profile.os.stat},
+            ),
+        ):
+            self.rejects(lambda: profile.read_key_file(str(self.key)), "unsafe_path")
         real_open = os.open
 
         def swap(name, flags, *args, **kwargs):

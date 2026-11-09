@@ -45,15 +45,19 @@ class NoteValidationTest(unittest.TestCase):
         for field in ("schema_version", "origin", "key_file", "metadata"):
             value = setup()
             del value[field]
-            self.rejects(lambda: validation.validate_setup(value), "invalid_setup")
+            self.rejects(
+                lambda value=value: validation.validate_setup(value), "invalid_setup"
+            )
         for field in ("content", "token", "actor_ref", "endpoint_path", "registry"):
             self.rejects(
-                lambda: validation.validate_setup({**setup(), field: "SENTINEL"}),
+                lambda field=field: validation.validate_setup(
+                    {**setup(), field: "SENTINEL"}
+                ),
                 "invalid_setup",
             )
         for version in (True, 1.0, "1", None, 2):
             self.rejects(
-                lambda: validation.validate_setup(
+                lambda version=version: validation.validate_setup(
                     {**setup(), "schema_version": version}
                 ),
                 "invalid_setup",
@@ -69,7 +73,9 @@ class NoteValidationTest(unittest.TestCase):
             "/a/\x00key",
         ):
             self.rejects(
-                lambda: validation.validate_setup({**setup(), "key_file": locator}),
+                lambda locator=locator: validation.validate_setup(
+                    {**setup(), "key_file": locator}
+                ),
                 "invalid_setup",
             )
 
@@ -95,7 +101,9 @@ class NoteValidationTest(unittest.TestCase):
         for field, values in changes.items():
             for value in values:
                 self.rejects(
-                    lambda: validation.validate_scope({**scope(), field: value}),
+                    lambda field=field, value=value: validation.validate_scope(
+                        {**scope(), field: value}
+                    ),
                     "invalid_scope",
                 )
         self.rejects(
@@ -105,7 +113,9 @@ class NoteValidationTest(unittest.TestCase):
         for field in scope():
             value = scope()
             del value[field]
-            self.rejects(lambda: validation.validate_scope(value), "invalid_scope")
+            self.rejects(
+                lambda value=value: validation.validate_scope(value), "invalid_scope"
+            )
         base = scope()
         prefix = "workspace_"
         base["workspace_ref"] = prefix
@@ -142,7 +152,7 @@ class NoteValidationTest(unittest.TestCase):
         ]
         for raw in bad:
             self.rejects(
-                lambda: validation.read_setup(io.BytesIO(raw)), "invalid_setup"
+                lambda raw=raw: validation.read_setup(io.BytesIO(raw)), "invalid_setup"
             )
         self.assertTrue(
             validation.decode_object(
@@ -205,18 +215,24 @@ class NoteValidationTest(unittest.TestCase):
             "https://127.0.0.1/anything",
         ]
         for origin in bad:
-            self.rejects(lambda: validation.validate_origin(origin), "invalid_origin")
+            self.rejects(
+                lambda origin=origin: validation.validate_origin(origin),
+                "invalid_origin",
+            )
 
     def test_nonfinite_exponents_are_rejected(self):
         for raw in (b'{"a":1e999}', b'{"a":{"b":-1e999}}'):
             self.rejects(
-                lambda: validation.decode_object(raw, 4096, "invalid_scope"),
+                lambda raw=raw: validation.decode_object(raw, 4096, "invalid_scope"),
                 "invalid_scope",
             )
 
     def test_legacy_numeric_authorities_are_rejected(self):
         for origin in ("https://0x7f000001", "https://0x7f.0.0.1", "https://127.0x1"):
-            self.rejects(lambda: validation.validate_origin(origin), "invalid_origin")
+            self.rejects(
+                lambda origin=origin: validation.validate_origin(origin),
+                "invalid_origin",
+            )
 
     def test_binding_comparison_preserves_authenticated_spelling(self):
         validation.require_matching_scope(scope(), scope())

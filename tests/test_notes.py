@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
 import os
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from test_note_validation import scope
+
 from devdiary import note_profile as profile
 from devdiary import notes
-from devdiary.cli import main
+from devdiary.cli import _configure_notes, main
 from devdiary.note_profile import require_bound_profile
 from devdiary.note_validation import NoteError
-from test_note_validation import scope
 
 
 class NotesTest(unittest.TestCase):
@@ -190,12 +193,14 @@ class NotesTest(unittest.TestCase):
         from devdiary.note_profile import read_key_file
         from devdiary.note_validation import require_matching_scope
 
-        with mock.patch.object(notes, "get_scope", return_value=scope("scope_b")):
-            with self.assertRaises(NoteError) as rejected:
-                require_matching_scope(
-                    scope(),
-                    notes.get_scope(bound.origin, read_key_file(bound.key_file)),
-                )
+        with (
+            mock.patch.object(notes, "get_scope", return_value=scope("scope_b")),
+            self.assertRaises(NoteError) as rejected,
+        ):
+            require_matching_scope(
+                scope(),
+                notes.get_scope(bound.origin, read_key_file(bound.key_file)),
+            )
         self.assertTrue(rejected.exception.code == "binding_mismatch")
         self.assertTrue(scope("scope_b")["subject_ref"] not in str(rejected.exception))
         self.assertTrue((self.state / "notes-profile.json").read_bytes() == raw)
@@ -238,6 +243,49 @@ class NotesTest(unittest.TestCase):
         ):
             with mock.patch.object(notes, "get_scope", side_effect=failure):
                 self.assert_error(self.cli(), "configure_failed")
+            self.assertFalse(self.state.exists())
+
+    def test_configure_helper_raises_only_fresh_sanitized_errors(self):
+        corrupted = NoteError("invalid_scope")
+        corrupted.code = "SENTINEL_CODE"
+        for original, code in (
+            (RuntimeError("SENTINEL_PATH_SECRET"), "configure_failed"),
+            (NoteError("invalid_scope"), "invalid_scope"),
+            (corrupted, "configure_failed"),
+        ):
+            output, error = io.StringIO(), io.StringIO()
+            stream = SimpleNamespace(
+                buffer=io.BytesIO(json.dumps(self.setup_value()).encode())
+            )
+            with (
+                mock.patch("sys.stdin", stream),
+                mock.patch.object(notes, "get_scope", side_effect=original),
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(error),
+                self.assertRaises(NoteError) as raised,
+            ):
+                _configure_notes(argparse.Namespace(state_dir=str(self.state)))
+            normalized = raised.exception
+            self.assertTrue(
+                normalized is not original, "fresh sanitized error required"
+            )
+            self.assertTrue(normalized.code == code, "allowlisted error required")
+            self.assertTrue(
+                normalized.__cause__ is None, "exception cause must not be forwarded"
+            )
+            self.assertTrue(normalized.__suppress_context__)
+            displayed = "".join(traceback.format_exception(normalized))
+            self.assertTrue(
+                all(
+                    "SENTINEL" not in value
+                    for value in (str(normalized), repr(normalized), displayed)
+                ),
+                "exception display must not expose the original failure",
+            )
+            self.assertTrue(
+                output.getvalue() == "" and error.getvalue() == "",
+                "helper must not report exceptions",
+            )
             self.assertFalse(self.state.exists())
 
     def test_notes_argument_failures_are_redacted_before_input_or_effects(self):
@@ -306,9 +354,9 @@ class NotesTest(unittest.TestCase):
                 ) as load,
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(error),
+                self.assertRaises(NoteError),
             ):
-                with self.assertRaises(NoteError):
-                    main(arguments)
+                main(arguments)
             load.assert_called_once()
             self.assertTrue(output.getvalue() == "")
 

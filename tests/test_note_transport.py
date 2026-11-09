@@ -14,9 +14,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
+from test_note_validation import scope
+
 from devdiary import note_transport as transport
 from devdiary.note_validation import NoteError
-from test_note_validation import scope
 
 KEY = "dn_live_" + "a" * 43
 
@@ -111,7 +112,7 @@ class NoteTransportTest(unittest.TestCase):
             (Response(raw=b'{"a":1,"a":2}'), "invalid_scope"),
         ]
         for response, code in cases:
-            self.rejects(lambda: self.call_fake(response), code)
+            self.rejects(lambda response=response: self.call_fake(response), code)
             self.assertTrue(response.closed)
             self.assertTrue(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0))
         for media in (
@@ -198,7 +199,10 @@ class NoteTransportTest(unittest.TestCase):
             "http://localhost:12345",
         ):
             with mock.patch.object(transport.urllib.request, "build_opener") as build:
-                self.rejects(lambda: transport.get_scope(origin, KEY), "invalid_origin")
+                self.rejects(
+                    lambda origin=origin: transport.get_scope(origin, KEY),
+                    "invalid_origin",
+                )
                 build.assert_not_called()
         self.rejects(
             lambda: transport.get_scope("https://example.test", KEY + "\r\nX: a"),
@@ -315,7 +319,7 @@ class NoteTransportTest(unittest.TestCase):
             f"http://127.0.0.1:{port + 1}",
         ):
             self.rejects(
-                lambda: transport.get_scope(bad, KEY, _loopback_port=port),
+                lambda bad=bad: transport.get_scope(bad, KEY, _loopback_port=port),
                 "invalid_origin",
             )
 

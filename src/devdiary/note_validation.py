@@ -106,7 +106,7 @@ def decode_object(raw: bytes, limit: int, code: str) -> dict:
         _check_depth(text)
         result = json.loads(text, object_pairs_hook=_pairs, parse_constant=_nonfinite)
         if not isinstance(result, dict):
-            raise ValueError
+            raise TypeError
         _check_values(result)
         return result
     except (ValueError, TypeError, UnicodeError, RecursionError):

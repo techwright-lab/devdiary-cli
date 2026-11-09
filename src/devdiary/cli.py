@@ -232,6 +232,17 @@ def main(arguments: list[str] | None = None) -> int:
 
 
 def _notes(args: argparse.Namespace) -> int:
+    from devdiary.note_validation import NoteError
+
+    try:
+        _configure_notes(args)
+        return 0
+    except NoteError as error:
+        print(json.dumps({"error_code": error.code}, separators=(",", ":")))
+        return 2
+
+
+def _configure_notes(args: argparse.Namespace) -> None:
     from devdiary.note_validation import ERROR_CODES, NoteError
 
     try:
@@ -239,7 +250,6 @@ def _notes(args: argparse.Namespace) -> int:
 
         result = notes.configure(args.state_dir, sys.stdin.buffer)
         print(json.dumps(result, separators=(",", ":")))
-        return 0
     except Exception as error:
         # This boundary must not expose input, paths, credentials or exception chains.
         code = (
@@ -247,8 +257,8 @@ def _notes(args: argparse.Namespace) -> int:
             if isinstance(error, NoteError) and error.code in ERROR_CODES
             else "configure_failed"
         )
-        print(json.dumps({"error_code": code}, separators=(",", ":")))
-        return 2
+        error = NoteError(code)
+        raise error from None
 
 
 def _observer(args: argparse.Namespace) -> int:
