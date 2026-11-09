@@ -109,13 +109,22 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--json", action="store_true")
 
     notes = commands.add_parser(
-        "notes", help="configure a bound notes profile", allow_abbrev=False
+        "notes", help="manage a private bound notes outbox", allow_abbrev=False
     )
     notes.error = _reject_notes_arguments
     notes_ops = notes.add_subparsers(dest="notes_operation", required=True)
-    configure = notes_ops.add_parser("configure", allow_abbrev=False)
-    configure.error = _reject_notes_arguments
-    configure.add_argument("--state-dir", required=True)
+    for operation in (
+        "configure",
+        "create",
+        "update",
+        "delete",
+        "status",
+        "retry",
+        "discard",
+    ):
+        note_command = notes_ops.add_parser(operation, allow_abbrev=False)
+        note_command.error = _reject_notes_arguments
+        note_command.add_argument("--state-dir", required=True)
 
     observer = commands.add_parser(
         "observer", help="local-only stock Claude/Codex metadata observer (POSIX pilot)"
@@ -235,11 +244,37 @@ def _notes(args: argparse.Namespace) -> int:
     from devdiary.note_validation import NoteError
 
     try:
-        _configure_notes(args)
-        return 0
+        if args.notes_operation == "configure":
+            _configure_notes(args)
+            return 0
+        return _local_notes(args)
     except NoteError as error:
         print(json.dumps({"error_code": error.code}, separators=(",", ":")))
         return 2
+
+
+def _local_notes(args: argparse.Namespace) -> int:
+    from devdiary.note_validation import ERROR_CODES, OUTBOX_ERROR_CODES, NoteError
+
+    try:
+        from devdiary import notes
+
+        result = notes.local_command(
+            args.state_dir, args.notes_operation, sys.stdin.buffer
+        )
+        print(json.dumps(result, separators=(",", ":")))
+        return (
+            2 if result.get("state") in {"pending", "blocked", "purge_pending"} else 0
+        )
+    except Exception as error:
+        code = (
+            error.code
+            if isinstance(error, NoteError)
+            and error.code in ERROR_CODES | OUTBOX_ERROR_CODES
+            else "store_failed"
+        )
+        error = NoteError(code)
+        raise error from None
 
 
 def _configure_notes(args: argparse.Namespace) -> None:
