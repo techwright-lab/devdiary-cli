@@ -382,6 +382,8 @@ class NoteWriteValidationTest(unittest.TestCase):
                     validation.encode_object(receipt), response.status, request
                 )
             self.assertEqual(raised.exception.code, "invalid_ack")
+            self.assertEqual(str(raised.exception), "invalid_ack")
+            self.assertIsNone(raised.exception.__cause__)
         self.rejects(
             lambda: validation.validate_receipt(
                 validation.encode_object(receipt), 201, request, "note_different"
