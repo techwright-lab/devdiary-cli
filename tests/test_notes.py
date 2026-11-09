@@ -24,7 +24,7 @@ class NotesTest(unittest.TestCase):
             self.skipTest("notes configure integration requires POSIX")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.state = self.root / "state"
         self.key = self.root / "key"
         self.secret = "dn_live_" + "a" * 43
@@ -107,6 +107,30 @@ class NotesTest(unittest.TestCase):
         self.assertTrue(bound.subject_ref == scope()["subject_ref"])
         self.assertTrue(
             list(self.state.iterdir()) == [self.state / "notes-profile.json"]
+        )
+
+    def test_owned_temporary_base_alias_uses_canonical_configure_fixture(self):
+        base = self.root / "temporary-base"
+        base.mkdir(mode=0o700)
+        alias = self.root / "temporary-alias"
+        alias.symlink_to(base, target_is_directory=True)
+        temporary_directory = tempfile.TemporaryDirectory
+        case = NotesTest(
+            "test_configure_matches_metadata_and_never_uses_registry_or_runner"
+        )
+        result = unittest.TestResult()
+        with mock.patch.object(
+            tempfile,
+            "TemporaryDirectory",
+            side_effect=lambda: temporary_directory(dir=alias),
+        ):
+            case.run(result)
+        self.assertTrue(case.temp.name.startswith(str(alias) + os.sep))
+        self.assertFalse(result.errors, "owned alias fixture setup must complete")
+        self.assertFalse(result.skipped, "POSIX alias fixture must run")
+        self.assertTrue(
+            result.wasSuccessful(),
+            "owned configure fixture must canonicalize its temporary root",
         )
 
     def test_expected_a_actual_b_is_rejected_without_alternative_identity_or_profile(

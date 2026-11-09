@@ -22,7 +22,7 @@ class NoteProfileTest(unittest.TestCase):
             self.skipTest("notes profile integration requires POSIX")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.key = self.root / "key"
         self.secret = "dn_live_" + "a" * 43
         self.write_file(self.key, self.secret.encode())
@@ -47,7 +47,7 @@ class NoteProfileTest(unittest.TestCase):
         self.assertTrue(str(self.key) not in repr(self.bound), "locator escaped")
         self.assertTrue(self.secret not in repr(self.bound), "secret escaped")
         with self.assertRaises(dataclasses.FrozenInstanceError):
-            self.bound.subject_ref = "other"
+            setattr(self.bound, "subject_ref", "other")
         self.rejects(
             lambda: dataclasses.replace(self.bound, capability="offline"),
             "invalid_scope",
@@ -74,6 +74,30 @@ class NoteProfileTest(unittest.TestCase):
         self.assertEqual(0o700, stat.S_IMODE(self.state.stat().st_mode))
         self.assertEqual(
             0o600, stat.S_IMODE((self.state / "notes-profile.json").stat().st_mode)
+        )
+
+    def test_owned_temporary_base_alias_uses_canonical_profile_fixture(self):
+        base = self.root / "temporary-base"
+        base.mkdir(mode=0o700)
+        alias = self.root / "temporary-alias"
+        alias.symlink_to(base, target_is_directory=True)
+        temporary_directory = tempfile.TemporaryDirectory
+        case = NoteProfileTest(
+            "test_missing_guard_is_read_only_and_valid_profile_round_trips"
+        )
+        result = unittest.TestResult()
+        with mock.patch.object(
+            tempfile,
+            "TemporaryDirectory",
+            side_effect=lambda: temporary_directory(dir=alias),
+        ):
+            case.run(result)
+        self.assertTrue(case.temp.name.startswith(str(alias) + os.sep))
+        self.assertFalse(result.errors, "owned alias fixture setup must complete")
+        self.assertFalse(result.skipped, "POSIX alias fixture must run")
+        self.assertTrue(
+            result.wasSuccessful(),
+            "owned profile fixture must canonicalize its temporary root",
         )
 
     def test_key_family_bounded_read_and_optional_single_lf(self):

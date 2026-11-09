@@ -6,6 +6,7 @@ import os
 import sys
 from importlib import resources
 from pathlib import Path
+from typing import NoReturn
 
 from devdiary import __version__, doctor, runner, spool
 from devdiary.config import (
@@ -27,7 +28,7 @@ class _NotesArgumentsError(ValueError):
     pass
 
 
-def _reject_notes_arguments(message: str) -> None:
+def _reject_notes_arguments(message: str) -> NoReturn:
     raise _NotesArgumentsError
 
 
