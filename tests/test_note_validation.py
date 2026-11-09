@@ -165,14 +165,19 @@ class NoteValidationTest(unittest.TestCase):
         raw += b" " * (262144 - len(raw))
 
         class Stream(io.BytesIO):
-            def read(self, size=-1):
+            def read(self, size: int | None = -1) -> bytes:
                 if size != 262145:
                     raise AssertionError("bounded binary read required")
                 return super().read(size)
 
         self.assertTrue(validation.read_setup(Stream(raw)) == setup())
         self.rejects(lambda: validation.read_setup(Stream(raw + b" ")), "invalid_setup")
-        self.rejects(lambda: validation.read_setup(io.StringIO("{}")), "invalid_setup")
+        malformed = Stream(raw)
+        with mock.patch.object(
+            Stream, "read", return_value=json.dumps(setup())
+        ) as read:
+            self.rejects(lambda: validation.read_setup(malformed), "invalid_setup")
+        read.assert_called_once_with(262145)
 
     def test_origin_is_canonical_not_normalized(self):
         valid = [

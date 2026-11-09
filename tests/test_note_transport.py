@@ -39,9 +39,9 @@ class Response(io.BytesIO):
         self.headers["Content-Length"] = "1"
         if encoding:
             self.headers["Content-Encoding"] = encoding
-        self.read_sizes = []
+        self.read_sizes: list[int | None] = []
 
-    def read(self, size=-1):
+    def read(self, size: int | None = -1) -> bytes:
         self.read_sizes.append(size)
         return super().read(size)
 
@@ -71,7 +71,19 @@ class NoteTransportTest(unittest.TestCase):
     def test_fixed_get_headers_no_proxy_no_redirect_and_default_tls(self):
         response = Response()
         handler = signal.getsignal(signal.SIGALRM)
-        actual, opener, build = self.call_fake(response)
+        proxy_type = urllib.request.ProxyHandler
+        created_proxies: list[urllib.request.ProxyHandler] = []
+
+        def create_proxy(proxies: dict[str, str]) -> urllib.request.ProxyHandler:
+            proxy = proxy_type(proxies)
+            created_proxies.append(proxy)
+            return proxy
+
+        with mock.patch.object(
+            transport.urllib.request, "ProxyHandler", side_effect=create_proxy
+        ) as proxy_factory:
+            actual, opener, build = self.call_fake(response)
+        proxy_factory.assert_called_once_with({})
         self.assertTrue(actual == scope())
         request = opener.open.call_args.args[0]
         self.assertTrue(
@@ -84,12 +96,9 @@ class NoteTransportTest(unittest.TestCase):
         )
         self.assertEqual(10, opener.open.call_args.kwargs["timeout"])
         handlers = build.call_args.args
-        self.assertTrue(
-            any(
-                isinstance(h, urllib.request.ProxyHandler) and h.proxies == {}
-                for h in handlers
-            )
-        )
+        self.assertTrue(len(created_proxies) == 1, "one real proxy handler required")
+        self.assertTrue(isinstance(created_proxies[0], proxy_type))
+        self.assertTrue(any(h is created_proxies[0] for h in handlers))
         self.assertTrue(
             any(isinstance(h, transport.NoRedirectHandler) for h in handlers)
         )
@@ -243,9 +252,7 @@ class NoteTransportTest(unittest.TestCase):
                 self.send_response(route["status"])
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
-                self.send_header(
-                    "Location", f"http://127.0.0.1:{self.server.server_port}/target"
-                )
+                self.send_header("Location", f"http://127.0.0.1:{port}/target")
                 self.end_headers()
                 try:
                     if route["trickle"]:
@@ -259,16 +266,16 @@ class NoteTransportTest(unittest.TestCase):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-            def log_message(self, *args):
+            def log_message(self, format: str, *args: object) -> None:
                 pass
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_port
         server.daemon_threads = False
         thread = threading.Thread(
             target=server.serve_forever, kwargs={"poll_interval": 0.01}
         )
         thread.start()
-        port = server.server_port
         origin = f"http://127.0.0.1:{port}"
         try:
             with mock.patch.dict(
@@ -325,6 +332,16 @@ class NoteTransportTest(unittest.TestCase):
 
 
 class NoteTransportPlatformTest(unittest.TestCase):
+    def test_response_read_preserves_bytesio_size_contract(self):
+        with Response(raw=b"fixture") as response:
+            self.assertTrue(response.read(None) == b"fixture")
+            response.seek(0)
+            self.assertTrue(response.read() == b"fixture")
+            response.seek(0)
+            self.assertTrue(response.read(3) == b"fix")
+            self.assertTrue(response.read_sizes == [None, -1, 3])
+        self.assertTrue(response.closed)
+
     def test_non_posix_integration_skips_before_scope_get(self):
         result = unittest.TestResult()
         with (

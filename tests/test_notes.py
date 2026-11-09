@@ -381,8 +381,8 @@ class NotesPlatformTest(unittest.TestCase):
         temporary.assert_not_called()
 
     def test_non_posix_configure_fails_before_input_key_network_or_state(self):
-        class Unreadable:
-            def read(self, size=-1):
+        class Unreadable(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
                 raise AssertionError("configure read input on unsupported platform")
 
         with (
