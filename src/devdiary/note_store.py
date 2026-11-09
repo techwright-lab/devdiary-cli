@@ -321,13 +321,12 @@ class Store:
         )
         self.connected = True
         self.connection.row_factory = sqlite3.Row
-        if not new:
-            if (
-                self.connection.execute("PRAGMA application_id").fetchone()[0]
-                != APPLICATION_ID
-                or self.connection.execute("PRAGMA user_version").fetchone()[0] != 1
-            ):
-                raise NoteError("store_corrupt")
+        if not new and (
+            self.connection.execute("PRAGMA application_id").fetchone()[0]
+            != APPLICATION_ID
+            or self.connection.execute("PRAGMA user_version").fetchone()[0] != 1
+        ):
+            raise NoteError("store_corrupt")
         for statement in (
             "PRAGMA secure_delete=ON",
             "PRAGMA synchronous=FULL",

@@ -548,13 +548,13 @@ class NoteWriteBoundaryTest(unittest.TestCase):
             validation.validate_receipt(raw + b" " * (4096 - len(raw)), 201, request),
             receipt,
         )
-        for raw in (
+        for candidate in (
             raw + b" " * (4097 - len(raw)),
             b'{"a":1,"a":2}',
             b'{"a":"\\ud800"}',
         ):
             with self.assertRaises(validation.NoteError) as raised:
-                validation.validate_receipt(raw, 201, request)
+                validation.validate_receipt(candidate, 201, request)
             self.assertEqual(raised.exception.code, "invalid_ack")
         for code in ("invalid_note", "invalid_ack"):
             self.assertNotIn(code, validation.ERROR_CODES)
