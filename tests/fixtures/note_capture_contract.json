@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "scope_a": {
+    "schema_version": 1,
+    "subject_ref": "12345678-1234-abcd-ABCD-123456789abc",
+    "workspace_ref": "workspace_SyntheticA1",
+    "capability": "notes:write",
+    "endpoint_path": "/ingest/v1/notes",
+    "scope_path": "/ingest/v1/notes/scope"
+  },
+  "scope_b": {
+    "schema_version": 1,
+    "subject_ref": "87654321-4321-abcd-ABCD-cba987654321",
+    "workspace_ref": "workspace_SyntheticB2",
+    "capability": "notes:write",
+    "endpoint_path": "/ingest/v1/notes",
+    "scope_path": "/ingest/v1/notes/scope"
+  },
+  "rotation_scope": "scope_a"
+}

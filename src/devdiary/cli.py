@@ -6,6 +6,7 @@ import os
 import sys
 from importlib import resources
 from pathlib import Path
+from typing import NoReturn
 
 from devdiary import __version__, doctor, runner, spool
 from devdiary.config import (
@@ -21,6 +22,14 @@ from devdiary.config import (
     validate_registry,
     write_registry,
 )
+
+
+class _NotesArgumentsError(ValueError):
+    pass
+
+
+def _reject_notes_arguments(message: str) -> NoReturn:
+    raise _NotesArgumentsError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -99,6 +108,15 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--state-dir", type=Path, required=True)
         command.add_argument("--json", action="store_true")
 
+    notes = commands.add_parser(
+        "notes", help="configure a bound notes profile", allow_abbrev=False
+    )
+    notes.error = _reject_notes_arguments
+    notes_ops = notes.add_subparsers(dest="notes_operation", required=True)
+    configure = notes_ops.add_parser("configure", allow_abbrev=False)
+    configure.error = _reject_notes_arguments
+    configure.add_argument("--state-dir", required=True)
+
     observer = commands.add_parser(
         "observer", help="local-only stock Claude/Codex metadata observer (POSIX pilot)"
     )
@@ -170,7 +188,19 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(arguments: list[str] | None = None) -> int:
-    args = parser().parse_args(arguments)
+    command_parser = parser()
+    try:
+        args, remaining = command_parser.parse_known_args(arguments)
+    except _NotesArgumentsError:
+        print('{"error_code":"invalid_setup"}')
+        return 2
+    if remaining:
+        if args.command == "notes":
+            print('{"error_code":"invalid_setup"}')
+            return 2
+        command_parser.error("unrecognized arguments: " + " ".join(remaining))
+    if args.command == "notes":
+        return _notes(args)
     if args.command == "capture":
         return _capture(args)
     if args.command == "observer":
@@ -199,6 +229,36 @@ def main(arguments: list[str] | None = None) -> int:
         print(f"devdiary: {error}", file=sys.stderr)
         return 2
     return 2
+
+
+def _notes(args: argparse.Namespace) -> int:
+    from devdiary.note_validation import NoteError
+
+    try:
+        _configure_notes(args)
+        return 0
+    except NoteError as error:
+        print(json.dumps({"error_code": error.code}, separators=(",", ":")))
+        return 2
+
+
+def _configure_notes(args: argparse.Namespace) -> None:
+    from devdiary.note_validation import ERROR_CODES, NoteError
+
+    try:
+        from devdiary import notes
+
+        result = notes.configure(args.state_dir, sys.stdin.buffer)
+        print(json.dumps(result, separators=(",", ":")))
+    except Exception as error:
+        # This boundary must not expose input, paths, credentials or exception chains.
+        code = (
+            error.code
+            if isinstance(error, NoteError) and error.code in ERROR_CODES
+            else "configure_failed"
+        )
+        error = NoteError(code)
+        raise error from None
 
 
 def _observer(args: argparse.Namespace) -> int:
