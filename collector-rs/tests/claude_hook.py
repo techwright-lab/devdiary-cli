@@ -1740,12 +1740,25 @@ class HookLossTest(InstallationFixture, unittest.TestCase):
         )
         self.addCleanup(db.close)
         db.execute("BEGIN IMMEDIATE")
+        locked_at = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(1) as pool:
             running = pool.submit(self.hook, self.main)
-            time.sleep(0.6)
-            db.execute("COMMIT")
+            try:
+                # The process has 700 ms total, not the connection's 1400 ms.
+                # The longer storage wait is covered below the process deadline.
+                time.sleep(0.1)
+                completed_while_locked = running.done()
+            finally:
+                db.execute("COMMIT")
+            held_seconds = time.monotonic() - locked_at
             running.result()
-        self.assertEqual(len(self.rows()), 1, self.drops())
+        self.assertFalse(
+            completed_while_locked,
+            f"hook completed while writer lock was held for {held_seconds:.3f}s",
+        )
+        self.assertEqual(
+            len(self.rows()), 1, {"held_seconds": held_seconds, "drops": self.drops()}
+        )
         self.assertNotIn("busy", self.drops())
 
     def test_a_large_tool_result_is_still_a_row(self):
