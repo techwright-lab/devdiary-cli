@@ -46,6 +46,148 @@ class Response(io.BytesIO):
         return super().read(size)
 
 
+class NotePostTransportTest(unittest.TestCase):
+    def setUp(self):
+        if os.name != "posix":
+            self.skipTest("POSIX notes writes are unsupported")
+        self.request = {
+            "action": "create",
+            "operation_id": "op:post",
+            "note_ref": "ref:post",
+            "attributes": {"content": "SYNTHETIC_POST"},
+        }
+        self.raw = json.dumps(self.request, separators=(",", ":")).encode()
+        self.receipt = {
+            "operation_id": "op:post",
+            "note_ref": "ref:post",
+            "note_id": "note_post",
+            "revision": 1,
+            "outcome": "applied",
+        }
+
+    def call(self, response):
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(
+            transport.urllib.request, "build_opener", return_value=opener
+        ) as build:
+            result = transport.post_operation(
+                "https://example.test",
+                KEY,
+                self.raw,
+                scope()["subject_ref"],
+                scope()["workspace_ref"],
+            )
+        return result, opener, build
+
+    def test_exact_post_framing_and_resources(self):
+        response = Response(raw=json.dumps(self.receipt).encode(), status=201)
+        result, opener, build = self.call(response)
+        self.assertEqual(result, (self.receipt, 201))
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.data, self.raw)
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.full_url, "https://example.test/ingest/v1/notes")
+        headers = dict(request.header_items())
+        self.assertEqual(headers["Devdiary-notes-subject"], scope()["subject_ref"])
+        self.assertEqual(headers["Devdiary-notes-workspace"], scope()["workspace_ref"])
+        self.assertEqual(headers["Authorization"], "Bearer " + KEY)
+        self.assertEqual(opener.open.call_args.kwargs, {"timeout": 10})
+        self.assertTrue(
+            any(
+                isinstance(handler, transport.NoRedirectHandler)
+                for handler in build.call_args.args
+            )
+        )
+        self.assertEqual(response.read_sizes, [4097])
+        self.assertTrue(response.closed)
+
+    def test_error_body_read_stays_inside_total_wall_deadline(self):
+        class Slow(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                time.sleep(0.1)
+                return super().read(size)
+
+        error = urllib.error.HTTPError(
+            "https://example.test/private",
+            409,
+            "private",
+            Message(),
+            Slow(b'{"error":"binding_mismatch"}'),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with (
+            mock.patch.object(transport, "_WALL_SECONDS", 0.02),
+            mock.patch.object(
+                transport.urllib.request, "build_opener", return_value=opener
+            ),
+            self.assertRaises(transport.DeliveryError) as raised,
+        ):
+            transport.post_operation(
+                "https://example.test",
+                KEY,
+                self.raw,
+                scope()["subject_ref"],
+                scope()["workspace_ref"],
+            )
+        self.assertEqual(raised.exception.code, "network_failure")
+
+    def test_wrong_status_invalid_ack_and_http_classification(self):
+        for response in (
+            Response(raw=json.dumps(self.receipt).encode(), status=200),
+            Response(raw=b"{}", status=201),
+            Response(raw=b"x" * 4097, status=201),
+            Response(
+                raw=json.dumps(self.receipt).encode(), status=201, cache="private"
+            ),
+        ):
+            with self.assertRaises(transport.DeliveryError) as raised:
+                self.call(response)
+            self.assertEqual(raised.exception.code, "invalid_ack")
+            self.assertTrue(raised.exception.retryable)
+            self.assertTrue(response.closed)
+        for status, code, retryable in (
+            (401, "unauthorized", False),
+            (403, "forbidden", False),
+            (404, "not_found", False),
+            (409, "conflict", False),
+            (422, "invalid_request", False),
+            (429, "rate_limited", True),
+            (500, "delivery_failed", True),
+            (302, "delivery_failed", False),
+        ):
+            headers = Message()
+            headers["Retry-After"] = "31"
+            error = urllib.error.HTTPError(
+                "https://example.test/PRIVATE",
+                status,
+                "PRIVATE_REASON",
+                headers,
+                io.BytesIO(b'{"error":"conflict","private":"SECRET"}'),
+            )
+            opener = mock.Mock()
+            opener.open.side_effect = error
+            with (
+                mock.patch.object(
+                    transport.urllib.request, "build_opener", return_value=opener
+                ),
+                self.assertRaises(transport.DeliveryError) as raised,
+            ):
+                transport.post_operation(
+                    "https://example.test",
+                    KEY,
+                    self.raw,
+                    scope()["subject_ref"],
+                    scope()["workspace_ref"],
+                )
+            self.assertEqual(raised.exception.code, code)
+            self.assertEqual(raised.exception.retryable, retryable)
+            self.assertNotIn("PRIVATE", str(raised.exception))
+            if status == 429:
+                self.assertEqual(raised.exception.retry_after, -1)
+
+
 class NoteTransportTest(unittest.TestCase):
     def setUp(self):
         if os.name != "posix":

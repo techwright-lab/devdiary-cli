@@ -1,0 +1,21 @@
+{
+  "create": {
+    "action": "create",
+    "operation_id": "note-op:fixture-001",
+    "note_ref": "note-ref:fixture-001",
+    "context": "workspace",
+    "attributes": {
+      "content": "Synthetic design checkpoint.",
+      "next_step": "Try the bounded fixture.",
+      "source": "explicit-note-v1",
+      "recorded_at": "2026-11-05T12:47:22Z"
+    },
+    "references": [{"kind": "document", "ref": "vault:products/devdiary/docs/plans/synthetic.md", "relation": "context"}]
+  },
+  "create_receipt": {"operation_id": "note-op:fixture-001", "note_ref": "note-ref:fixture-001", "note_id": "note_fixture001", "revision": 1, "outcome": "applied"},
+  "update": {"action": "update", "operation_id": "note-op:fixture-002", "note_ref": "note-ref:fixture-001", "expected_revision": 1, "attributes": {"content": "Synthetic correction."}, "references": []},
+  "update_receipt": {"operation_id": "note-op:fixture-002", "note_ref": "note-ref:fixture-001", "note_id": "note_fixture001", "revision": 2, "outcome": "applied"},
+  "delete": {"action": "delete", "operation_id": "note-op:fixture-003", "note_ref": "note-ref:fixture-001", "expected_revision": 2},
+  "delete_receipt": {"operation_id": "note-op:fixture-003", "note_ref": "note-ref:fixture-001", "note_id": "note_fixture001", "revision": 3, "outcome": "deleted"},
+  "old_create_deleted_receipt": {"operation_id": "note-op:fixture-001", "note_ref": "note-ref:fixture-001", "note_id": "note_fixture001", "revision": 3, "outcome": "deleted"}
+}

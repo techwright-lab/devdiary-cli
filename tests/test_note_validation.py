@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import unittest
+from http.client import HTTPResponse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -251,6 +252,326 @@ class NoteValidationTest(unittest.TestCase):
             ),
             "binding_mismatch",
         )
+
+
+class NoteWriteValidationTest(unittest.TestCase):
+    def rejects(self, action, code="invalid_note"):
+        with self.assertRaises(validation.NoteError) as raised:
+            action()
+        self.assertEqual(str(raised.exception), code)
+        self.assertIsNone(raised.exception.__cause__)
+
+    def fixture(self, name):
+        path = FIXTURE.with_name("note_outbox_contract.json")
+        return json.loads(path.read_bytes())[name]
+
+    def test_literal_create_and_receipt(self):
+        request = self.fixture("create")
+        self.assertEqual(validation.validate_write(request), request)
+        receipt = self.fixture("create_receipt")
+        self.assertEqual(
+            validation.validate_receipt(
+                validation.encode_object(receipt), 201, request
+            ),
+            receipt,
+        )
+
+    def test_action_absence_types_and_literal_receipts(self):
+        for action, status in (("create", 201), ("update", 200), ("delete", 200)):
+            request = self.fixture(action)
+            self.assertEqual(validation.validate_write(request), request)
+            receipt = self.fixture(action + "_receipt")
+            self.assertEqual(
+                validation.validate_receipt(
+                    validation.encode_object(receipt), status, request
+                ),
+                receipt,
+            )
+        create = self.fixture("create")
+        for revision in (None, True, 0, 1, 1.0, "1"):
+            self.rejects(
+                lambda revision=revision: validation.validate_write(
+                    {**create, "expected_revision": revision}
+                )
+            )
+        for action in ("update", "delete"):
+            request = self.fixture(action)
+            for revision in (None, True, False, 0, -1, 1.0, "1"):
+                self.rejects(
+                    lambda revision=revision, request=request: (
+                        validation.validate_write(
+                            {**request, "expected_revision": revision}
+                        )
+                    )
+                )
+            missing = dict(request)
+            del missing["expected_revision"]
+            self.rejects(lambda missing=missing: validation.validate_write(missing))
+            for context in (None, "workspace"):
+                self.rejects(
+                    lambda context=context, request=request: validation.validate_write(
+                        {**request, "context": context}
+                    )
+                )
+        for field in ("recorded_at", "actor_ref", "owner", "source"):
+            self.rejects(
+                lambda field=field: validation.validate_write({**create, field: "x"})
+            )
+        for context in (None, {}, True, "other"):
+            self.rejects(
+                lambda context=context: validation.validate_write(
+                    {**create, "context": context}
+                )
+            )
+        for action in ("update", "delete"):
+            self.rejects(
+                lambda action=action: validation.validate_write(
+                    {**self.fixture(action), "attributes": {"recorded_at": None}}
+                )
+            )
+        self.rejects(
+            lambda: validation.validate_write(
+                {**self.fixture("delete"), "references": []}
+            )
+        )
+
+    def test_receipt_exact_types_status_mapping_and_terminal_dominance(self):
+        request = self.fixture("create")
+        receipt = self.fixture("create_receipt")
+        for field in receipt:
+            incomplete = dict(receipt)
+            del incomplete[field]
+            self.rejects(
+                lambda incomplete=incomplete: validation.validate_receipt(
+                    validation.encode_object(incomplete), 201, request
+                ),
+                "invalid_ack",
+            )
+        changes = {
+            "operation_id": [None, True, "different"],
+            "note_ref": [None, 1, "different"],
+            "note_id": [None, True, "note_", "note_é", "note_a b", "note_a\n"],
+            "revision": [True, 1.0, "1", None, 0, -1, 2],
+            "outcome": [None, {}, "other", "replayed", "deleted"],
+            "content": ["PRIVATE_SENTINEL"],
+        }
+        for field, values in changes.items():
+            for value in values:
+                self.rejects(
+                    lambda field=field, value=value: validation.validate_receipt(
+                        validation.encode_object({**receipt, field: value}),
+                        201,
+                        request,
+                    ),
+                    "invalid_ack",
+                )
+        for status in (200, 202, 204, 301, 409, True):
+            self.rejects(
+                lambda status=status: validation.validate_receipt(
+                    validation.encode_object(receipt), status, request
+                ),
+                "invalid_ack",
+            )
+        response: HTTPResponse = mock.create_autospec(HTTPResponse, instance=True)
+        response.status = 201
+        with mock.patch.object(response, "status", 201.0):
+            self.assertIs(type(response.status), float)
+            self.assertEqual(response.status, 201.0)
+            with self.assertRaises(validation.NoteError) as raised:
+                validation.validate_receipt(
+                    validation.encode_object(receipt), response.status, request
+                )
+            self.assertEqual(raised.exception.code, "invalid_ack")
+            self.assertEqual(str(raised.exception), "invalid_ack")
+            self.assertIsNone(raised.exception.__cause__)
+        self.rejects(
+            lambda: validation.validate_receipt(
+                validation.encode_object(receipt), 201, request, "note_different"
+            ),
+            "invalid_ack",
+        )
+        for action in ("create", "update"):
+            request = self.fixture(action)
+            replay = {**self.fixture(action + "_receipt"), "outcome": "replayed"}
+            self.assertEqual(
+                validation.validate_receipt(
+                    validation.encode_object(replay), 200, request
+                ),
+                replay,
+            )
+        stale_delete = {**self.fixture("delete"), "expected_revision": 20}
+        for request in (self.fixture("create"), self.fixture("update"), stale_delete):
+            deleted = {
+                **self.fixture("delete_receipt"),
+                "operation_id": request["operation_id"],
+            }
+            self.assertEqual(
+                validation.validate_receipt(
+                    validation.encode_object(deleted), 200, request
+                ),
+                deleted,
+            )
+        for outcome in ("applied", "replayed"):
+            self.rejects(
+                lambda outcome=outcome: validation.validate_receipt(
+                    validation.encode_object(
+                        {**self.fixture("delete_receipt"), "outcome": outcome}
+                    ),
+                    200,
+                    self.fixture("delete"),
+                ),
+                "invalid_ack",
+            )
+        for revision in (1, 3):
+            self.rejects(
+                lambda revision=revision: validation.validate_receipt(
+                    validation.encode_object(
+                        {**self.fixture("update_receipt"), "revision": revision}
+                    ),
+                    200,
+                    self.fixture("update"),
+                ),
+                "invalid_ack",
+            )
+
+
+class NoteWriteBoundaryTest(unittest.TestCase):
+    def request(self):
+        return {
+            "action": "create",
+            "operation_id": "op:1",
+            "note_ref": "ref:1",
+            "attributes": {"content": "synthetic"},
+        }
+
+    def rejects(self, value):
+        with self.assertRaises(validation.NoteError) as raised:
+            validation.validate_write(value)
+        self.assertEqual(raised.exception.code, "invalid_note")
+
+    def test_character_timestamp_and_reference_boundaries(self):
+        base = self.request()
+        for field, limit in (("content", 16384), ("next_step", 4096), ("source", 200)):
+            attrs = {**base["attributes"], field: "é" * limit}
+            self.assertEqual(
+                validation.validate_write({**base, "attributes": attrs})["attributes"],
+                attrs,
+            )
+            self.rejects({**base, "attributes": {**attrs, field: "é" * (limit + 1)}})
+        for time in (None, "2026-11-05T12:47:22Z", "2026-11-05T12:47:22.123+05:30"):
+            value = {**base, "attributes": {**base["attributes"], "occurred_at": time}}
+            self.assertEqual(validation.validate_write(value), value)
+        for time in ("2026-11-05T12:47:22", "2026-99-05T12:47:22Z", True, {}, "xZ"):
+            self.rejects(
+                {**base, "attributes": {**base["attributes"], "occurred_at": time}}
+            )
+        ref = {"kind": "document", "ref": "vault:a/b.md"}
+        for refs in ([], [ref], [ref] * 32):
+            value = {**base, "references": refs}
+            self.assertEqual(validation.validate_write(value), value)
+        for refs in (None, [None], [ref, None], {}, "x", [ref] * 33):
+            self.rejects({**base, "references": refs})
+        for ref in (
+            {"kind": "note", "ref": "note_abc", "relation": "supersedes"},
+            {"kind": "document", "ref": "vault:é/😀.md"},
+            {"kind": "external", "ref": "https://example.test/a?q=ok"},
+            {"kind": "external", "ref": "urn:example:abc"},
+            {"kind": "run", "ref": "a-b_1"},
+        ):
+            self.assertEqual(
+                validation.validate_write({**base, "references": [ref]})["references"],
+                [ref],
+            )
+        for ref in (
+            {"kind": "note", "ref": "a b"},
+            {"kind": "note", "ref": "x", "relation": None},
+            {"kind": "work", "ref": "x", "relation": "supersedes"},
+            {"kind": "document", "ref": "vault:../x"},
+            {"kind": "document", "ref": "/x"},
+            {"kind": "document", "ref": "a//b"},
+            {"kind": "document", "ref": "a%20b"},
+            {"kind": "external", "ref": "https://user:pass@example.test"},
+            {"kind": "external", "ref": "https://example.test/?%74oken=x"},
+            {"kind": "external", "ref": "https://example.test/#api_key=x"},
+            {"kind": "external", "ref": "file:///x"},
+            {"kind": "external", "ref": "javascript:x"},
+            {"kind": "external", "ref": "https://"},
+            {"kind": "external", "ref": "https://é.test"},
+            {"kind": "document", "ref": "x" * 2049},
+            {"kind": "document", "ref": "x", "owner": "x"},
+        ):
+            self.rejects({**base, "references": [ref]})
+
+    def test_final_wire_budget_and_strict_bounded_reader(self):
+        value = {
+            **self.request(),
+            "references": [{"kind": "document", "ref": "😀" * 2048} for _ in range(32)],
+        }
+        self.rejects(value)
+        value["references"][-1]["ref"] = ""
+        remaining = 262144 - len(validation.encode_object(value))
+        value["references"][-1]["ref"] = "😀" * (remaining // 4) + "x" * (remaining % 4)
+        raw = validation.freeze_write(value)
+        self.assertEqual(len(raw), 262144)
+        self.assertEqual(validation.read_write(io.BytesIO(raw)), value)
+        value["references"][-1]["ref"] += "x"
+        self.rejects(value)
+        for raw in (
+            b"\xff",
+            b"{} {}",
+            b"[]",
+            b'{"a":NaN}',
+            b'{"a":1e999}',
+            b'{"a":"\\ud800"}',
+            b'{"a":1,"a":2}',
+            b'{"a":' * 9 + b"0" + b"}" * 9,
+            b"\xef\xbb\xbf{}",
+            b" " * 262145,
+        ):
+            with self.assertRaises(validation.NoteError):
+                validation.read_write(io.BytesIO(raw))
+
+        class Stream(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                if size != 262145:
+                    raise AssertionError("bounded read required")
+                return super().read(size)
+
+        self.assertEqual(
+            validation.read_write(Stream(validation.encode_object(self.request()))),
+            self.request(),
+        )
+        with (
+            mock.patch.object(Stream, "read", return_value="not binary"),
+            self.assertRaises(validation.NoteError),
+        ):
+            validation.read_write(Stream())
+
+    def test_receipt_budget_duplicates_and_new_codes_stay_outside_configure(self):
+        request = self.request()
+        receipt = {
+            "operation_id": "op:1",
+            "note_ref": "ref:1",
+            "note_id": "note_x",
+            "revision": 1,
+            "outcome": "applied",
+        }
+        raw = validation.encode_object(receipt)
+        self.assertEqual(
+            validation.validate_receipt(raw + b" " * (4096 - len(raw)), 201, request),
+            receipt,
+        )
+        for candidate in (
+            raw + b" " * (4097 - len(raw)),
+            b'{"a":1,"a":2}',
+            b'{"a":"\\ud800"}',
+        ):
+            with self.assertRaises(validation.NoteError) as raised:
+                validation.validate_receipt(candidate, 201, request)
+            self.assertEqual(raised.exception.code, "invalid_ack")
+        for code in ("invalid_note", "invalid_ack"):
+            self.assertNotIn(code, validation.ERROR_CODES)
+            self.assertEqual(validation.NoteError(code).code, code)
 
 
 class NoteQualificationTest(unittest.TestCase):
