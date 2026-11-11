@@ -1018,7 +1018,10 @@ mod tests {
                 Err(error) => panic!("writer disconnected: {error}"),
             };
             writer.join().unwrap();
-            assert!(waited, "writer returned before the held transaction released");
+            assert!(
+                waited,
+                "writer returned before the held transaction released"
+            );
             assert!(result.is_ok(), "writer failed after release: {result:?}");
         });
     }
