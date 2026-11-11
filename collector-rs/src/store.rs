@@ -159,8 +159,8 @@ fn state_entry(path: &Path, transient: bool) -> Result<()> {
         Err(e) => Err(e),
     }
 }
-// Full fsync on a journaled spool makes parallel hooks queue. A row given up on is
-// lost for good, so wait most of the hook's 2 second budget.
+// Full fsync on a journaled spool makes parallel writers queue. This connection
+// timeout does not extend a hook process's separate 700 ms whole-process deadline.
 const BUSY_WAIT: Duration = Duration::from_millis(1400);
 fn connect(path: &Path, page_limit: bool) -> Result<Connection> {
     let db = Connection::open(path)?;
@@ -987,6 +987,44 @@ mod tests {
         }
     }
     const MARK: Mark = Mark { offset: 7, ino: 9 };
+
+    #[test]
+    fn a_connection_waits_out_a_six_hundred_millisecond_write_lock() {
+        use std::sync::mpsc;
+
+        let (dir, store) = store();
+        let holder = Connection::open(dir.path().join("state").join(DB)).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = store
+                    .db
+                    .execute_batch("BEGIN IMMEDIATE; COMMIT;")
+                    .map_err(|error| error.to_string());
+                finished_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let while_locked = finished_rx.recv_timeout(Duration::from_millis(600));
+            holder.execute_batch("COMMIT").unwrap();
+            let waited = matches!(&while_locked, Err(mpsc::RecvTimeoutError::Timeout));
+            let result = match while_locked {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    finished_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+                }
+                Err(error) => panic!("writer disconnected: {error}"),
+            };
+            writer.join().unwrap();
+            assert!(
+                waited,
+                "writer returned before the held transaction released"
+            );
+            assert!(result.is_ok(), "writer failed after release: {result:?}");
+        });
+    }
 
     #[test]
     fn a_closed_bracket_returns_its_mark_once() {
