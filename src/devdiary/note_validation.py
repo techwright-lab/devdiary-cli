@@ -47,6 +47,7 @@ ERROR_CODES = frozenset(
 OUTBOX_ERROR_CODES = frozenset(
     {
         "invalid_note",
+        "invalid_import",
         "invalid_ack",
         "store_failed",
         "store_corrupt",

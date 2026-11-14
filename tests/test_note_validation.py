@@ -573,6 +573,14 @@ class NoteWriteBoundaryTest(unittest.TestCase):
             self.assertNotIn(code, validation.ERROR_CODES)
             self.assertEqual(validation.NoteError(code).code, code)
 
+    def test_import_error_is_bounded_and_stays_outside_configure(self):
+        error = validation.NoteError("invalid_import")
+        self.assertEqual(error.code, "invalid_import")
+        self.assertEqual(str(error), "invalid_import")
+        self.assertIsNone(error.__cause__)
+        self.assertIn("invalid_import", validation.OUTBOX_ERROR_CODES)
+        self.assertNotIn("invalid_import", validation.ERROR_CODES)
+
 
 class NoteQualificationTest(unittest.TestCase):
     def setUp(self):
