@@ -28,7 +28,7 @@ class ClaudeHookTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.exe = self.root / "collector ' quoted"
-        shutil.copyfile(ROOT / "target/debug/devdiary-collector", self.exe)
+        shutil.copyfile(ROOT / "target/debug/devdiary", self.exe)
         self.exe.chmod(0o700)
         self.state = self.root / "state"
         self.state.mkdir(mode=0o700)
@@ -78,7 +78,7 @@ class ClaudeHookTest(unittest.TestCase):
 
     def hook(self, data=None, raw=None, plan=None):
         result = subprocess.run(
-            [str(self.exe), "claude-hook", str(plan or self.plan)],
+            [str(self.exe), "hook", "claude", str(plan or self.plan)],
             input=raw
             if raw is not None
             else json.dumps(data if data is not None else self.raw).encode(),
@@ -499,7 +499,7 @@ class ClaudeHookTest(unittest.TestCase):
     def test_open_stdin_deadline_and_locked_spool(self):
         start = time.monotonic()
         process = subprocess.Popen(
-            [str(self.exe), "claude-hook", str(self.plan)],
+            [str(self.exe), "hook", "claude", str(self.plan)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -739,7 +739,7 @@ class ClaudeHookTest(unittest.TestCase):
         self.hook()
         before = fingerprint.read_bytes()
         replacement = self.root / "replacement"
-        shutil.copyfile(ROOT / "target/debug/devdiary-collector", replacement)
+        shutil.copyfile(ROOT / "target/debug/devdiary", replacement)
         replacement.chmod(0o700)
         os.replace(replacement, self.exe)
         self.hook(dict(self.raw, tool_use_id="after-replace"))
@@ -883,7 +883,7 @@ class InstallationFixture:
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.exe = self.root / "collector"
-        shutil.copyfile(ROOT / "target/debug/devdiary-collector", self.exe)
+        shutil.copyfile(ROOT / "target/debug/devdiary", self.exe)
         self.exe.chmod(0o700)
         self.main = self.repo("main", "git@github.com:acme/demo.git")
         self.refs = ["https://github.com/acme/demo"]
@@ -1051,7 +1051,7 @@ class InstallationFixture:
             "tool_input": {"command": "PRIVATE_SENTINEL"},
         }
         result = self.run_collector(
-            "claude-hook",
+            "hook", "claude",
             self.plan,
             data=json.dumps(event).encode(),
             env=self.env(**env),
@@ -1202,7 +1202,7 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
                 "waiting_for_approval": True,
                 "refused": 0,
                 "notice": "Runs of paperclip stay unknown until approved. "
-                "In a terminal run: devdiary-collector orchestrators approve",
+                "In a terminal run: devdiary orchestrators approve",
             },
         )
 
@@ -1546,7 +1546,7 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.assertEqual(marks, 0)
 
     def test_out_of_scope_hook_p99_on_the_release_build(self):
-        release = ROOT / "target/release/devdiary-collector"
+        release = ROOT / "target/release/devdiary"
         if not release.exists():
             self.skipTest("cargo build --release first")
         exe = self.root / "release-collector"
@@ -1772,7 +1772,7 @@ class HookLossTest(InstallationFixture, unittest.TestCase):
             "tool_response": "x" * (6 * 1024 * 1024),
         }
         self.run_collector(
-            "claude-hook",
+            "hook", "claude",
             self.plan,
             data=json.dumps(event).encode(),
             env=self.env(),
@@ -1781,7 +1781,7 @@ class HookLossTest(InstallationFixture, unittest.TestCase):
 
     def test_each_kind_of_bad_input_has_its_own_count(self):
         self.connect()
-        self.run_collector("claude-hook", self.plan, data=b"{", env=self.env())
+        self.run_collector("hook", "claude", self.plan, data=b"{", env=self.env())
         self.assertIn("invalid_json", self.drops())
 
 
@@ -1928,7 +1928,7 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
         if event["hook_event_name"] != "SessionEnd":
             event["prompt_id"] = f"{session}-prompt"
         result = self.run_collector(
-            "claude-hook", self.plan, data=json.dumps(event).encode(), env=self.env()
+            "hook", "claude", self.plan, data=json.dumps(event).encode(), env=self.env()
         )
         self.assertEqual((result.stdout, result.stderr), (b"", b""))
 

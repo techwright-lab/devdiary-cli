@@ -7,7 +7,7 @@
 
 ## Why
 
-Paperclip starts new Claude agent sessions through `acpx`, with `--setting-sources=project,local`. That leaves out user settings, and `devdiary-collector install` writes its hooks to user settings, `~/.claude/settings.json`. So those sessions never run the hooks.
+Paperclip starts new Claude agent sessions through `acpx`, with `--setting-sources=project,local`. That leaves out user settings, and `devdiary setup` writes its hooks to user settings, `~/.claude/settings.json`. So those sessions never run the hooks.
 
 Resumed sessions do load user settings. A partly working install can therefore show a few agent rows and hide the gap.
 
@@ -16,7 +16,7 @@ Resumed sessions do load user settings. A partly working install can therefore s
 1. Install the collector, if you have not:
 
    ```sh
-   devdiary-collector install --settings ~/.claude/settings.json --record-orchestrated-outside-repos
+   devdiary setup --settings ~/.claude/settings.json --record-orchestrated-outside-repos
    ```
 
 2. In DevDiary, open Settings, Collector, Control planes, and turn on Paperclip.
@@ -24,7 +24,7 @@ Resumed sessions do load user settings. A partly working install can therefore s
 3. Approve the environment names:
 
    ```sh
-   devdiary-collector orchestrators approve
+   devdiary orchestrators approve
    ```
 
 4. Add the setting. With a systemd user service:
@@ -67,8 +67,8 @@ Then open Settings, Collector in DevDiary. The Paperclip row warns when it is on
 ## If rows still do not arrive
 
 - **Agents work in a folder outside any repository:** install with `--record-orchestrated-outside-repos`.
-- **Rows stay `unknown`:** run `devdiary-collector orchestrators approve`.
-- **Drops rise:** run `devdiary-collector doctor` and read `drops`.
+- **Rows stay `unknown`:** run `devdiary orchestrators approve`.
+- **Drops rise:** run `devdiary doctor` and read `drops`.
 
 ## Not covered
 

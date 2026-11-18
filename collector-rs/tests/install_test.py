@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CRATE = Path(__file__).resolve().parents[1]
-BIN = CRATE / "target/debug/devdiary-collector"
+BIN = CRATE / "target/debug/devdiary"
 VERSION = tomllib.loads((CRATE / "Cargo.toml").read_text())["package"]["version"]
 EVENTS = [
     "SessionStart",
@@ -84,7 +84,8 @@ class InstallTest(unittest.TestCase):
         ).encode()
         self.settings.write_bytes(self.original)
         self.settings.chmod(0o644)
-        self.data = self.home / ".local/share/devdiary/collector"
+        self.data = self.home / ".local/share/devdiary/cli/claude"
+        self.codex_data = self.home / ".local/share/devdiary/cli/codex"
         self.runtime = "claude-code"
         self.requested_runtime = None
         self.received_raw = []
@@ -195,7 +196,7 @@ class InstallTest(unittest.TestCase):
     def install_args(self, *extra):
         return [
             str(BIN),
-            "install",
+            "setup",
             "--origin",
             self.origin,
             "--trust-origin",
@@ -300,7 +301,7 @@ class InstallTest(unittest.TestCase):
     def test_codex_installs_alongside_claude_without_replacing_it(self):
         self.install("--yes")
         claude_settings = self.settings.read_bytes()
-        claude_service = self.config / "systemd/user/devdiary-collector-sync.service"
+        claude_service = self.config / "systemd/user/devdiary-claude-sync.service"
         original_service = claude_service.read_bytes()
         self.runtime = "codex"
         settings = self.home / ".codex/hooks.json"
@@ -316,10 +317,10 @@ class InstallTest(unittest.TestCase):
         self.assertIn("Interrupt", hooks)
         self.assertIn("PermissionRequest", hooks)
         self.assertNotIn("PostToolUseFailure", hooks)
-        self.assertIn(" codex-hook ", hooks["Interrupt"][0]["hooks"][0]["command"])
-        self.assertTrue((self.data / "codex/install.json").is_file())
+        self.assertIn(" hook codex ", hooks["Interrupt"][0]["hooks"][0]["command"])
+        self.assertTrue((self.codex_data / "install.json").is_file())
         self.assertTrue(
-            (self.config / "systemd/user/devdiary-collector-codex-sync.timer").is_file()
+            (self.config / "systemd/user/devdiary-codex-sync.timer").is_file()
         )
 
     def systemctl_log(self):
@@ -336,7 +337,7 @@ class InstallTest(unittest.TestCase):
     def record(self):
         return json.loads((self.data / "install.json").read_text())
 
-    def spool(self, count):
+    def spool(self, count, vendor="claude"):
         repo = self.root / "demo"
         if not repo.exists():
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -361,7 +362,7 @@ class InstallTest(unittest.TestCase):
                 "cwd": str(repo),
             }
             subprocess.run(
-                [record["executable"], "claude-hook", record["plan"]],
+                [record["executable"], "hook", vendor, record["plan"]],
                 input=json.dumps(event).encode(),
                 env=self.env(),
                 timeout=10,
@@ -398,7 +399,7 @@ class InstallTest(unittest.TestCase):
 
     def timer_sync(self):
         self.run_collector(
-            "timer-sync", self.data / "connection", exe=self.record()["executable"]
+            "sync", self.data / "connection", exe=self.record()["executable"]
         )
         return json.loads(self.run_collector("doctor").stdout)
 
@@ -408,35 +409,35 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(doc["hooks"]["UserPromptSubmit"][0], CODEGRAPH)
         entries = self.owned_entries()
         self.assertEqual(sum(len(v) for v in entries.values()), len(EVENTS))
-        exe = self.data / VERSION / "devdiary-collector"
+        exe = self.data / VERSION / "devdiary"
         for (entry,) in entries.values():
-            self.assertIn(f"'{exe}' claude-hook ", entry["hooks"][0]["command"])
+            self.assertIn(f"'{exe}' hook claude ", entry["hooks"][0]["command"])
         self.assertEqual(exe.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(out.count(" claude-hook "), len(EVENTS))
+        self.assertEqual(out.count(" hook claude "), len(EVENTS))
         self.assertIn("Self-test passed", out)
         self.assertEqual(
             self.systemctl_log(),
             [
                 "--user daemon-reload",
-                "--user enable --now devdiary-collector-sync.timer",
+                "--user enable --now devdiary-claude-sync.timer",
             ],
         )
 
     def test_unit_files_snapshot(self):
         self.install("--yes")
         units = self.config / "systemd/user"
-        exe = self.data / VERSION / "devdiary-collector"
+        exe = self.data / VERSION / "devdiary"
         self.assertEqual(
-            (units / "devdiary-collector-sync.service").read_text(),
+            (units / "devdiary-claude-sync.service").read_text(),
             "[Unit]\nDescription=DevDiary collector sync\n\n[Service]\nType=oneshot\n"
             "Nice=10\nNoNewPrivileges=true\n"
-            f'ExecStart="{exe}" timer-sync "{self.data / "connection"}"\n',
+            f'ExecStart="{exe}" sync "{self.data / "connection"}"\n',
         )
         self.assertEqual(
-            (units / "devdiary-collector-sync.timer").read_text(),
+            (units / "devdiary-claude-sync.timer").read_text(),
             "[Unit]\nDescription=DevDiary collector sync every 2 minutes\n\n[Timer]\n"
             "OnActiveSec=30s\nOnUnitActiveSec=2min\nRandomizedDelaySec=30\nPersistent=true\n"
-            "Unit=devdiary-collector-sync.service\n\n[Install]\nWantedBy=timers.target\n",
+            "Unit=devdiary-claude-sync.service\n\n[Install]\nWantedBy=timers.target\n",
         )
 
     def test_self_test_row_is_never_selected_by_sync(self):
@@ -446,8 +447,8 @@ class InstallTest(unittest.TestCase):
             (selftests,) = db.execute("SELECT count(*) FROM self_test").fetchone()
             (pending,) = db.execute("SELECT count(*) FROM outbox").fetchone()
         self.assertEqual((selftests, pending), (1, 0))
-        exe = self.data / VERSION / "devdiary-collector"
-        self.run_collector("timer-sync", self.data / "connection", exe=exe)
+        exe = self.data / VERSION / "devdiary"
+        self.run_collector("sync", self.data / "connection", exe=exe)
         self.run_collector("connection-sync", self.data / "connection", "100")
         self.assertEqual(self.received, [])
         with sqlite3.connect(outbox) as db:
@@ -464,12 +465,12 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(
             self.systemctl_log()[2:],
             [
-                "--user disable --now devdiary-collector-sync.timer",
+                "--user disable --now devdiary-claude-sync.timer",
                 "--user daemon-reload",
             ],
         )
         self.assertFalse(
-            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
         )
         log = self.systemctl_log()
         self.run_collector("uninstall")
@@ -500,7 +501,7 @@ class InstallTest(unittest.TestCase):
         )
         self.assertEqual(
             self.systemctl_log()[-1],
-            "--user enable --now devdiary-collector-sync.timer",
+            "--user enable --now devdiary-claude-sync.timer",
         )
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
@@ -528,7 +529,7 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn(b"Hooks are registered", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse(
-            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
         )
         self.assertFalse((self.data / "install.json").exists())
         self.assertIn(b"Not installed", self.run_collector("uninstall").stdout)
@@ -632,10 +633,10 @@ class InstallTest(unittest.TestCase):
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertIn(
-            "--user disable --now devdiary-collector-sync.timer", self.systemctl_log()
+            "--user disable --now devdiary-claude-sync.timer", self.systemctl_log()
         )
         self.assertFalse(
-            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
         )
 
     def test_uninstall_without_a_record_still_disables_leftover_units(self):
@@ -643,13 +644,13 @@ class InstallTest(unittest.TestCase):
         (self.data / "install.json").unlink()
         self.run_collector("uninstall")
         self.assertIn(
-            "--user disable --now devdiary-collector-sync.timer", self.systemctl_log()
+            "--user disable --now devdiary-claude-sync.timer", self.systemctl_log()
         )
         self.assertFalse(
-            (self.config / "systemd/user/devdiary-collector-sync.timer").exists()
+            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
         )
         self.assertFalse(
-            (self.config / "systemd/user/devdiary-collector-sync.service").exists()
+            (self.config / "systemd/user/devdiary-claude-sync.service").exists()
         )
 
     def test_install_without_a_settings_file_says_so(self):
@@ -678,6 +679,60 @@ class InstallTest(unittest.TestCase):
         result = self.install("--yes", code=2)
         self.assertIn(b"python_observer_registered", result.stderr)
         self.assertFalse(self.data.exists())
+
+    def test_old_collector_hooks_refuse_before_pairing(self):
+        old = b"'/home/u/.local/share/devdiary/collector/0.4.0/devdiary-collector' claude-hook '/home/u/plan.json' >/dev/null 2>&1 || :"
+        self.settings.write_bytes(
+            self.original.replace(b"codegraph hook prompt", old)
+        )
+        result = self.install("--yes", code=2)
+        self.assertIn(b"old_collector_registered", result.stderr)
+        self.assertIn(b"devdiary-collector uninstall", result.stderr)
+        self.assertFalse(hasattr(self, "installation"))
+        self.assertFalse(self.data.exists())
+
+    def setup_with_path(self, *dirs):
+        path = os.pathsep.join([*map(str, dirs), os.environ["PATH"]])
+        return subprocess.run(
+            self.install_args("--yes"),
+            env={**self.env(), "PATH": path},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=40,
+            check=False,
+        )
+
+    def test_setup_warns_when_another_devdiary_comes_first_on_path(self):
+        other = self.root / "other-bin"
+        other.mkdir()
+        (other / "devdiary").write_text("#!/bin/sh\n")
+        (other / "devdiary").chmod(0o755)
+        result = self.setup_with_path(other)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(other / "devdiary").encode(), result.stderr)
+        self.assertTrue((self.data / "install.json").is_file())
+
+    def test_setup_does_not_warn_when_it_is_first_on_path(self):
+        result = self.setup_with_path(BIN.parent)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(b"PATH", result.stderr)
+
+    def test_sync_sends_every_installed_harness_now(self):
+        self.install("--yes")
+        self.spool(2)
+        self.runtime = "codex"
+        self.install("--yes", "--vendor", "codex")
+        claude, self.data = self.data, self.codex_data
+        self.spool(1, vendor="codex")
+        self.data = claude
+        self.run_collector("sync")
+        self.assertEqual(len(self.received), 3)
+        self.assertEqual(self.pending(), 0)
+
+    def test_sync_with_nothing_installed_sends_nothing(self):
+        out = self.run_collector("sync").stdout
+        self.assertIn(b"Not installed", out)
+        self.assertEqual(self.received, [])
 
     def test_timer_sync_delivers_pending_rows_but_never_the_self_test(self):
         self.install("--yes")
@@ -729,7 +784,7 @@ class InstallTest(unittest.TestCase):
             "cwd": str(self.root / "demo"),
         }
         subprocess.run(
-            [record["executable"], "claude-hook", record["plan"]],
+            [record["executable"], "hook", "claude", record["plan"]],
             input=json.dumps(event).encode(),
             env=self.env(),
             timeout=10,
@@ -1002,7 +1057,7 @@ class InstallTest(unittest.TestCase):
         )
         self.assertEqual(
             self.systemctl_log()[-1],
-            "--user enable --now devdiary-collector-sync.timer",
+            "--user enable --now devdiary-claude-sync.timer",
         )
 
     def test_upgrade_shows_the_new_entries_before_asking(self):
@@ -1012,7 +1067,7 @@ class InstallTest(unittest.TestCase):
         code, err = self.interactive(b"n\n", args=[str(BIN), "upgrade"])
         self.assertEqual(code, 2)
         self.assertIn(b"consent_declined", err)
-        self.assertEqual(self.seen.count(b" claude-hook "), len(EVENTS))
+        self.assertEqual(self.seen.count(b" hook claude "), len(EVENTS))
         self.assertEqual(self.settings.read_bytes(), before)
         self.assertEqual(self.systemctl_log(), log)
 
@@ -1040,7 +1095,7 @@ class InstallTest(unittest.TestCase):
         log = self.systemctl_log()
         result = self.install("--yes", code=2)
         self.assertIn(b"connection_revoked", result.stderr)
-        self.assertIn(b"install --new-pair", result.stderr)
+        self.assertIn(b"setup --new-pair", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse((self.data / "install.json").exists())
         self.assertEqual(self.systemctl_log(), log)

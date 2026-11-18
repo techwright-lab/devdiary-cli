@@ -186,7 +186,7 @@ begin
   agent = SecureRandom.uuid
   [[{"PAPERCLIP_AGENT_ID" => agent, "PAPERCLIP_API_KEY" => "SENTINELSECRET"}, "PostToolUse"], [{}, "SessionStart"]].each do |env, event|
     hook_input = JSON.generate({hook_event_name: event, session_id: "fixture-installation", cwd: repository, tool_use_id: "toolu_fixture", tool_name: "Bash"})
-    out, err, status = Open3.capture3(env, exe, "claude-hook", hook_plan, stdin_data: hook_input)
+    out, err, status = Open3.capture3(env, exe, "hook", "claude", hook_plan, stdin_data: hook_input)
     raise "hook not silent" unless status.success? && out.empty? && err.empty?
   end
   sent = state[:requests].size
