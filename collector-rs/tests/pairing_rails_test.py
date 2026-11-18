@@ -368,7 +368,7 @@ class InstallationPairingTest(unittest.TestCase):
 
     def test_setup_without_repository_pairs_installation_scope(self):
         out = self.setup_collector("--record-orchestrated-outside-repos").stdout
-        self.assertIn(b"All active repositories", out)
+        self.assertIn(b"All tracked repositories", out)
         (start,) = self.starts
         self.assertEqual(start["scope_kind"], "installation")
         self.assertEqual(
