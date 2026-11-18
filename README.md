@@ -13,7 +13,7 @@ envelope.
 The CLI also exposes a durable, JSON-stdin `capture begin|finish|status|retry`
 boundary for orchestrators and runtime-independent attesters. See the
 [portable capture protocol](../_vault/products/devdiary/docs/contracts/portable-capture-protocol.md) in the canonical TechWright vault for the wire contract,
-recovery rules, environment allowlist, and security boundaries. `devdiary run`
+recovery rules, environment allowlist, and security boundaries. `devdiary-launcher run`
 uses durable capture under `REGISTRY_PARENT/attribution-captures`; the legacy
 HMAC spool remains supported alongside it.
 
@@ -407,9 +407,9 @@ hook drops the row, as above.
 Once an approved list exists, a preset added to the offer is not read until approved.
 Its runs can look like ordinary runs, and `doctor` says so.
 
-### Runs started by `devdiary run`
+### Runs started by `devdiary-launcher run`
 
-`devdiary run` exports `DEVDIARY_RUN_REF` (`urn:devdiary:run:<uuid>`) and declares a
+`devdiary-launcher run` exports `DEVDIARY_RUN_REF` (`urn:devdiary:run:<uuid>`) and declares a
 session with that ref. The hook sends the same ref in the optional v2 field
 `declared_run_ref`, so the server can match the observed visit to the declared
 session and show one run once.
@@ -664,13 +664,13 @@ hardlink). Never put its contents in arguments, environment, vendor settings or
 chat. No device authorization or automatic Git-remote mapping is performed.
 
 ```sh
-devdiary observer connect --state-dir "$STATE" \
+devdiary-launcher observer connect --state-dir "$STATE" \
   --endpoint https://app.example.test/ingest/v1/observations \
   --collector-ref "$COLLECTOR_REF" \
   --repository-ref https://github.com/OWNER/REPO \
   --key-file "$PRIVATE_KEY_FILE" --consent
-devdiary observer sync --state-dir "$STATE" --limit 100
-devdiary observer health --state-dir "$STATE"
+devdiary-launcher observer sync --state-dir "$STATE" --limit 100
+devdiary-launcher observer health --state-dir "$STATE"
 ```
 
 `connect` binds this installation's existing local repository root to the exact
@@ -719,7 +719,7 @@ Documentation/schema verification and fixture tests **are not stock-runtime
 qualification**. Windows (structured `observer_platform_unsupported`), remote/container hosts,
 managed-policy resolution and device authorization are not implemented. Health intentionally reports `runtime_qualified: false`.
 
-`devdiary observer discover [--vendor claude|codex]` checks PATH executables and
+`devdiary-launcher observer discover [--vendor claude|codex]` checks PATH executables and
 runs only `--version`/`--help` in temporary HOME/config/cwd with a minimal,
 credential-free environment. It never enables hooks or reads vendor credentials,
 private sessions, trust databases, or user config. This is read-only discovery of
@@ -773,21 +773,21 @@ or a suitably protected installation. This path check is not a Python dependency
 sandbox: the interpreter's standard library and base installation must also be trusted.
 In an installed package, use its stable Python environment. From
 this source checkout, prefix commands with `PYTHONPATH=src python3 -m devdiary` in
-place of `devdiary`. Only `apply --consent` and `remove --consent` change settings.
+place of `devdiary-launcher`. Only `apply --consent` and `remove --consent` change settings.
 Planning writes nothing; redirect its JSON output to a private plan file yourself.
 Do not point a fixture run at live user settings.
 
 ```sh
 # REPO, SETTINGS, STATE, PLAN, PYTHON are absolute, user-selected fixture paths.
 # REPO must already exist. STATE must be absent or private (0700).
-devdiary observer plan --vendor claude --repository "$REPO" --settings "$SETTINGS" \
+devdiary-launcher observer plan --vendor claude --repository "$REPO" --settings "$SETTINGS" \
   --state-dir "$STATE" --executable "$PYTHON" > "$PLAN"
 # Inspect the plan, stop concurrent settings editors, then approve:
-devdiary observer apply --plan "$PLAN" --consent
-devdiary observer health --state-dir "$STATE"
-devdiary observer observations --state-dir "$STATE" --limit 100
+devdiary-launcher observer apply --plan "$PLAN" --consent
+devdiary-launcher observer health --state-dir "$STATE"
+devdiary-launcher observer observations --state-dir "$STATE" --limit 100
 # Retains local metadata; stale loaded registrations become no-ops:
-devdiary observer remove --state-dir "$STATE" --consent
+devdiary-launcher observer remove --state-dir "$STATE" --consent
 ```
 
 To qualify a disposable stock Claude session, launch **from REPO** with a
@@ -869,28 +869,28 @@ uv build .  # build sdist and wheel artifacts
 ## First run
 
 ```text
-devdiary init \
+devdiary-launcher init \
   --namespace urn:acme \
   --principal-ref urn:acme:human:owner \
   --endpoint https://app.example.test/ingest/v1/sessions
 
-devdiary actor add \
+devdiary-launcher actor add \
   --ref urn:acme:actor:reviewer \
   --display-name "Code Reviewer" \
   --attester-ref urn:acme:attester:local-launcher \
   --lane review \
   --identity paperclip_agent_id=agent-123
 
-devdiary adapter add \
+devdiary-launcher adapter add \
   --name my-runtime \
   --runtime custom-cli \
   --session-ref-env DEVDIARY_RUNTIME_SESSION_REF_MY_RUNTIME \
   --provider-env DEVDIARY_RUNTIME_PROVIDER_MY_RUNTIME \
   --model-env DEVDIARY_RUNTIME_MODEL_MY_RUNTIME
 
-devdiary doctor --actor urn:acme:actor:reviewer
+devdiary-launcher doctor --actor urn:acme:actor:reviewer
 
-devdiary run --actor urn:acme:actor:reviewer -- your-command
+devdiary-launcher run --actor urn:acme:actor:reviewer -- your-command
 ```
 
 Known outputs may be declared explicitly before the command, for example with
@@ -916,7 +916,7 @@ using the original `capture_id` and the configured credential. To retry legacy
 HMAC entries without minting a new event identity:
 
 ```text
-devdiary emit pending
+devdiary-launcher emit pending
 ```
 
 Set the configured key environment variable (default:
