@@ -682,9 +682,7 @@ class InstallTest(unittest.TestCase):
 
     def test_old_collector_hooks_refuse_before_pairing(self):
         old = b"'/home/u/.local/share/devdiary/collector/0.4.0/devdiary-collector' claude-hook '/home/u/plan.json' >/dev/null 2>&1 || :"
-        self.settings.write_bytes(
-            self.original.replace(b"codegraph hook prompt", old)
-        )
+        self.settings.write_bytes(self.original.replace(b"codegraph hook prompt", old))
         result = self.install("--yes", code=2)
         self.assertIn(b"old_collector_registered", result.stderr)
         self.assertIn(b"devdiary-collector uninstall", result.stderr)

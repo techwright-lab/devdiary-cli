@@ -1051,7 +1051,8 @@ class InstallationFixture:
             "tool_input": {"command": "PRIVATE_SENTINEL"},
         }
         result = self.run_collector(
-            "hook", "claude",
+            "hook",
+            "claude",
             self.plan,
             data=json.dumps(event).encode(),
             env=self.env(**env),
@@ -1772,7 +1773,8 @@ class HookLossTest(InstallationFixture, unittest.TestCase):
             "tool_response": "x" * (6 * 1024 * 1024),
         }
         self.run_collector(
-            "hook", "claude",
+            "hook",
+            "claude",
             self.plan,
             data=json.dumps(event).encode(),
             env=self.env(),

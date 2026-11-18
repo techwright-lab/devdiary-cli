@@ -148,9 +148,7 @@ class CodexHookTest(unittest.TestCase):
             json.loads(settings.read_bytes()), {"hooks": {"Stop": [unrelated]}}
         )
         self.assertFalse(
-            (
-                self.fixture.config / "systemd/user/devdiary-codex-sync.timer"
-            ).exists()
+            (self.fixture.config / "systemd/user/devdiary-codex-sync.timer").exists()
         )
         rows = self.sync()
         self.assertEqual(len(rows), 1)
