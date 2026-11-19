@@ -5,6 +5,8 @@ import fcntl
 import io
 import json
 import os
+import pty
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -16,818 +18,13 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import saved_connection
+import terminal
+
 from devdiary import observer_hook
 
 ROOT = Path(__file__).resolve().parents[1]
 EVENTS = observer_hook.EVENTS
-
-
-class ClaudeHookTest(unittest.TestCase):
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory(prefix="claude-rust-")
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-        self.exe = self.root / "collector ' quoted"
-        shutil.copyfile(ROOT / "target/debug/devdiary", self.exe)
-        self.exe.chmod(0o700)
-        self.state = self.root / "state"
-        self.state.mkdir(mode=0o700)
-        self.repo = self.root / "repo"
-        self.repo.mkdir(mode=0o700)
-        self.settings = self.root / "settings.json"
-        self.original = {
-            "permissions": {"allow": ["Read"]},
-            "env": {"PRIVATE": "CONFIG_SECRET"},
-            "hooks": {"Stop": [], "Unrelated": [{"keep": True}]},
-        }
-        self.save(self.settings, self.original)
-        self.plan = self.root / "plan ' quoted.json"
-        self.scope = json.loads((ROOT / "tests/fixtures/scope.json").read_bytes())
-        self.scope["repository"] = str(self.repo)
-        self.command("init", self.state, "--consent", data=self.scope)
-        self.command("claude-plan", self.state, self.settings, self.plan)
-        self.command("claude-apply", self.plan, "--consent")
-        self.raw = {
-            "hook_event_name": "PostToolUse",
-            "session_id": "session-1",
-            "cwd": str(self.repo),
-            "tool_use_id": "tool-1",
-            "tool_name": "Read",
-            "prompt": "PRIVATE_SENTINEL",
-            "tool_input": {"path": "PRIVATE_SENTINEL"},
-            "tool_response": "PRIVATE_SENTINEL",
-            "transcript_path": "PRIVATE_SENTINEL",
-            "actor_ref": "not-authoritative",
-        }
-
-    def save(self, path, value):
-        path.write_text(json.dumps(value))
-        path.chmod(0o600)
-
-    def command(self, *args, data=None, code=0):
-        raw = json.dumps(data).encode() if data is not None else b""
-        result = subprocess.run(
-            [str(self.exe), *map(str, args)],
-            input=raw,
-            capture_output=True,
-            check=False,
-            timeout=5,
-        )
-        self.assertEqual(result.returncode, code, result.stderr)
-        return result
-
-    def hook(self, data=None, raw=None, plan=None):
-        result = subprocess.run(
-            [str(self.exe), "hook", "claude", str(plan or self.plan)],
-            input=raw
-            if raw is not None
-            else json.dumps(data if data is not None else self.raw).encode(),
-            capture_output=True,
-            check=False,
-            timeout=2,
-        )
-        self.assertEqual(
-            (result.returncode, result.stdout, result.stderr), (0, b"", b"")
-        )
-        return result
-
-    def drops(self):
-        return json.loads(self.command("status", self.state).stdout)["drops"]
-
-    def rows(self):
-        with sqlite3.connect(self.state / "collector-rust-v1.sqlite3") as db:
-            return [
-                json.loads(r[0])
-                for r in db.execute("SELECT payload FROM outbox ORDER BY seq")
-            ]
-
-    def test_roundtrip_quoted_shell_private_and_removed_hook(self):
-        config = json.loads(self.settings.read_bytes())
-        command = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-        result = subprocess.run(
-            ["/bin/sh", "-c", command],
-            input=json.dumps(self.raw).encode(),
-            capture_output=True,
-            check=False,
-            timeout=2,
-            env={"PATH": "/nonexistent"},
-        )
-        self.assertEqual(
-            (result.returncode, result.stdout, result.stderr), (0, b"", b"")
-        )
-        self.assertEqual(len(self.rows()), 1)
-        self.assertEqual(self.rows()[0]["attribution_basis"], "unknown")
-        self.assertNotIn("actor_ref", self.rows()[0])
-        for file in self.state.iterdir():
-            self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
-            self.assertEqual(file.stat().st_mode & 0o077, 0)
-        self.assertNotIn(b"CONFIG_SECRET", self.plan.read_bytes())
-        self.command("claude-remove", self.plan, "--consent")
-        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
-        self.hook(dict(self.raw, tool_use_id="after-remove"))
-        self.assertEqual(len(self.rows()), 1)
-        self.exe.unlink()
-        result = subprocess.run(
-            ["/bin/sh", "-c", command],
-            input=b"{}",
-            capture_output=True,
-            check=False,
-            timeout=2,
-        )
-        self.assertEqual(
-            (result.returncode, result.stdout, result.stderr), (0, b"", b"")
-        )
-
-    def test_saved_plan_validation_precedes_all_mutations(self):
-        self.command("claude-remove", self.plan, "--consent")
-        self.plan.unlink()
-        self.command("claude-plan", self.state, self.settings, self.plan)
-        original = json.loads(self.plan.read_bytes())
-        cases = [
-            dict(original, absent_events="invalid"),
-            dict(original, absent_events=original["absent_events"] + ["Stop"]),
-            dict(original, absent_events=original["absent_events"][1:]),
-            dict(original, absent_events=["Unknown"]),
-            dict(original, absent_events=[1]),
-            dict(original, absent_events=original["absent_events"] * 2),
-            dict(original, absent_hooks="false"),
-            dict(original, absent_hooks=True),
-            dict(original, unknown=True),
-            dict(
-                original,
-                scope=dict(
-                    original["scope"],
-                    installation_id="22222222-2222-4222-8222-222222222222",
-                ),
-            ),
-            dict(original, scope=dict(original["scope"], unknown=True)),
-            dict(original, scope=dict(original["scope"], collector_ref="changed")),
-        ]
-        cases += [
-            {k: v for k, v in original.items() if k != field} for field in original
-        ]
-        raws = [json.dumps(value).encode() for value in cases]
-        raws += [
-            json.dumps(original)
-            .replace('"version": 1', '"version": 1, "version": 1')
-            .encode(),
-            json.dumps(original)
-            .replace('"timeout": 2', '"timeout": 2, "timeout": 2')
-            .encode(),
-        ]
-        for raw in raws:
-            with self.subTest(plan=raw):
-                self.plan.write_bytes(raw)
-                before = {
-                    str(p.relative_to(self.root)): p.read_bytes()
-                    for p in self.root.rglob("*")
-                    if p.is_file()
-                }
-                self.command("claude-apply", self.plan, "--consent", code=2)
-                after = {
-                    str(p.relative_to(self.root)): p.read_bytes()
-                    for p in self.root.rglob("*")
-                    if p.is_file()
-                }
-                self.assertEqual(after, before)
-        self.save(self.plan, original)
-        self.command("claude-apply", self.plan, "--consent")
-        # Type-valid receipt metadata and scope edits must also fail after install.
-        for field, value in (
-            ("absent_hooks", True),
-            ("absent_events", list(EVENTS)),
-            ("scope", dict(original["scope"], collector_ref="changed")),
-            (
-                "scope",
-                dict(
-                    original["scope"],
-                    installation_id="22222222-2222-4222-8222-222222222222",
-                ),
-            ),
-        ):
-            self.save(self.plan, dict(original, **{field: value}))
-            before = {
-                str(p.relative_to(self.root)): p.read_bytes()
-                for p in self.root.rglob("*")
-                if p.is_file()
-            }
-            self.command("claude-apply", self.plan, "--consent", code=2)
-            self.command("claude-remove", self.plan, "--consent", code=2)
-            self.hook()
-            after = {
-                str(p.relative_to(self.root)): p.read_bytes()
-                for p in self.root.rglob("*")
-                if p.is_file() and p.name != "drops.log"
-            }
-            before.pop("state/drops.log", None)
-            self.assertEqual(after.keys(), before.keys())
-            self.assertTrue(all(after[k] == before[k] for k in before))
-        self.save(self.plan, original)
-        self.command("claude-remove", self.plan, "--consent")
-        self.command("claude-remove", self.plan, "--consent")
-        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
-
-    def test_type_valid_original_presence_mismatch_is_atomic(self):
-        self.command("claude-remove", self.plan, "--consent")
-        for original, change in [
-            (self.original, {"absent_events": list(EVENTS)}),
-            ({}, {"absent_hooks": False}),
-            ({"hooks": {}}, {"absent_hooks": True}),
-        ]:
-            with self.subTest(original=original, change=change):
-                self.plan.unlink()
-                self.save(self.settings, original)
-                self.command("claude-plan", self.state, self.settings, self.plan)
-                valid = json.loads(self.plan.read_bytes())
-                self.save(self.plan, dict(valid, **change))
-                before = {
-                    str(p.relative_to(self.root)): p.read_bytes()
-                    for p in self.root.rglob("*")
-                    if p.is_file()
-                }
-                self.command("claude-apply", self.plan, "--consent", code=2)
-                after = {
-                    str(p.relative_to(self.root)): p.read_bytes()
-                    for p in self.root.rglob("*")
-                    if p.is_file()
-                }
-                self.assertEqual(before, after)
-                self.save(self.plan, valid)
-                self.command("claude-apply", self.plan, "--consent")
-                self.command("claude-remove", self.plan, "--consent")
-                self.assertEqual(json.loads(self.settings.read_bytes()), original)
-
-    def test_python_reference_parity_and_dedup(self):
-        py = self.root / "python"
-        py.mkdir(mode=0o700)
-        self.save(py / "registration.lock", {})
-        self.save(
-            py / "manifest.json",
-            {
-                "status": "installed",
-                "installation_id": self.scope["installation_id"],
-                "repository": str(self.repo),
-                "vendor": "claude",
-            },
-        )
-        for event in EVENTS:
-            payload = dict(
-                self.raw,
-                hook_event_name=event,
-                prompt_id="prompt-1",
-                agent_id="child-1",
-                agent_type="Explore",
-                source="resume",
-                model="model-fixture",
-                reason="other",
-            )
-            for _ in range(2):
-                self.hook(payload)
-                observer_hook.collect(
-                    py,
-                    self.scope["installation_id"],
-                    io.BytesIO(json.dumps(payload).encode()),
-                )
-        with sqlite3.connect(py / "observations.sqlite3") as db:
-            reference = [
-                json.loads(r[0])
-                for r in db.execute("SELECT metadata FROM observations ORDER BY seq")
-            ]
-        actual = self.rows()
-        self.assertEqual(len(actual), len(reference))
-        for a, b in zip(actual, reference):
-            for key in ("observation_id", "observed_at", "repository_ref"):
-                a.pop(key, None)
-            for key in (
-                "observation_id",
-                "observed_at",
-                "repository",
-                "source_tag",
-                "actor_ref",
-                "delivery",
-                "deduplication",
-            ):
-                b.pop(key, None)
-            self.assertEqual(a, b)
-        self.assertEqual([r["event"] for r in actual].count("Stop"), 1)
-        self.assertEqual([r["event"] for r in actual].count("SessionEnd"), 2)
-
-    def test_empty_config_roundtrip_and_duplicate_owned_refusal(self):
-        self.command("claude-remove", self.plan, "--consent")
-        self.plan.unlink()
-        self.save(self.settings, {})
-        self.command("claude-plan", self.state, self.settings, self.plan)
-        self.command("claude-apply", self.plan, "--consent")
-        installed = self.settings.read_bytes()
-        doc = json.loads(installed)
-        doc["hooks"]["Stop"].append(doc["hooks"]["Stop"][0])
-        self.save(self.settings, doc)
-        self.command("claude-remove", self.plan, "--consent", code=2)
-        self.hook()
-        self.assertEqual(self.rows(), [])
-        self.settings.write_bytes(installed)
-        self.command("claude-remove", self.plan, "--consent")
-        self.assertEqual(json.loads(self.settings.read_bytes()), {})
-
-    def test_missing_ids_keep_distinct_firings_and_no_inferred_end(self):
-        for event in ("SessionStart", "Stop", "SubagentStop", "SessionEnd"):
-            for _ in range(2):
-                self.hook(
-                    {
-                        "hook_event_name": event,
-                        "session_id": "session-1",
-                        "cwd": str(self.repo),
-                        "stop_hook_active": True,
-                        "reason": "other",
-                    }
-                )
-        rows = self.rows()
-        self.assertEqual(len(rows), 8)
-        self.assertEqual(len({r["observation_id"] for r in rows}), 8)
-        for event in ("SessionStart", "Stop", "SubagentStop", "SessionEnd"):
-            self.assertEqual(sum(r["event"] == event for r in rows), 2)
-        for row in rows:
-            self.assertFalse(
-                {"duration", "ended_at", "actor_ref", "stop_hook_active"} & row.keys()
-            )
-            if row["event"] != "SessionEnd":
-                self.assertNotIn("reason", row)
-
-    def test_fixture_resume_failure_child_correlation_and_repeated_starts(self):
-        # Synthetic hook contract only: no claim about interactive Claude behavior.
-        def emit(event, **fields):
-            self.hook(
-                dict(
-                    hook_event_name=event,
-                    session_id="parent-session",
-                    cwd=str(self.repo),
-                    **fields,
-                )
-            )
-
-        for source in ("startup", "resume", "resume"):
-            emit("SessionStart", source=source, model="fixture-model")
-        for _ in range(2):
-            emit("PreToolUse", tool_use_id="failed-read", tool_name="Read")
-            emit(
-                "PostToolUseFailure",
-                tool_use_id="failed-read",
-                tool_name="Read",
-                error="PRIVATE_SENTINEL",
-                tool_input={"path": "PRIVATE_SENTINEL"},
-            )
-            for child in ("child-a", "child-b"):
-                emit("SubagentStart", agent_id=child, agent_type="Explore")
-                emit(
-                    "PreToolUse",
-                    agent_id=child,
-                    tool_use_id="same-tool",
-                    tool_name="Read",
-                )
-                emit(
-                    "PostToolUse",
-                    agent_id=child,
-                    tool_use_id="same-tool",
-                    tool_name="Read",
-                )
-                emit("SubagentStop", agent_id=child, agent_type="Explore")
-            emit("Stop", prompt_id="turn-one")
-        rows = self.rows()
-        self.assertEqual(len(rows), 14)
-        self.assertEqual(
-            [r["source"] for r in rows if r["event"] == "SessionStart"],
-            ["startup", "resume", "resume"],
-        )
-        self.assertFalse(any(r["event"] == "SessionEnd" for r in rows))
-        for child in ("child-a", "child-b"):
-            child_rows = [r for r in rows if r.get("agent_id") == child]
-            self.assertEqual(
-                [r["event"] for r in child_rows],
-                ["SubagentStart", "PreToolUse", "PostToolUse", "SubagentStop"],
-            )
-            self.assertTrue(
-                all(r["session_id"] == "parent-session" for r in child_rows)
-            )
-        failed = [r for r in rows if r["event"] == "PostToolUseFailure"]
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["tool_use_id"], "failed-read")
-        self.assertTrue(
-            all(
-                not {"duration", "ended_at", "actor_ref", "error"} & r.keys()
-                for r in rows
-            )
-        )
-        emit("SessionEnd", reason="other")
-        self.assertEqual(len(self.rows()), 15)
-        for file in self.state.iterdir():
-            if file.is_file():
-                self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
-
-    def test_fixture_exception_cleanup_disables_later_lifecycle(self):
-        try:
-            self.hook(dict(self.raw, hook_event_name="SessionStart", source="startup"))
-            raise RuntimeError("synthetic host failure")
-        except RuntimeError:
-            pass
-        finally:
-            self.command("claude-remove", self.plan, "--consent")
-        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
-        before = self.rows()
-        for event in EVENTS:
-            self.hook(dict(self.raw, hook_event_name=event))
-        self.assertEqual(self.rows(), before)
-        self.assertEqual([r["event"] for r in before], ["SessionStart"])
-
-    def test_invalid_scope_and_payload_are_neutral(self):
-        outside = self.root / "repo-other"
-        outside.mkdir()
-        (self.repo / "escape").symlink_to(outside, target_is_directory=True)
-        cases = [
-            dict(self.raw, cwd=str(outside)),
-            dict(self.raw, cwd=str(self.repo / "escape")),
-            dict(self.raw, cwd="relative"),
-            dict(self.raw, hook_event_name="Unknown"),
-            dict(self.raw, session_id="bad token"),
-            dict(self.raw, prompt_id=None),
-            dict(self.raw, tool_use_id="x" * 201),
-        ]
-        for value in cases:
-            self.hook(value)
-        for raw in (
-            b"{invalid",
-            b"[]",
-            b"x" * 65537,
-            b'{"session_id":"one","session_id":"two"}',
-        ):
-            self.hook(raw=raw)
-        self.assertEqual(self.rows(), [])
-        self.assertEqual(
-            self.drops(),
-            {
-                "outside_scope": 2,
-                "invalid": 3,
-                "invalid_json": 4,
-                "invalid_prompt_id": 1,
-                "invalid_tool_use_id": 1,
-            },
-        )
-        child = self.repo / "sub"
-        child.mkdir()
-        self.hook(dict(self.raw, cwd=str(child)))
-        self.assertEqual(len(self.rows()), 1)
-
-    def test_a_permission_prompt_records_its_moment_and_nothing_private(self):
-        self.hook(
-            {
-                "hook_event_name": "PermissionRequest",
-                "session_id": "session-1",
-                "cwd": str(self.repo),
-                "tool_name": "Bash",
-                "tool_input": {"command": "PRIVATE_SENTINEL"},
-            }
-        )
-        self.assertEqual([row["event"] for row in self.rows()], ["PermissionRequest"])
-        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(self.rows()))
-
-    def test_a_bad_agent_type_costs_the_label_and_not_the_row(self):
-        for tool, value in enumerate(("has space", None, "")):
-            self.hook(dict(self.raw, tool_use_id=f"tool-{tool}", agent_type=value))
-        self.assertEqual(len(self.rows()), 3)
-        self.assertFalse(any("agent_type" in row for row in self.rows()))
-        self.assertEqual(self.drops(), {})
-
-    def test_open_stdin_deadline_and_locked_spool(self):
-        start = time.monotonic()
-        process = subprocess.Popen(
-            [str(self.exe), "hook", "claude", str(self.plan)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            self.assertEqual(process.wait(timeout=1.5), 0)
-            self.assertLess(time.monotonic() - start, 1.3)
-            self.assertEqual(process.stdout.read(), b"")
-            self.assertEqual(process.stderr.read(), b"")
-        finally:
-            process.kill() if process.poll() is None else None
-            process.communicate()
-        with sqlite3.connect(self.state / "collector-rust-v1.sqlite3") as db:
-            db.execute("BEGIN EXCLUSIVE")
-            self.hook()
-        self.assertEqual(self.rows(), [])
-        self.hook()
-        self.assertEqual(len(self.rows()), 1)
-
-    def test_concurrent_dedup_and_registration_lock(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            list(pool.map(lambda _: self.hook(), range(12)))
-        self.assertEqual(len(self.rows()), 1)
-        with (self.state / "claude-settings.lock").open("rb") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            self.hook(dict(self.raw, tool_use_id="locked"))
-            self.command("claude-remove", self.plan, "--consent", code=2)
-        self.assertEqual(len(self.rows()), 1)
-        drops = self.drops()
-        self.assertGreaterEqual(drops.pop("busy"), 1)
-        self.assertLessEqual(drops.keys(), {"observation_conflict", "busy"})
-
-    def test_consent_stale_plan_owned_entry_and_unrelated_edits(self):
-        self.command("claude-remove", self.plan, code=2)
-        config = json.loads(self.settings.read_bytes())
-        config["new_customer_setting"] = True
-        extra = {"hooks": [{"type": "command", "command": "true"}]}
-        config["hooks"]["Stop"].append(extra)
-        self.save(self.settings, config)
-        self.command("claude-remove", self.plan, "--consent")
-        expected = dict(self.original, new_customer_setting=True)
-        expected["hooks"]["Stop"].append(extra)
-        self.assertEqual(json.loads(self.settings.read_bytes()), expected)
-        self.command("claude-apply", self.plan, "--consent", code=2)
-        self.plan.unlink()
-        self.command("claude-plan", self.state, self.settings, self.plan)
-        self.command("claude-apply", self.plan, code=2)
-        self.command("claude-apply", self.plan, "--consent")
-        config = json.loads(self.settings.read_bytes())
-        config["hooks"]["Stop"][-1]["hooks"][0]["timeout"] = 10
-        self.save(self.settings, config)
-        before = self.settings.read_bytes()
-        self.command("claude-remove", self.plan, "--consent", code=2)
-        self.assertEqual(self.settings.read_bytes(), before)
-        self.hook()
-        self.assertEqual(self.rows(), [])
-
-    def test_changed_executable_scope_and_permissions(self):
-        self.exe.chmod(0o755)
-        self.hook()
-        self.assertEqual(self.rows(), [])
-        self.exe.chmod(0o700)
-        with self.exe.open("ab") as f:
-            f.write(b"changed")
-        self.hook()
-        self.assertEqual(self.rows(), [])
-        self.command("claude-remove", self.plan, "--consent")
-        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
-        self.command("claude-apply", self.plan, "--consent", code=2)
-
-    def test_setup_crash_and_retry_keeps_atomic_settings(self):
-        # Real process death at varying points, never production fault switches.
-        self.command("claude-remove", self.plan, "--consent")
-        for delay in (0, 0.01, 0.04, 0.08):
-            self.plan.unlink()
-            self.command("claude-plan", self.state, self.settings, self.plan)
-            process = subprocess.Popen(
-                [str(self.exe), "claude-apply", str(self.plan), "--consent"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            time.sleep(delay)
-            if process.poll() is None:
-                process.kill()
-            process.communicate(timeout=2)
-            current = json.loads(self.settings.read_bytes())
-            if current != self.original:
-                entry = json.loads(self.plan.read_bytes())["entry"]
-                self.assertTrue(
-                    all(current["hooks"][event].count(entry) == 1 for event in EVENTS)
-                )
-            # Retry works both before and after the atomic rename.
-            self.command("claude-apply", self.plan, "--consent")
-            self.hook()
-            self.command("claude-remove", self.plan, "--consent")
-            self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
-        with sqlite3.connect(self.state / "collector-rust-v1.sqlite3") as db:
-            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
-
-    def test_scope_changed_and_untrusted_registration_files(self):
-        saved_plan = self.plan.read_bytes()
-        proposal = json.loads(saved_plan)
-        proposal["scope"]["collector_ref"] = "changed"
-        self.save(self.plan, proposal)
-        self.hook()
-        self.assertEqual(self.rows(), [])
-        self.plan.write_bytes(saved_plan)
-        self.plan.chmod(0o644)
-        self.hook()
-        self.assertEqual(self.rows(), [])
-        self.plan.chmod(0o600)
-        alias = self.root / "hardlink"
-        os.link(self.plan, alias)
-        self.hook()
-        self.assertEqual(self.rows(), [])
-        alias.unlink()
-        self.command("claude-remove", self.plan, "--consent")
-        original = self.settings.read_bytes()
-        self.plan.unlink()
-        self.settings.write_bytes(
-            b'{"hooks":{},"permissions":{"allow":[],"allow":["Write"]}}'
-        )
-        self.command("claude-plan", self.state, self.settings, self.plan, code=2)
-        self.assertFalse(self.plan.exists())
-        self.settings.write_bytes(original)
-        self.command("claude-plan", self.state, self.settings, self.plan)
-        self.save(self.settings, dict(self.original, edit_after_plan=True))
-        before = self.settings.read_bytes()
-        self.command("claude-apply", self.plan, "--consent", code=2)
-        self.assertEqual(self.settings.read_bytes(), before)
-
-    def test_full_spool_neutral_without_mutation(self):
-        # Exercise the real conservative admission boundary, not synthetic rows.
-        row = json.loads((ROOT / "tests/fixtures/local-observation.json").read_bytes())
-        row.update(
-            repository=str(self.repo), installation_id=self.scope["installation_id"]
-        )
-        import uuid
-
-        for _ in range(1200):
-            row["observation_id"] = str(uuid.uuid4())
-            result = subprocess.run(
-                [str(self.exe), "collect", str(self.state)],
-                input=json.dumps(row).encode(),
-                capture_output=True,
-                check=False,
-                timeout=3,
-            )
-            if result.returncode:
-                break
-        else:
-            self.fail("expected conservative capacity refusal")
-        before = self.rows()
-        self.assertGreater(len(before), 100)
-        self.hook()
-        self.assertEqual(self.rows(), before)
-        self.assertLessEqual(
-            (self.state / "collector-rust-v1.sqlite3").stat().st_size, 16 * 1024 * 1024
-        )
-
-    def test_outside_scope_event_counts_a_drop_without_a_row(self):
-        outside = self.root / "repo-other"
-        outside.mkdir()
-        self.hook(dict(self.raw, cwd=str(outside)))
-        self.assertEqual(self.rows(), [])
-        self.assertEqual(self.drops(), {"outside_scope": 1})
-
-    def test_settings_readable_by_others_but_writable_only_by_owner(self):
-        self.command("claude-remove", self.plan, "--consent")
-        home = self.root / "home"
-        home.mkdir(mode=0o700)
-        claude = home / ".claude"
-        claude.mkdir()
-        claude.chmod(0o755)
-        settings = claude / "settings.json"
-        settings.write_text(json.dumps(self.original))
-        settings.chmod(0o644)
-        plan = self.root / "shared-plan.json"
-        self.command("claude-plan", self.state, settings, plan)
-        self.command("claude-apply", plan, "--consent")
-        self.assertEqual(settings.stat().st_mode & 0o777, 0o644)
-        self.hook(plan=plan)
-        self.assertEqual(len(self.rows()), 1)
-        for path, mode in ((settings, 0o664), (settings, 0o777), (claude, 0o777)):
-            with self.subTest(path=path.name, mode=oct(mode)):
-                original = path.stat().st_mode & 0o777
-                path.chmod(mode)
-                self.hook(dict(self.raw, tool_use_id=f"mode-{mode}"), plan=plan)
-                self.command("claude-remove", plan, "--consent", code=2)
-                path.chmod(original)
-        alias = home / "settings-alias.json"
-        os.link(settings, alias)
-        self.hook(dict(self.raw, tool_use_id="hardlinked"), plan=plan)
-        self.command("claude-remove", plan, "--consent", code=2)
-        alias.unlink()
-        self.assertEqual(len(self.rows()), 1)
-        self.assertEqual(self.drops(), {"permission": 4})
-        linked = self.root / "linked-home"
-        linked.symlink_to(home, target_is_directory=True)
-        self.command(
-            "claude-plan",
-            self.state,
-            linked / ".claude/settings.json",
-            self.root / "linked-plan.json",
-            code=2,
-        )
-        self.command("claude-remove", plan, "--consent")
-        self.assertEqual(json.loads(settings.read_bytes()), self.original)
-        self.assertEqual(settings.stat().st_mode & 0o777, 0o644)
-
-    def test_broken_settings_count_as_stale_plan_not_invalid_events(self):
-        text = self.settings.read_text()
-        for broken in ('{"permissions": {}, ' + text[1:], text[:-1]):
-            with self.subTest(broken=broken[:20]):
-                self.settings.write_text(broken)
-                self.hook()
-        self.assertEqual(self.rows(), [])
-        self.assertEqual(self.drops(), {"stale_plan": 2})
-
-    def test_python_observer_registration_is_refused(self):
-        self.command("claude-remove", self.plan, "--consent")
-        self.plan.unlink()
-        observer = {"type": "command", "command": "python3 /opt/observer_hook.py"}
-        self.save(
-            self.settings,
-            dict(self.original, hooks={"Stop": [{"hooks": [observer]}]}),
-        )
-        result = self.command(
-            "claude-plan", self.state, self.settings, self.plan, code=2
-        )
-        self.assertIn(b"python_observer_registered", result.stderr)
-        self.assertFalse(self.plan.exists())
-
-    def test_replaced_binary_is_rehashed_within_the_hook_deadline(self):
-        self.assertGreater(self.exe.stat().st_size, 32 * 1024 * 1024)
-        fingerprint = self.state / "executable-fingerprint"
-        self.hook()
-        before = fingerprint.read_bytes()
-        replacement = self.root / "replacement"
-        shutil.copyfile(ROOT / "target/debug/devdiary", replacement)
-        replacement.chmod(0o700)
-        os.replace(replacement, self.exe)
-        self.hook(dict(self.raw, tool_use_id="after-replace"))
-        self.assertEqual(len(self.rows()), 2)
-        self.assertNotEqual(fingerprint.read_bytes(), before)
-        with self.exe.open("ab") as f:
-            f.write(b"changed")
-        self.hook(dict(self.raw, tool_use_id="after-change"))
-        self.assertEqual(len(self.rows()), 2)
-        self.assertEqual(self.drops(), {"stale_plan": 1})
-
-    def test_unrelated_revoked_entry_beside_a_plain_state_is_ignored(self):
-        (self.root / "revoked").write_text("unrelated")
-        self.hook()
-        (self.root / "revoked").unlink()
-        (self.root / "revoked").mkdir()
-        self.hook(dict(self.raw, tool_use_id="beside-directory"))
-        self.assertEqual(len(self.rows()), 2)
-        self.assertEqual(self.drops(), {})
-
-    def test_large_tool_payload_is_skipped_up_to_sixteen_mebibytes(self):
-        self.hook(dict(self.raw, tool_response="PRIVATE_SENTINEL" * 200_000))
-        self.assertEqual(len(self.rows()), 1)
-        self.hook(raw=b'{"pad":"' + b"x" * (16 * 1024 * 1024) + b'"}')
-        self.assertEqual(len(self.rows()), 1)
-        self.assertEqual(self.drops(), {"input_too_large": 1})
-        for file in self.state.iterdir():
-            self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
-
-    def test_hook_to_real_cli_http_delivery(self):
-        owner = self
-        received = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_POST(self):
-                payload = json.loads(
-                    self.rfile.read(int(self.headers["Content-Length"]))
-                )
-                received.append(payload)
-                self.send_response(201)
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "collector_ref": owner.scope["collector_ref"],
-                            "observation_id": payload["observation_id"],
-                            "installation_id": payload["installation_id"],
-                            "record_id": 1,
-                        }
-                    ).encode()
-                )
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever)
-        thread.start()
-        try:
-            # New isolated scope rather than retargeting an existing spool.
-            self.command("claude-remove", self.plan, "--consent")
-            self.plan.unlink()
-            self.state = self.root / "http-state"
-            self.state.mkdir(mode=0o700)
-            self.scope["endpoint"] = (
-                f"http://127.0.0.1:{server.server_port}/ingest/v1/observations"
-            )
-            self.command("init", self.state, "--consent", data=self.scope)
-            self.command("claude-plan", self.state, self.settings, self.plan)
-            self.command("claude-apply", self.plan, "--consent")
-            self.hook()
-            spooled = self.rows()
-            key = self.root / "synthetic-key"
-            key.write_text("dc_live_SYNTHETIC_ONLY")
-            key.chmod(0o600)
-            (self.state / "executable-fingerprint").unlink()
-            self.command("sync", self.state, key, "10")
-            self.assertTrue((self.state / "executable-fingerprint").exists())
-            self.assertEqual(received, spooled)
-            self.assertEqual(self.rows(), [])
-            self.assertEqual(
-                json.loads(self.command("status", self.state).stdout),
-                {"pending": 0, "delivered": 1, "drops": {}},
-            )
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
 
 
 AGENT = "22c99d01-c3ee-4041-9066-0a83f34bd2e2"
@@ -957,40 +154,58 @@ class InstallationFixture:
         git("-C", path, "commit", "-q", "--allow-empty", "-m", "init")
         return path
 
-    def connect(self, opt_in=False, versions=(1, 2), approved=(PAPERCLIP,)):
-        self.connection = self.root / "connection"
-        self.connection.mkdir(mode=0o700)
-        installation = {
-            "installation_id": str(uuid.uuid4()),
-            "origin": self.origin,
-            "scope_kind": "installation",
-            "record_orchestrated_outside_repos": opt_in,
-        }
-        scope = {
-            "endpoint": self.origin + "/ingest/v1/observations",
-            "collector_ref": self.collector_ref,
-            "installation_id": installation["installation_id"],
-            "scope_kind": "installation",
-            "observation_schema_versions": list(versions),
-            "record_orchestrated_outside_repos": opt_in,
-        }
-        self.write(self.connection / "installation.json", installation)
-        self.write(
-            self.connection / "connection.json",
-            {
-                "scope": scope,
-                "token": "dc_live_" + "s" * 43,
-                "repository_refs": self.refs,
-            },
+    def connect(
+        self, opt_in=False, versions=(1, 2), approved=(PAPERCLIP,), settings=None
+    ):
+        # A saved connection, as pairing leaves it; setup then reuses it.
+        self.home = self.root / getattr(self, "home_name", "home")
+        self.connection = saved_connection.save(
+            self.home,
+            self.origin,
+            self.refs,
+            versions,
+            opt_in,
+            collector_ref=self.collector_ref,
         )
+        self.data = self.connection.parent
         self.settings = self.root / "settings.json"
-        self.write(self.settings, {})
-        self.plan = self.root / "plan.json"
-        self.run_collector("setup-plan", self.connection, self.settings, self.plan)
-        self.run_collector("claude-apply", self.plan, "--consent")
+        self.write(self.settings, {} if settings is None else settings)
+        self.setup_env = saved_connection.environment(self.root, self.home, self.env())
+        self.opt_in = opt_in
+        # Setup refreshes the scope once. Serve what the connection was approved
+        # with, so a test's offer still arrives with the first sync.
+        served = self.served_refs, self.served_orchestrators, self.served_declared_run
+        self.served_refs = self.refs
+        self.served_orchestrators = self.served_declared_run = None
+        self.install()
+        self.served_refs, self.served_orchestrators, self.served_declared_run = served
         self.outbox = self.connection / "outbox"
         if approved is not None:
             self.approve(list(approved))
+
+    def install(self, code=0, settings=None, answers=(b"y\n",), on_prompt=None):
+        """Run `devdiary setup` on a terminal, reusing the saved connection."""
+        args = [self.exe, "setup", "--settings", settings or self.settings]
+        args += ["--origin", self.origin, "--trust-origin", "--no-browser"]
+        if self.opt_in:
+            args.append("--record-orchestrated-outside-repos")
+        status, out, err, _ = terminal.answering(
+            args, self.setup_env, answers, on_prompt=on_prompt
+        )
+        self.assertEqual(status, code, err)
+        if code == 0:
+            record = json.loads((self.data / "install.json").read_bytes())
+            self.plan = Path(record["plan"])
+            self.pinned = Path(record["executable"])
+        return out, err
+
+    def uninstall(self, code=0):
+        return self.run_collector("uninstall", env=self.setup_env, code=code)
+
+    def newest_plan(self):
+        plans = (self.data / "plans").iterdir()
+        made = [p for p in plans if re.fullmatch(r"claude-\d+\.json", p.name)]
+        return max(made, key=lambda p: int(p.stem.split("-")[1]))
 
     def approve(self, entries):
         self.write(self.outbox / "orchestrators-approved.json", entries)
@@ -1001,10 +216,12 @@ class InstallationFixture:
     def saved_refs(self):
         return json.loads((self.outbox / "repository-refs.json").read_bytes())
 
+    def doctor(self):
+        result = self.run_collector("doctor", env=self.setup_env)
+        return json.loads(result.stdout)
+
     def status(self):
-        return json.loads(
-            self.run_collector("connection-status", self.connection).stdout
-        )["local_orchestrators"]
+        return self.doctor()["orchestrators"]
 
     def write(self, path, value):
         path.write_text(json.dumps(value))
@@ -1068,11 +285,714 @@ class InstallationFixture:
             ]
 
     def drops(self):
-        status = self.run_collector("connection-status", self.connection)
-        return json.loads(status.stdout)["local_drops"]
+        return self.doctor()["drops"]
 
-    def sync(self, code=0):
-        return self.run_collector("connection-sync", self.connection, "100", code=code)
+    def sync(self):
+        self.run_collector("sync", self.connection, env=self.setup_env)
+        return self.doctor()
+
+
+class ClaudeHookTest(InstallationFixture, unittest.TestCase):
+    """One installed Claude Code registration, run through the real hook command."""
+
+    home_name = "home ' quoted"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.main
+        self.original = {
+            "permissions": {"allow": ["Read"]},
+            "env": {"PRIVATE": "CONFIG_SECRET"},
+            "hooks": {"Stop": [], "Unrelated": [{"keep": True}]},
+        }
+        self.connect(approved=None, settings=self.original)
+        self.installation_id = json.loads(
+            (self.connection / "installation.json").read_bytes()
+        )["installation_id"]
+        self.raw = {
+            "hook_event_name": "PostToolUse",
+            "session_id": "session-1",
+            "cwd": str(self.repo),
+            "tool_use_id": "tool-1",
+            "tool_name": "Read",
+            "prompt": "PRIVATE_SENTINEL",
+            "tool_input": {"path": "PRIVATE_SENTINEL"},
+            "tool_response": "PRIVATE_SENTINEL",
+            "transcript_path": "PRIVATE_SENTINEL",
+            "actor_ref": "not-authoritative",
+        }
+
+    def save(self, path, value):
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    def hook(self, data=None, raw=None, plan=None):
+        result = subprocess.run(
+            [str(self.exe), "hook", "claude", str(plan or self.plan)],
+            input=raw
+            if raw is not None
+            else json.dumps(data if data is not None else self.raw).encode(),
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (0, b"", b"")
+        )
+        return result
+
+    def files(self, skip=(), units=True):
+        return {
+            str(p.relative_to(self.root)): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file()
+            and p.name not in skip
+            and (units or not p.is_relative_to(self.root / "config"))
+        }
+
+    def refused_while_asked(self, edit, code=2):
+        """Edit the new plan or the settings while setup asks; nothing may change."""
+        seen = {}
+
+        def on_prompt(_):
+            edit(self.newest_plan())
+            seen["before"] = self.files()
+
+        self.install(code=code, on_prompt=on_prompt)
+        self.assertEqual(self.files(), seen["before"])
+
+    def test_roundtrip_quoted_shell_private_and_removed_hook(self):
+        config = json.loads(self.settings.read_bytes())
+        command = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+        self.assertIn("home '\"'\"' quoted", command)
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=json.dumps(self.raw).encode(),
+            capture_output=True,
+            check=False,
+            timeout=2,
+            env={"PATH": "/nonexistent"},
+        )
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (0, b"", b"")
+        )
+        self.assertEqual(len(self.rows()), 1)
+        self.assertNotIn("actor_ref", self.rows()[0])
+        for file in self.outbox.iterdir():
+            self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
+            self.assertEqual(file.stat().st_mode & 0o077, 0)
+        self.assertNotIn(b"CONFIG_SECRET", self.plan.read_bytes())
+        self.uninstall()
+        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+        self.hook(dict(self.raw, tool_use_id="after-remove"))
+        self.assertEqual(len(self.rows()), 1)
+        self.pinned.unlink()
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=b"{}",
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (0, b"", b"")
+        )
+
+    def test_saved_plan_validation_precedes_all_mutations(self):
+        self.uninstall()
+        other = "22222222-2222-4222-8222-222222222222"
+        cases = [
+            lambda p: dict(p, absent_events="invalid"),
+            lambda p: dict(p, absent_events=p["absent_events"] + ["Stop"]),
+            lambda p: dict(p, absent_events=p["absent_events"][1:]),
+            lambda p: dict(p, absent_events=["Unknown"]),
+            lambda p: dict(p, absent_events=[1]),
+            lambda p: dict(p, absent_events=p["absent_events"] * 2),
+            lambda p: dict(p, absent_hooks="false"),
+            lambda p: dict(p, absent_hooks=True),
+            lambda p: dict(p, unknown=True),
+            lambda p: dict(p, scope=dict(p["scope"], installation_id=other)),
+            lambda p: dict(p, scope=dict(p["scope"], unknown=True)),
+            lambda p: dict(p, scope=dict(p["scope"], collector_ref="changed")),
+        ]
+        fields = list(json.loads(self.plan.read_bytes()))
+        cases += [
+            lambda p, f=field: {k: v for k, v in p.items() if k != f}
+            for field in fields
+        ]
+        raw_cases = [
+            lambda raw: raw.replace(b'"version": 1', b'"version": 1, "version": 1'),
+            lambda raw: raw.replace(b'"timeout": 2', b'"timeout": 2, "timeout": 2'),
+        ]
+
+        def rewrite(change):
+            return lambda path: path.write_bytes(
+                json.dumps(change(json.loads(path.read_bytes()))).encode()
+            )
+
+        def rewrite_raw(change):
+            def edit(path):
+                raw = json.dumps(json.loads(path.read_bytes())).encode()
+                path.write_bytes(change(raw))
+
+            return edit
+
+        for index, edit in enumerate(
+            [rewrite(c) for c in cases] + [rewrite_raw(c) for c in raw_cases]
+        ):
+            with self.subTest(case=index):
+                self.refused_while_asked(edit)
+        self.install()
+        original = json.loads(self.plan.read_bytes())
+        # Type-valid receipt metadata and scope edits must also fail after install.
+        for field, value in (
+            ("absent_hooks", True),
+            ("absent_events", list(EVENTS)),
+            ("scope", dict(original["scope"], collector_ref="changed")),
+            ("scope", dict(original["scope"], installation_id=other)),
+        ):
+            self.save(self.plan, dict(original, **{field: value}))
+            # Uninstall disables the timer before it reads the plan.
+            before = self.files(skip={"drops.log"}, units=False)
+            self.run_collector("upgrade", "--yes", env=self.setup_env, code=2)
+            self.uninstall(code=2)
+            self.hook()
+            self.assertEqual(self.files(skip={"drops.log"}, units=False), before)
+        self.save(self.plan, original)
+        self.uninstall()
+        self.uninstall()
+        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+
+    def test_type_valid_original_presence_mismatch_is_atomic(self):
+        self.uninstall()
+        for original, change in [
+            (self.original, {"absent_events": list(EVENTS)}),
+            ({}, {"absent_hooks": False}),
+            ({"hooks": {}}, {"absent_hooks": True}),
+        ]:
+            with self.subTest(original=original, change=change):
+                self.save(self.settings, original)
+                self.refused_while_asked(
+                    lambda path, change=change: self.save(
+                        path, dict(json.loads(path.read_bytes()), **change)
+                    )
+                )
+                self.install()
+                self.uninstall()
+                self.assertEqual(json.loads(self.settings.read_bytes()), original)
+
+    def test_python_reference_parity_and_dedup(self):
+        py = self.root / "python"
+        py.mkdir(mode=0o700)
+        self.save(py / "registration.lock", {})
+        self.save(
+            py / "manifest.json",
+            {
+                "status": "installed",
+                "installation_id": self.installation_id,
+                "repository": str(self.repo),
+                "vendor": "claude",
+            },
+        )
+        for event in EVENTS:
+            payload = dict(
+                self.raw,
+                hook_event_name=event,
+                prompt_id="prompt-1",
+                agent_id="child-1",
+                agent_type="Explore",
+                source="resume",
+                model="model-fixture",
+                reason="other",
+            )
+            for _ in range(2):
+                self.hook(payload)
+                observer_hook.collect(
+                    py,
+                    self.installation_id,
+                    io.BytesIO(json.dumps(payload).encode()),
+                )
+        with sqlite3.connect(py / "observations.sqlite3") as db:
+            reference = [
+                json.loads(r[0])
+                for r in db.execute("SELECT metadata FROM observations ORDER BY seq")
+            ]
+        actual = self.rows()
+        self.assertEqual(len(actual), len(reference))
+        for a, b in zip(actual, reference):
+            # Installation rows are schema v2; the Python observer writes v1.
+            for key in ("observation_id", "observed_at", "repository_ref"):
+                a.pop(key, None)
+            self.assertEqual((a.pop("schema_version"), b.pop("schema_version")), (2, 1))
+            for key in (
+                "observation_id",
+                "observed_at",
+                "repository",
+                "source_tag",
+                "actor_ref",
+                "delivery",
+                "deduplication",
+            ):
+                b.pop(key, None)
+            self.assertEqual(a, b)
+        self.assertEqual([r["event"] for r in actual].count("Stop"), 1)
+        self.assertEqual([r["event"] for r in actual].count("SessionEnd"), 2)
+
+    def test_empty_config_roundtrip_and_duplicate_owned_refusal(self):
+        self.uninstall()
+        self.save(self.settings, {})
+        self.install()
+        installed = self.settings.read_bytes()
+        doc = json.loads(installed)
+        doc["hooks"]["Stop"].append(doc["hooks"]["Stop"][0])
+        self.save(self.settings, doc)
+        self.uninstall(code=2)
+        self.hook()
+        self.assertEqual(self.rows(), [])
+        self.settings.write_bytes(installed)
+        self.uninstall()
+        self.assertEqual(json.loads(self.settings.read_bytes()), {})
+
+    def test_missing_ids_keep_distinct_firings_and_no_inferred_end(self):
+        for event in ("SessionStart", "Stop", "SubagentStop", "SessionEnd"):
+            for _ in range(2):
+                self.hook(
+                    {
+                        "hook_event_name": event,
+                        "session_id": "session-1",
+                        "cwd": str(self.repo),
+                        "stop_hook_active": True,
+                        "reason": "other",
+                    }
+                )
+        rows = self.rows()
+        self.assertEqual(len(rows), 8)
+        self.assertEqual(len({r["observation_id"] for r in rows}), 8)
+        for event in ("SessionStart", "Stop", "SubagentStop", "SessionEnd"):
+            self.assertEqual(sum(r["event"] == event for r in rows), 2)
+        for row in rows:
+            self.assertFalse(
+                {"duration", "ended_at", "actor_ref", "stop_hook_active"} & row.keys()
+            )
+            if row["event"] != "SessionEnd":
+                self.assertNotIn("reason", row)
+
+    def test_fixture_resume_failure_child_correlation_and_repeated_starts(self):
+        # Synthetic hook contract only: no claim about interactive Claude behavior.
+        def emit(event, **fields):
+            self.hook(
+                dict(
+                    hook_event_name=event,
+                    session_id="parent-session",
+                    cwd=str(self.repo),
+                    **fields,
+                )
+            )
+
+        for source in ("startup", "resume", "resume"):
+            emit("SessionStart", source=source, model="fixture-model")
+        for _ in range(2):
+            emit("PreToolUse", tool_use_id="failed-read", tool_name="Read")
+            emit(
+                "PostToolUseFailure",
+                tool_use_id="failed-read",
+                tool_name="Read",
+                error="PRIVATE_SENTINEL",
+                tool_input={"path": "PRIVATE_SENTINEL"},
+            )
+            for child in ("child-a", "child-b"):
+                emit("SubagentStart", agent_id=child, agent_type="Explore")
+                emit(
+                    "PreToolUse",
+                    agent_id=child,
+                    tool_use_id="same-tool",
+                    tool_name="Read",
+                )
+                emit(
+                    "PostToolUse",
+                    agent_id=child,
+                    tool_use_id="same-tool",
+                    tool_name="Read",
+                )
+                emit("SubagentStop", agent_id=child, agent_type="Explore")
+            emit("Stop", prompt_id="turn-one")
+        rows = self.rows()
+        self.assertEqual(len(rows), 14)
+        self.assertEqual(
+            [r["source"] for r in rows if r["event"] == "SessionStart"],
+            ["startup", "resume", "resume"],
+        )
+        self.assertFalse(any(r["event"] == "SessionEnd" for r in rows))
+        for child in ("child-a", "child-b"):
+            child_rows = [r for r in rows if r.get("agent_id") == child]
+            self.assertEqual(
+                [r["event"] for r in child_rows],
+                ["SubagentStart", "PreToolUse", "PostToolUse", "SubagentStop"],
+            )
+            self.assertTrue(
+                all(r["session_id"] == "parent-session" for r in child_rows)
+            )
+        failed = [r for r in rows if r["event"] == "PostToolUseFailure"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["tool_use_id"], "failed-read")
+        self.assertTrue(
+            all(
+                not {"duration", "ended_at", "actor_ref", "error"} & r.keys()
+                for r in rows
+            )
+        )
+        emit("SessionEnd", reason="other")
+        self.assertEqual(len(self.rows()), 15)
+        for file in self.outbox.iterdir():
+            if file.is_file():
+                self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
+
+    def test_fixture_exception_cleanup_disables_later_lifecycle(self):
+        try:
+            self.hook(dict(self.raw, hook_event_name="SessionStart", source="startup"))
+            raise RuntimeError("synthetic host failure")
+        except RuntimeError:
+            pass
+        finally:
+            self.uninstall()
+        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+        before = self.rows()
+        for event in EVENTS:
+            self.hook(dict(self.raw, hook_event_name=event))
+        self.assertEqual(self.rows(), before)
+        self.assertEqual([r["event"] for r in before], ["SessionStart"])
+
+    def test_invalid_scope_and_payload_are_neutral(self):
+        outside = self.root / "repo-other"
+        outside.mkdir()
+        (self.repo / "escape").symlink_to(outside, target_is_directory=True)
+        cases = [
+            dict(self.raw, cwd=str(outside)),
+            dict(self.raw, cwd=str(self.repo / "escape")),
+            dict(self.raw, cwd="relative"),
+            dict(self.raw, hook_event_name="Unknown"),
+            dict(self.raw, session_id="bad token"),
+            dict(self.raw, prompt_id=None),
+            dict(self.raw, tool_use_id="x" * 201),
+        ]
+        for value in cases:
+            self.hook(value)
+        for raw in (
+            b"{invalid",
+            b"[]",
+            b"x" * 65537,
+            b'{"session_id":"one","session_id":"two"}',
+        ):
+            self.hook(raw=raw)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(
+            self.drops(),
+            {
+                "outside_scope": 2,
+                "invalid": 3,
+                "invalid_json": 4,
+                "invalid_prompt_id": 1,
+                "invalid_tool_use_id": 1,
+            },
+        )
+        child = self.repo / "sub"
+        child.mkdir()
+        self.hook(dict(self.raw, cwd=str(child)))
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_permission_prompt_records_its_moment_and_nothing_private(self):
+        self.hook(
+            {
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "cwd": str(self.repo),
+                "tool_name": "Bash",
+                "tool_input": {"command": "PRIVATE_SENTINEL"},
+            }
+        )
+        self.assertEqual([row["event"] for row in self.rows()], ["PermissionRequest"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(self.rows()))
+
+    def test_a_bad_agent_type_costs_the_label_and_not_the_row(self):
+        for tool, value in enumerate(("has space", None, "")):
+            self.hook(dict(self.raw, tool_use_id=f"tool-{tool}", agent_type=value))
+        self.assertEqual(len(self.rows()), 3)
+        self.assertFalse(any("agent_type" in row for row in self.rows()))
+        self.assertEqual(self.drops(), {})
+
+    def test_open_stdin_deadline_and_locked_spool(self):
+        start = time.monotonic()
+        process = subprocess.Popen(
+            [str(self.exe), "hook", "claude", str(self.plan)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertEqual(process.wait(timeout=1.5), 0)
+            self.assertLess(time.monotonic() - start, 1.3)
+            self.assertEqual(process.stdout.read(), b"")
+            self.assertEqual(process.stderr.read(), b"")
+        finally:
+            process.kill() if process.poll() is None else None
+            process.communicate()
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            db.execute("BEGIN EXCLUSIVE")
+            self.hook()
+        self.assertEqual(self.rows(), [])
+        self.hook()
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_concurrent_dedup_and_registration_lock(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(lambda _: self.hook(), range(12)))
+        self.assertEqual(len(self.rows()), 1)
+        with (self.outbox / "claude-settings.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.hook(dict(self.raw, tool_use_id="locked"))
+            self.uninstall(code=2)
+        self.assertEqual(len(self.rows()), 1)
+        drops = self.drops()
+        self.assertGreaterEqual(drops.pop("busy"), 1)
+        self.assertLessEqual(drops.keys(), {"observation_conflict", "busy"})
+
+    def test_consent_stale_plan_owned_entry_and_unrelated_edits(self):
+        config = json.loads(self.settings.read_bytes())
+        config["new_customer_setting"] = True
+        extra = {"hooks": [{"type": "command", "command": "true"}]}
+        config["hooks"]["Stop"].append(extra)
+        self.save(self.settings, config)
+        self.uninstall()
+        expected = dict(self.original, new_customer_setting=True)
+        expected["hooks"]["Stop"].append(extra)
+        self.assertEqual(json.loads(self.settings.read_bytes()), expected)
+        before = self.settings.read_bytes()
+        _, err = self.install(code=2, answers=(b"n\n",))
+        self.assertIn(b"consent_declined", err)
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.install()
+        config = json.loads(self.settings.read_bytes())
+        config["hooks"]["Stop"][-1]["hooks"][0]["timeout"] = 10
+        self.save(self.settings, config)
+        before = self.settings.read_bytes()
+        self.uninstall(code=2)
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.hook()
+        self.assertEqual(self.rows(), [])
+
+    def test_changed_executable_scope_and_permissions(self):
+        self.pinned.chmod(0o755)
+        self.hook()
+        self.assertEqual(self.rows(), [])
+        self.pinned.chmod(0o700)
+        with self.pinned.open("ab") as f:
+            f.write(b"changed")
+        self.hook()
+        self.assertEqual(self.rows(), [])
+        self.uninstall()
+        self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+
+    def test_setup_crash_and_retry_keeps_atomic_settings(self):
+        # Real process death at varying points, never production fault switches.
+        self.uninstall()
+        for delay in (0, 0.01, 0.04, 0.08):
+            with self.subTest(delay=delay):
+                self.setup_then_kill(delay)
+                current = json.loads(self.settings.read_bytes())
+                installed = (self.data / "install.json").exists()
+                if current != self.original:
+                    entry = json.loads(self.newest_plan().read_bytes())["entry"]
+                    self.assertTrue(
+                        all(current["hooks"][e].count(entry) == 1 for e in EVENTS)
+                    )
+                    # Hooks without an install record could be removed by
+                    # neither setup nor uninstall.
+                    self.assertTrue(installed, "hooks written, no install record")
+                # A retry works both before and after the atomic rename.
+                if not installed:
+                    self.install()
+                self.hook()
+                self.uninstall()
+                self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+        with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+
+    def setup_then_kill(self, delay):
+        """Answer setup's question on a terminal, then kill it `delay` seconds later."""
+        args = [self.exe, "setup", "--settings", self.settings, "--origin"]
+        args += [self.origin, "--trust-origin", "--no-browser"]
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        process = subprocess.Popen(
+            [str(a) for a in args],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.setup_env,
+        )
+        os.close(slave)
+        seen = b""
+        deadline = time.monotonic() + 20
+        while terminal.PROMPT not in seen and time.monotonic() < deadline:
+            seen += os.read(process.stdout.fileno(), 4096)
+        self.assertIn(terminal.PROMPT, seen)
+        os.write(master, b"y\n")
+        time.sleep(delay)
+        process.kill()
+        process.communicate(timeout=10)
+
+    def test_scope_changed_and_untrusted_registration_files(self):
+        saved_plan = self.plan.read_bytes()
+        proposal = json.loads(saved_plan)
+        proposal["scope"]["collector_ref"] = "changed"
+        self.save(self.plan, proposal)
+        self.hook()
+        self.assertEqual(self.rows(), [])
+        self.plan.write_bytes(saved_plan)
+        self.plan.chmod(0o644)
+        self.hook()
+        self.assertEqual(self.rows(), [])
+        self.plan.chmod(0o600)
+        alias = self.root / "hardlink"
+        os.link(self.plan, alias)
+        self.hook()
+        self.assertEqual(self.rows(), [])
+        alias.unlink()
+        self.uninstall()
+        original = self.settings.read_bytes()
+        plans = sorted((self.data / "plans").iterdir())
+        self.settings.write_bytes(
+            b'{"hooks":{},"permissions":{"allow":[],"allow":["Write"]}}'
+        )
+        self.install(code=2)
+        self.assertEqual(sorted((self.data / "plans").iterdir()), plans)
+        self.settings.write_bytes(original)
+        edited = dict(self.original, edit_after_plan=True)
+        self.refused_while_asked(lambda _: self.save(self.settings, edited))
+        self.assertEqual(json.loads(self.settings.read_bytes()), edited)
+
+    def test_full_spool_neutral_without_mutation(self):
+        # Exercise the real conservative admission boundary through the hook.
+        for i in range(900):
+            self.hook(dict(self.raw, tool_use_id=f"fill-{i}"))
+            if i % 100 == 99 and self.drops().get("spool_full"):
+                break
+        else:
+            self.fail("expected conservative capacity refusal")
+        before = self.rows()
+        self.assertGreater(len(before), 100)
+        self.hook(dict(self.raw, tool_use_id="after-full"))
+        self.assertEqual(self.rows(), before)
+        self.assertLessEqual(
+            (self.outbox / "collector-rust-v1.sqlite3").stat().st_size,
+            16 * 1024 * 1024,
+        )
+
+    def test_outside_scope_event_counts_a_drop_without_a_row(self):
+        outside = self.root / "repo-other"
+        outside.mkdir()
+        self.hook(dict(self.raw, cwd=str(outside)))
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.drops(), {"outside_scope": 1})
+
+    def test_settings_readable_by_others_but_writable_only_by_owner(self):
+        self.uninstall()
+        home = self.root / "other-home"
+        home.mkdir(mode=0o700)
+        claude = home / ".claude"
+        claude.mkdir()
+        claude.chmod(0o755)
+        settings = claude / "settings.json"
+        settings.write_text(json.dumps(self.original))
+        settings.chmod(0o644)
+        self.install(settings=settings)
+        plan = self.plan
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o644)
+        self.hook(plan=plan)
+        self.assertEqual(len(self.rows()), 1)
+        for path, mode in ((settings, 0o664), (settings, 0o777), (claude, 0o777)):
+            with self.subTest(path=path.name, mode=oct(mode)):
+                original = path.stat().st_mode & 0o777
+                path.chmod(mode)
+                self.hook(dict(self.raw, tool_use_id=f"mode-{mode}"), plan=plan)
+                self.uninstall(code=2)
+                path.chmod(original)
+        alias = home / "settings-alias.json"
+        os.link(settings, alias)
+        self.hook(dict(self.raw, tool_use_id="hardlinked"), plan=plan)
+        self.uninstall(code=2)
+        alias.unlink()
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {"permission": 4})
+        self.uninstall()
+        self.assertEqual(json.loads(settings.read_bytes()), self.original)
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o644)
+        linked = self.root / "linked-home"
+        linked.symlink_to(home, target_is_directory=True)
+        _, err = self.install(settings=linked / ".claude/settings.json", code=2)
+        self.assertNotIn(b"already_installed", err)
+        self.assertFalse((self.data / "install.json").exists())
+
+    def test_broken_settings_count_as_stale_plan_not_invalid_events(self):
+        text = self.settings.read_text()
+        for broken in ('{"permissions": {}, ' + text[1:], text[:-1]):
+            with self.subTest(broken=broken[:20]):
+                self.settings.write_text(broken)
+                self.hook()
+        self.assertEqual(self.rows(), [])
+        self.settings.write_text(text)  # doctor reads the settings too
+        self.assertEqual(self.drops(), {"stale_plan": 2})
+
+    def test_python_observer_registration_is_refused(self):
+        self.uninstall()
+        plans = sorted((self.data / "plans").iterdir())
+        observer = {"type": "command", "command": "python3 /opt/observer_hook.py"}
+        self.save(
+            self.settings,
+            dict(self.original, hooks={"Stop": [{"hooks": [observer]}]}),
+        )
+        _, err = self.install(code=2)
+        self.assertIn(b"python_observer_registered", err)
+        self.assertEqual(sorted((self.data / "plans").iterdir()), plans)
+
+    def test_replaced_binary_is_rehashed_within_the_hook_deadline(self):
+        self.assertGreater(self.pinned.stat().st_size, 32 * 1024 * 1024)
+        fingerprint = self.outbox / "executable-fingerprint"
+        self.hook()
+        before = fingerprint.read_bytes()
+        replacement = self.root / "replacement"
+        shutil.copyfile(ROOT / "target/debug/devdiary", replacement)
+        replacement.chmod(0o700)
+        os.replace(replacement, self.pinned)
+        self.hook(dict(self.raw, tool_use_id="after-replace"))
+        self.assertEqual(len(self.rows()), 2)
+        self.assertNotEqual(fingerprint.read_bytes(), before)
+        with self.pinned.open("ab") as f:
+            f.write(b"changed")
+        self.hook(dict(self.raw, tool_use_id="after-change"))
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(self.drops(), {"stale_plan": 1})
+
+    def test_large_tool_payload_is_skipped_up_to_sixteen_mebibytes(self):
+        self.hook(dict(self.raw, tool_response="PRIVATE_SENTINEL" * 200_000))
+        self.assertEqual(len(self.rows()), 1)
+        self.hook(raw=b'{"pad":"' + b"x" * (16 * 1024 * 1024) + b'"}')
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.drops(), {"input_too_large": 1})
+        for file in self.outbox.iterdir():
+            self.assertNotIn(b"PRIVATE_SENTINEL", file.read_bytes())
+
+    def test_hook_to_real_cli_http_delivery(self):
+        self.hook()
+        spooled = self.rows()
+        (self.outbox / "executable-fingerprint").unlink()
+        doctor = self.sync()
+        self.assertTrue((self.outbox / "executable-fingerprint").exists())
+        self.assertEqual([json.loads(r) for r in self.received], spooled)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(
+            (doctor["pending"], doctor["delivered"], doctor["drops"]), (0, 1, {})
+        )
 
 
 class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
@@ -1324,8 +1244,6 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
             offered.chmod(0o600)
             self.assertTrue(self.status()["offered_list_unreadable"], bad)
             self.assertFalse(self.status()["waiting_for_approval"], bad)
-        plain = json.loads(self.run_collector("status", self.outbox).stdout)
-        self.assertTrue(plain["orchestrators_offered_unreadable"])
         self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
         self.assertEqual(self.rows()[0]["orchestrator"], "paperclip")
         self.served_orchestrators = [PAPERCLIP]
@@ -1375,9 +1293,8 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
         self.hook(self.main, PAPERCLIP_AGENT_ID=AGENT)
         self.served_orchestrators = [EVIL, CRON]
         self.served_refs = ["https://github.com/acme/other"]
-        result = self.sync()
         self.assertEqual(
-            json.loads(result.stdout)["scope_refresh_error"],
+            self.sync()["last_scope_refresh_error"],
             "scope_refresh_offer_refused",
         )
         self.assertEqual(len(self.received), 1)
@@ -1386,9 +1303,8 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
             (self.outbox / "orchestrators-approved.json").read_bytes(), approved
         )
         self.assertEqual(self.saved_refs(), self.served_refs)
-        health = self.run_collector("connection-status", self.connection)
         self.assertEqual(
-            json.loads(health.stdout)["local_scope_refresh_error"],
+            self.doctor()["last_scope_refresh_error"],
             "scope_refresh_offer_refused",
         )
 
@@ -1424,9 +1340,8 @@ class InstallationScopeHookTest(InstallationFixture, unittest.TestCase):
     def test_a_first_offer_with_a_refused_entry_is_saved_clean_and_reported(self):
         self.served_orchestrators = [EVIL, PAPERCLIP]
         self.connect(approved=None)
-        result = self.sync()
         self.assertEqual(
-            json.loads(result.stdout)["scope_refresh_error"],
+            self.sync()["last_scope_refresh_error"],
             "scope_refresh_offer_refused",
         )
         self.assertEqual(self.offered(), {"orchestrators": [PAPERCLIP], "refused": 1})
@@ -1627,9 +1542,8 @@ class DeclaredRunHookTest(InstallationFixture, unittest.TestCase):
     def test_a_refused_reply_keeps_the_last_good_answer(self):
         self.accepted()
         self.served_declared_run = "true"
-        result = self.sync()
         self.assertEqual(
-            json.loads(result.stdout)["scope_refresh_error"],
+            self.sync()["last_scope_refresh_error"],
             "scope_refresh_invalid_response",
         )
         self.hook(self.main, DEVDIARY_RUN_REF=DECLARED)

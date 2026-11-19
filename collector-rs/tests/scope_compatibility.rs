@@ -4,7 +4,6 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     os::unix::fs::PermissionsExt,
-    process::Command,
 };
 
 enum Want {
@@ -73,66 +72,65 @@ fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize
         )
         .ok();
     });
+    // A saved connection, as pairing leaves it; sync is the timer's path.
     let dir = tempfile::tempdir().unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let root = dir.path();
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+    let origin = endpoint.trim_end_matches("/ingest/v1/observations");
     let config = json!({"collector_ref":"collector-fixture", "endpoint":endpoint,
         "installation_id":"11111111-1111-4111-8111-111111111111", "observation_schema_versions":[1,2],
         "record_orchestrated_outside_repos":false,"scope_kind":"installation"});
-    devdiary::store::Store::open(dir.path(), Some(&serde_json::to_vec(&config).unwrap())).unwrap();
-    let refs = dir.path().join("repository-refs.json");
-    fs::write(&refs, b"[\"https://github.com/acme/old\"]").unwrap();
-    fs::set_permissions(&refs, fs::Permissions::from_mode(0o600)).unwrap();
-    let offered = dir.path().join("orchestrators-offered.json");
-    fs::write(&offered, saved).unwrap();
-    fs::set_permissions(&offered, fs::Permissions::from_mode(0o600)).unwrap();
-    let approved = dir.path().join("orchestrators-approved.json");
-    fs::write(&approved, b"[]").unwrap();
-    fs::set_permissions(&approved, fs::Permissions::from_mode(0o600)).unwrap();
-    let credentials = tempfile::tempdir().unwrap();
-    fs::set_permissions(credentials.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let key = credentials.path().join("key");
-    fs::write(&key, b"dc_live_secret_fixture").unwrap();
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_devdiary"))
-        .arg("sync")
-        .arg(dir.path())
-        .arg(&key)
-        .arg("1")
-        .output()
-        .unwrap();
+    let installation = json!({"installation_id":"11111111-1111-4111-8111-111111111111",
+        "origin":origin, "scope_kind":"installation", "record_orchestrated_outside_repos":false});
+    let token = format!("dc_live_{}", "s".repeat(43));
+    let saved_connection = json!({"scope":config, "token":token,
+        "repository_refs":["https://github.com/acme/old"]});
+    let outbox = root.join("outbox");
+    for (path, raw) in [
+        (root.join("installation.json"), installation.to_string()),
+        (root.join("connection.json"), saved_connection.to_string()),
+    ] {
+        fs::write(&path, raw).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::create_dir(&outbox).unwrap();
+    fs::set_permissions(&outbox, fs::Permissions::from_mode(0o700)).unwrap();
+    let refs = outbox.join("repository-refs.json");
+    let offered = outbox.join("orchestrators-offered.json");
+    let approved = outbox.join("orchestrators-approved.json");
+    for (path, raw) in [
+        (&refs, "[\"https://github.com/acme/old\"]"),
+        (&offered, saved),
+        (&approved, "[]"),
+    ] {
+        fs::write(path, raw).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let result = devdiary::pairing::sync(root, 1);
     server.join().unwrap();
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.success(), !matches!(want, Stopped), "{error}");
-    assert!(!error.contains("dc_live_secret_fixture"));
-    assert!(!error.contains("response-secret"));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("dc_live_secret_fixture"));
-    assert!(!stdout.contains("response-secret"));
+    assert_eq!(result.is_ok(), !matches!(want, Stopped));
+    if let Err(error) = &result {
+        assert!(!error.to_string().contains(&token));
+        assert!(!error.to_string().contains("response-secret"));
+    }
     assert_eq!(fs::read(approved).unwrap(), b"[]");
     let reported = match want {
         Kept(code) => Some(code),
         Refused(_) => Some(OFFER_REFUSED),
         Applied | Stopped => None,
     };
-    if let Some(code) = reported {
-        let line: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(stdout.lines().count(), 1);
-        assert_eq!(line["scope_refresh_error"], code);
+    if let Ok(report) = &result {
+        assert_eq!(report.scope_refresh_error, reported);
     }
     let refs_now = fs::read_to_string(refs).unwrap();
     let offer_now = fs::read_to_string(offered).unwrap();
     match want {
-        Applied => {
-            assert!(!stdout.contains("scope_refresh_error"));
-            assert_eq!(refs_now, NEW_REFS);
-        }
+        Applied => assert_eq!(refs_now, NEW_REFS),
         Refused(offer) => {
-            assert!(!error.trim().is_empty());
             assert_eq!(refs_now, NEW_REFS);
             assert_eq!(serde_json::from_str::<Value>(&offer_now).unwrap(), offer);
         }
         Kept(_) | Stopped => {
-            assert!(!error.trim().is_empty());
             assert_eq!(offer_now, saved);
             assert_eq!(refs_now, "[\"https://github.com/acme/old\"]");
         }

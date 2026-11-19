@@ -1,4 +1,9 @@
-"""Real subprocess/HTTP tests; only disposable state and synthetic credentials."""
+"""Real subprocess/HTTP delivery tests; only disposable state and synthetic credentials.
+
+Rows come from the installed hook and leave through `sync CONNECTION_DIR`, the
+command the timer runs. Frozen bytes and scope refresh are covered at the library
+level in contract.rs and scope_compatibility.rs.
+"""
 
 import concurrent.futures
 import json
@@ -14,11 +19,15 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from devdiary import observer_upload
+import saved_connection
+import terminal
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target/debug/devdiary"
 FIXTURES = ROOT / "tests/fixtures"
+TOKEN = saved_connection.TOKEN
+REF = "https://github.com/acme/demo"
+GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid"]
 
 
 class CollectorTest(unittest.TestCase):
@@ -26,16 +35,8 @@ class CollectorTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.state = self.root / "rust-state"
-        self.state.mkdir(mode=0o700)
-        self.key = self.root / "key"
-        self.key.write_text("dc_live_SYNTHETIC_ONLY")
-        self.key.chmod(0o600)
-        self.config = json.loads((FIXTURES / "scope.json").read_bytes())
-        self.row = json.loads((FIXTURES / "local-observation.json").read_bytes())
         self.requests = []
         self.mode = "ok"
-        self.scope = None
         self.entered = threading.Event()
         self.release = threading.Event()
         owner = self
@@ -45,15 +46,17 @@ class CollectorTest(unittest.TestCase):
                 pass
 
             def do_GET(self):
-                if owner.scope is None:
-                    return self.send_error(501)
-                if owner.scope == "loss":
-                    self.connection.shutdown(socket.SHUT_RDWR)
-                    self.connection.close()
-                    return
-                status, body, *length = owner.scope
-                self.send_response(status)
-                self.send_header("Content-Length", str(*length or [len(body)]))
+                body = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "collector_ref": "collector-fixture",
+                        "scope_kind": "installation",
+                        "repository_refs": [REF],
+                        "observation_schema_versions": [1, 2],
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -98,10 +101,39 @@ class CollectorTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.stop_server)
-        self.config["endpoint"] = (
-            f"http://127.0.0.1:{self.server.server_port}/ingest/v1/observations"
+        self.install(f"http://127.0.0.1:{self.server.server_port}")
+
+    def install(self, origin, code=0):
+        """Save a connection as pairing leaves it, then run setup on a terminal."""
+        self.home = self.root / "home"
+        scope = json.loads((FIXTURES / "installation-scope.json").read_bytes())
+        self.connection = saved_connection.save(
+            self.home,
+            origin,
+            [REF],
+            collector_ref=scope["collector_ref"],
+            installation_id=scope["installation_id"],
         )
-        self.call("init", "--consent", data=self.config)
+        data = self.connection.parent
+        settings = self.root / "settings.json"
+        settings.write_text("{}")
+        settings.chmod(0o600)
+        base = {k: v for k, v in os.environ.items() if not k.startswith("PAPERCLIP_")}
+        self.env = saved_connection.environment(self.root, self.home, base)
+        self.env["HTTP_PROXY"] = "http://127.0.0.1:1"
+        args = [BIN, "setup", "--settings", settings, "--origin", origin]
+        args += ["--trust-origin", "--no-browser"]
+        status, _, self.setup_err, _ = terminal.answering(args, self.env)
+        self.assertEqual(status, code, self.setup_err)
+        record = json.loads((data / "install.json").read_bytes())
+        self.exe, self.plan = record["executable"], record["plan"]
+        self.outbox = self.connection / "outbox"
+        self.repo = self.root / "demo"
+        subprocess.run([*GIT, "init", "-q", str(self.repo)], check=True)
+        subprocess.run(
+            [*GIT, "-C", str(self.repo), "remote", "add", "origin", REF + ".git"],
+            check=True,
+        )
 
     def stop_server(self):
         self.release.set()
@@ -109,134 +141,91 @@ class CollectorTest(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
-    def call(self, command, *args, data=None, code=0):
-        raw = json.dumps(data).encode() if isinstance(data, dict) else data
-        result = subprocess.run(
-            [str(BIN), command, str(self.state), *map(str, args)],
-            input=raw,
-            check=False,
+    def hook(self, session="session-1", **fields):
+        # A tool ID makes the row's identity stable, so a repeat deduplicates.
+        event = {
+            "hook_event_name": "PostToolUse",
+            "session_id": session,
+            "cwd": str(self.repo),
+            "tool_use_id": "tool-" + session,
+            "tool_name": "Read",
+            **fields,
+        }
+        subprocess.run(
+            [self.exe, "hook", "claude", self.plan],
+            input=json.dumps(event).encode(),
             capture_output=True,
-            timeout=9,
-            env={**os.environ, "HTTP_PROXY": "http://127.0.0.1:1"},
+            check=True,
+            timeout=5,
+            env=self.env,
+        )
+
+    def sync(self, code=0):
+        result = subprocess.run(
+            [self.exe, "sync", str(self.connection)],
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=self.env,
         )
         self.assertEqual(result.returncode, code, result.stderr)
-        self.assertNotIn(b"PRIVATE-SENTINEL", result.stdout + result.stderr)
         self.assertNotIn(b"dc_live_", result.stdout + result.stderr)
         return result
 
+    def doctor(self, code=0):
+        result = subprocess.run(
+            [str(BIN), "doctor"],
+            capture_output=True,
+            check=False,
+            timeout=10,
+            env=self.env,
+        )
+        self.assertEqual(result.returncode, code, result.stderr)
+        return json.loads(result.stdout) if code == 0 else None
+
     def db(self):
-        db = sqlite3.connect(self.state / "collector-rust-v1.sqlite3")
+        db = sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3")
         self.addCleanup(db.close)
         return db
 
-    def collect(self, number=2, **changes):
-        row = {**self.row, **changes}
-        row["observation_id"] = f"{number:08d}-2222-4222-8222-222222222222"
-        self.call("collect", data=row)
-        return row
+    def pending(self):
+        return self.db().execute("SELECT count(*) FROM outbox").fetchone()[0]
 
-    def test_python_conformance_timestamp_null_and_vendor_ids(self):
-        cases = json.loads((FIXTURES / "timestamps.json").read_bytes())
-        for i, case in enumerate(cases):
-            timestamp = case["observed_at"]
-            if case["timestamp"] is None:
-                self.call(
-                    "collect", data={**self.row, "observed_at": timestamp}, code=2
-                )
-                continue
-            row = self.collect(i, observed_at=timestamp, prompt_id=None)
-            projected = {
-                k: v
-                for k, v in row.items()
-                if k in observer_upload.FIELDS and v is not None
-            }
-            expected = observer_upload.envelope(projected, self.config)
-            self.assertEqual(json.loads(expected)["observed_at"], case["timestamp"])
-            actual = (
-                self.db()
-                .execute(
-                    "SELECT payload FROM outbox WHERE observation_id=?",
-                    (row["observation_id"],),
-                )
-                .fetchone()[0]
-            )
-            self.assertEqual(actual, expected)
-        self.call("sync", self.key, 100)
+    def test_every_request_carries_the_token_and_no_private_file_leaks(self):
+        self.hook(prompt="PRIVATE-SENTINEL")
+        self.sync()
+        self.assertEqual(len(self.requests), 1)
         for raw, auth in self.requests:
-            self.assertEqual(auth, "Bearer dc_live_SYNTHETIC_ONLY")
+            self.assertEqual(auth, "Bearer " + TOKEN)
             self.assertNotIn(b"PRIVATE-SENTINEL", raw)
-            observer_upload.receipt(
-                json.dumps(
-                    {
-                        "observation_id": json.loads(raw)["observation_id"],
-                        "installation_id": self.config["installation_id"],
-                        "collector_ref": self.config["collector_ref"],
-                        "record_id": 17,
-                    }
-                ),
-                raw,
-                self.config["collector_ref"],
-            )
-        for path in self.state.iterdir():
+        for path in self.outbox.iterdir():
             self.assertEqual(path.stat().st_mode & 0o077, 0)
             self.assertNotIn(b"PRIVATE-SENTINEL", path.read_bytes())
             self.assertNotIn(b"dc_live_", path.read_bytes())
 
     def test_byte_capacity_retains_and_delivers_every_accepted_row(self):
-        # Real valid large rows through admission, not 10,000 injected {} blobs.
-        large = {
-            key: "x" * 130
-            for key in (
-                "prompt_id",
-                "turn_id",
-                "tool_use_id",
-                "agent_id",
-                "agent_type",
-                "model",
-                "tool_name",
-                "source",
-                "reason",
-            )
-        }
-        accepted = {}
-        row = self.row
-        for number in range(10001):
-            row = {
-                **self.row,
-                **large,
-                "observation_id": f"{number:08d}-2222-4222-8222-222222222222",
-            }
-            result = subprocess.run(
-                [str(BIN), "collect", str(self.state)],
-                input=json.dumps(row).encode(),
-                check=False,
-                capture_output=True,
-                timeout=9,
-            )
-            if result.returncode:
-                self.assertEqual(result.returncode, 2, result.stderr)
+        # Real rows through the hook's admission, not injected blobs.
+        for number in range(1200):
+            self.hook(f"fill-{number}")
+            if number % 100 == 99 and self.doctor()["drops"].get("spool_full"):
                 break
-            projected = {
-                k: v
-                for k, v in row.items()
-                if k in observer_upload.FIELDS and v is not None
-            }
-            accepted[row["observation_id"]] = observer_upload.envelope(
-                projected, self.config
-            )
-        count = len(accepted)
+        else:
+            self.fail("expected conservative capacity refusal")
+        count = self.pending()
         self.assertGreater(count, 100)
-        self.assertLess(count, 10000)  # byte capacity, not the row-count guard
         db = self.db()
-        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], count)
         self.assertLessEqual(db.execute("PRAGMA page_count").fetchone()[0], 4096)
-        # Global failure, then restart and wrap all rows with row-specific failures.
+        accepted = {
+            json.loads(payload)["observation_id"]: payload
+            for (payload,) in db.execute("SELECT payload FROM outbox")
+        }
+        # A global failure stops the run at its first row.
         self.mode = 503
-        self.call("sync", self.key, 100, code=1)
-        self.assertEqual(db.execute("SELECT cursor FROM scope").fetchone()[0], 1)
+        self.sync()
+        self.assertEqual(len(self.requests), 1)
+        # Row-specific refusals: each row is tried once per run, then kept.
         self.mode = "wrong"
-        for _ in range((count + 99) // 100):
-            self.call("sync", self.key, 100, code=1)
+        self.sync()
         self.assertEqual(
             db.execute(
                 "SELECT count(*) FROM outbox WHERE failure='invalid_receipt'"
@@ -244,68 +233,55 @@ class CollectorTest(unittest.TestCase):
             count,
         )
         self.mode = "ok"
-        for remaining in range(count, 0, -100):
-            self.call("sync", self.key, 100, code=int(remaining > 100))
-        status = json.loads(self.call("status").stdout)
-        self.assertEqual((status["pending"], status["delivered"]), (0, count))
-        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
-        self.collect(0, **large)  # an exact retry of a delivered row stays deduplicated
-        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
-        self.call("collect", data=row)  # reclaimed capacity admits the refused row
-        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 1)
-        (raw_receipt,) = db.execute("SELECT last_receipt FROM scope").fetchone()
-        last = json.loads(raw_receipt)["observation_id"]
-        observer_upload.receipt(
-            raw_receipt, accepted[last], self.config["collector_ref"]
-        )
-        self.assertLessEqual(db.execute("PRAGMA page_count").fetchone()[0], 4096)
+        self.sync()
+        doctor = self.doctor()
+        self.assertEqual((doctor["pending"], doctor["delivered"]), (0, count))
+        self.hook("fill-0")  # a delivered row's identity is never spooled again
+        self.assertEqual(self.pending(), 0)
+        self.hook("after-capacity")  # reclaimed capacity admits a new row
+        self.assertEqual(self.pending(), 1)
         self.assertLessEqual(
-            (self.state / "collector-rust-v1.sqlite3").stat().st_size, 16 * 1024 * 1024
+            (self.outbox / "collector-rust-v1.sqlite3").stat().st_size,
+            16 * 1024 * 1024,
         )
         for raw, _ in self.requests:
             self.assertEqual(raw, accepted[json.loads(raw)["observation_id"]])
-        print(
-            f"capacity regression: {count} accepted, {count} acknowledged; "
-            f"{db.execute('PRAGMA page_count').fetchone()[0]} physical pages <=4096"
-        )
 
     def test_response_loss_exact_replay_and_dedup(self):
-        self.collect()
-        self.collect()
+        self.hook()
         self.mode = "loss"
-        self.call("sync", self.key, 1, code=1)
+        self.sync()
+        self.assertEqual(self.pending(), 1)
         self.mode = "ok"
-        self.call("sync", self.key, 1)
-        self.assertEqual(self.requests[0][0], self.requests[1][0])
-        self.assertEqual(
-            self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 0
-        )
-        self.assertEqual(json.loads(self.call("status").stdout)["delivered"], 1)
+        self.sync()
+        self.assertEqual(self.requests[0][0], self.requests[-1][0])
+        self.assertEqual(self.pending(), 0)
+        self.assertEqual(self.doctor()["delivered"], 1)
 
-    def test_poison_fairness_and_global_failure_cursor(self):
-        self.collect()
-        self.collect(3, session_id="session-2")
-        self.mode = 401
-        self.call("sync", self.key, 100, code=1)
+    def test_poison_row_is_kept_and_the_next_row_still_goes(self):
+        self.hook()
+        self.hook("session-2")
+        self.mode = 503
+        self.sync()
         self.assertEqual(len(self.requests), 1)
         self.mode = "poison"
-        self.call("sync", self.key, 1, code=1)
-        self.assertEqual(json.loads(self.requests[-1][0])["session_id"], "session-2")
-        self.call("sync", self.key, 100, code=1)
-        self.assertEqual(
-            self.db().execute("SELECT observation_id FROM outbox").fetchall(),
-            [("00000002-2222-4222-8222-222222222222",)],
-        )
-        self.assertEqual(json.loads(self.call("status").stdout)["delivered"], 1)
+        self.sync()
+        # The run starts after the row the global failure stopped at.
+        sessions = [json.loads(raw)["session_id"] for raw, _ in self.requests[1:]]
+        self.assertEqual(sessions, ["session-2", "session-1"])
+        self.assertEqual(self.pending(), 1)
+        (kept,) = self.db().execute("SELECT payload FROM outbox").fetchone()
+        self.assertEqual(json.loads(kept)["session_id"], "session-1")
+        self.assertEqual(self.doctor()["delivered"], 1)
 
     def test_crash_after_server_acceptance_keeps_bytes_and_cursor(self):
-        self.collect()
-        self.collect(3, session_id="session-2")
+        self.hook()
         self.mode = "wait"
         process = subprocess.Popen(
-            [str(BIN), "sync", str(self.state), str(self.key), "1"],
+            [self.exe, "sync", str(self.connection)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=self.env,
         )
         try:
             self.assertTrue(self.entered.wait(3))
@@ -317,67 +293,44 @@ class CollectorTest(unittest.TestCase):
                 process.communicate()
             self.release.set()
         self.assertEqual(self.db().execute("SELECT cursor FROM scope").fetchone()[0], 1)
+        self.assertEqual(self.pending(), 1)
         self.mode = "ok"
-        self.call("sync", self.key, 1, code=1)
-        self.call("sync", self.key, 1)
+        self.sync()
         self.assertEqual(self.requests[0][0], self.requests[-1][0])
+        self.assertEqual(self.pending(), 0)
 
-    def test_redirect_invalid_receipts_and_global_failures(self):
-        self.collect()
-        for mode in [302, "wrong", "oversize", 403, 429, 503]:
-            self.mode = mode
-            before = len(self.requests)
-            self.call("sync", self.key, 100, code=1)
-            self.assertEqual(len(self.requests), before + 1)
-            self.assertEqual(
-                self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 1
-            )
-        self.key.write_text("dc_live_ROTATED_SYNTHETIC")
+    def test_redirect_invalid_receipts_and_global_failures_keep_the_row(self):
+        self.hook()
+        for mode in [302, "wrong", "oversize", 503]:
+            with self.subTest(mode=mode):
+                self.mode = mode
+                before = len(self.requests)
+                self.sync()
+                self.assertEqual(len(self.requests), before + 1)
+                self.assertEqual(self.pending(), 1)
+                self.assertIsNotNone(self.doctor()["last_sync_error"])
         self.mode = "ok"
-        self.call("sync", self.key, 1)
-        self.assertEqual(self.requests[-1][1], "Bearer dc_live_ROTATED_SYNTHETIC")
+        self.sync()
+        self.assertEqual(self.pending(), 0)
+        self.assertIsNone(self.doctor()["last_sync_error"])
 
-    def test_scope_credential_permissions_and_python_spool_refusal(self):
-        self.collect()
-        for key, value in [
-            ("endpoint", "https://other.test/ingest/v1/observations"),
-            ("collector_ref", "other"),
-            ("repository_ref", "https://github.com/acme/other"),
-            ("installation_id", "33333333-3333-4333-8333-333333333333"),
-        ]:
-            self.call("init", "--consent", data={**self.config, key: value}, code=2)
-        self.key.chmod(0o644)
-        self.call("sync", self.key, 1, code=2)
-        self.key.chmod(0o600)
-        self.key.write_text("dd_live_actor_key")
-        self.call("sync", self.key, 1, code=2)
-        (self.state / "observations.sqlite3").touch(mode=0o600)
-        self.call("status", code=2)
-        self.assertEqual(self.requests, [])
-
-    def test_capacity_conflicts_concurrent_writers_and_atomicity(self):
+    def test_concurrent_hooks_spool_every_row_once(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(self.collect, range(10)))
-        self.assertEqual(
-            self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 10
-        )
-        self.call(
-            "collect",
-            data={
-                **self.row,
-                "observation_id": "00000002-2222-4222-8222-222222222222",
-                "session_id": "changed",
-            },
-            code=2,
-        )
+            list(pool.map(lambda n: self.hook(f"session-{n}"), range(10)))
+        self.assertEqual(self.pending(), 10)
+        self.hook("session-3")  # same identity, new time: a conflict, not a row
+        self.assertEqual(self.pending(), 10)
+        # The row-count guard holds even when the bytes would still fit.
         db = self.db()
         with db:
             db.executemany(
                 "INSERT INTO outbox(observation_id,payload) VALUES(?,?)",
                 [(f"capacity-{i}", b"{}") for i in range(9990)],
             )
-        self.call("collect", data=self.row, code=2)
-        self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 10000)
+        self.hook("session-over")
+        self.assertEqual(self.pending(), 10000)
+        drops = self.doctor()["drops"]
+        self.assertEqual(drops, {"observation_conflict": 1, "spool_full": 1})
 
     def test_untrusted_tls_certificate_is_not_accepted(self):
         cert, key = self.root / "cert.pem", self.root / "tls-key.pem"
@@ -411,14 +364,14 @@ class CollectorTest(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            self.state = self.root / "tls-state"
-            self.state.mkdir(mode=0o700)
-            self.config["endpoint"] = (
-                f"https://localhost:{server.server_port}/ingest/v1/observations"
-            )
-            self.call("init", "--consent", data=self.config)
-            self.collect()
-            self.call("sync", self.key, 1, code=1)
+            # A second installation saved against the TLS server. Setup registers,
+            # then reports the scope refresh that the certificate refused.
+            self.root = self.root / "tls"
+            self.root.mkdir()
+            self.install(f"https://localhost:{server.server_port}", code=2)
+            self.assertIn(b"Scope refresh failed", self.setup_err)
+            self.hook()
+            self.sync()
             self.assertEqual(
                 self.db().execute("SELECT failure FROM outbox").fetchone(),
                 ("network_failure",),
@@ -428,241 +381,46 @@ class CollectorTest(unittest.TestCase):
             server.server_close()
             thread.join()
 
-    def test_symlinks_hardlinks_foreign_schema_and_missing_consent(self):
-        link = self.root / "linked-key"
-        link.symlink_to(self.key)
-        self.call("sync", link, 1, code=2)
-        link.unlink()
-        os.link(self.key, link)
-        self.call("sync", self.key, 1, code=2)
-        link.unlink()
-        self.call("init", data=self.config, code=2)
+    def test_a_foreign_schema_or_a_python_spool_is_refused(self):
+        self.hook()
         db = self.db()
         with db:
             db.execute("PRAGMA user_version=3")
-        self.call("status", code=2)
+        self.sync(code=2)
         self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+        with db:
+            db.execute("PRAGMA user_version=0")
+        (self.outbox / "observations.sqlite3").touch(mode=0o600)
+        self.sync(code=2)
         self.assertEqual(self.requests, [])
 
     def test_collection_continues_during_exclusive_sync(self):
-        self.collect()
+        self.hook()
         self.mode = "wait"
         process = subprocess.Popen(
-            [str(BIN), "sync", str(self.state), str(self.key), "1"],
+            [self.exe, "sync", str(self.connection)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=self.env,
         )
         try:
             self.assertTrue(self.entered.wait(3))
-            self.collect(3)
-            self.call("sync", self.key, 1, code=2)
+            self.hook("session-2")
+            self.sync(code=2)
         finally:
             self.release.set()
             process.communicate(timeout=8)
         self.assertEqual(len(self.requests), 1)
-        status = json.loads(self.call("status").stdout)
-        self.assertEqual((status["pending"], status["delivered"]), (1, 1))
+        doctor = self.doctor()
+        self.assertEqual((doctor["pending"], doctor["delivered"]), (1, 1))
 
-    def test_blocked_and_oversize_stdin_and_network_deadlines(self):
-        self.call("collect", data=b" " * 65537, code=2)
-        process = subprocess.Popen(
-            [str(BIN), "collect", str(self.state)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            self.assertEqual(process.wait(timeout=2), 2)
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.communicate()
-        self.collect()
+    def test_a_stalled_server_is_abandoned_within_the_network_deadline(self):
+        self.hook()
         self.mode = "wait"
         start = time.monotonic()
-        self.call("sync", self.key, 1, code=1)
+        self.sync()
         self.assertLess(time.monotonic() - start, 7)
-
-    def installation_state(self, versions=(1, 2)):
-        config = json.loads((FIXTURES / "installation-scope.json").read_bytes())
-        config["endpoint"] = self.config["endpoint"]
-        config["observation_schema_versions"] = list(versions)
-        self.state = self.root / "installation-state"
-        self.state.mkdir(mode=0o700)
-        self.call("init", "--consent", data=config)
-
-    def test_v2_fixture_is_frozen_and_sent_byte_identical(self):
-        self.installation_state()
-        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
-        wire = (FIXTURES / "wire-v2.json").read_bytes()
-        self.call("collect", data=local)
-        self.call("collect", data=local)
-        (payload,) = self.db().execute("SELECT payload FROM outbox").fetchall()
-        self.assertEqual(payload[0], wire)
-        self.call("sync", self.key, 10)
-        self.assertEqual([raw for raw, _ in self.requests], [wire])
-        self.assertEqual(json.loads(self.call("status").stdout)["delivered"], 1)
-
-    def good_scope(self, **changes):
-        config = json.loads((FIXTURES / "installation-scope.json").read_bytes())
-        reply = {
-            "schema_version": 1,
-            "collector_ref": config["collector_ref"],
-            "scope_kind": "installation",
-            "repository_refs": ["https://github.com/acme/good"],
-            "observation_schema_versions": [1, 2],
-            "orchestrators": [
-                {"key": "paperclip", "env": {"run_ref": "PAPERCLIP_RUN_ID"}}
-            ],
-        }
-        return (200, json.dumps({**reply, **changes}).encode())
-
-    def collect_v2(self, number):
-        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
-        row = {**local, "observation_id": f"{number:08d}-2222-4222-8222-222222222222"}
-        self.call("collect", data=row)
-
-    def test_a_failed_refresh_keeps_the_scope_and_still_delivers(self):
-        self.installation_state()
-        self.scope = self.good_scope()
-        self.call("sync", self.key, 10)
-        refs = (self.state / "repository-refs.json").read_bytes()
-        offer = (self.state / "orchestrators-offered.json").read_bytes()
-        failures = {
-            "scope_refresh_network_failure": "loss",
-            "scope_refresh_http_failure": (503, b'{"error":"response-secret"}'),
-            "scope_refresh_read_failure": (200, b"{response-secret", 100),
-            "scope_refresh_response_too_large": (200, b"x" * 262145),
-            "scope_refresh_invalid_response": (200, b"{response-secret"),
-        }
-        for number, (code, scope) in enumerate(failures.items(), start=1):
-            with self.subTest(code):
-                self.scope = scope
-                self.collect_v2(number)
-                result = self.call("sync", self.key, 10)
-                (line,) = result.stdout.splitlines()
-                self.assertEqual(
-                    json.loads(line),
-                    {"pending": 0, "delivered": number, "scope_refresh_error": code},
-                )
-                self.assertNotIn(b"response-secret", result.stdout + result.stderr)
-                self.assertEqual(len(self.requests), number)
-                self.assertEqual(
-                    (self.state / "repository-refs.json").read_bytes(), refs
-                )
-                self.assertEqual(
-                    (self.state / "orchestrators-offered.json").read_bytes(), offer
-                )
-
-    def test_a_refused_entry_applies_refs_keeps_the_offer_and_still_delivers(self):
-        self.installation_state()
-        self.scope = self.good_scope()
-        self.call("sync", self.key, 10)
-        offer = (self.state / "orchestrators-offered.json").read_bytes()
-        evil = {"key": "evil", "env": {"agent_ref": "AWS_SECRET_ACCESS_KEY"}}
-        refs = ["https://github.com/acme/moved"]
-        self.scope = self.good_scope(orchestrators=[evil], repository_refs=refs)
-        self.collect_v2(1)
-        result = self.call("sync", self.key, 10)
-        self.assertEqual(
-            json.loads(result.stdout),
-            {
-                "pending": 0,
-                "delivered": 1,
-                "scope_refresh_error": "scope_refresh_offer_refused",
-            },
-        )
-        self.assertEqual(
-            json.loads((self.state / "repository-refs.json").read_bytes()), refs
-        )
-        self.assertEqual(
-            (self.state / "orchestrators-offered.json").read_bytes(), offer
-        )
-
-    def test_revocation_and_a_requested_wait_stop_delivery(self):
-        self.installation_state()
-        self.collect_v2(1)
-        for status in (401, 429):
-            with self.subTest(status):
-                self.scope = (status, b'{"error":"response-secret"}')
-                result = self.call("sync", self.key, 10, code=2)
-                self.assertEqual(result.stdout, b"")
-                self.assertNotIn(b"response-secret", result.stderr)
-                self.assertEqual(self.requests, [])
-                self.db().execute("UPDATE scope SET retry_after=0").connection.commit()
-
-    def test_a_declared_run_row_needs_the_scope_to_accept_it(self):
-        self.installation_state()
-        local = json.loads(
-            (FIXTURES / "local-observation-declared-run.json").read_bytes()
-        )
-        wire = (FIXTURES / "wire-declared-run.json").read_bytes()
-        self.call("collect", data=local, code=2)
-        self.scope = self.good_scope(accepts_declared_run_ref=True)
-        self.call("sync", self.key, 10)
-        self.call("collect", data=local)
-        self.call("sync", self.key, 10)
-        self.assertEqual([raw for raw, _ in self.requests], [wire])
-        self.scope = self.good_scope(accepts_declared_run_ref=False)
-        self.call("sync", self.key, 10)
-        fresh = {**local, "observation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
-        self.call("collect", data=fresh, code=2)
-
-    def test_v2_refuses_actor_claims_and_v1_shape(self):
-        self.installation_state()
-        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
-        for change in (
-            {"actor_ref": "invented"},
-            {"schema_version": 1},
-            {"repository": "/fixture/repo"},
-            {"orchestrator": "none"},
-            {"orchestrator": "Not A Key"},
-            {"commits": ["0" * 40] * 21},
-        ):
-            self.call("collect", data={**local, **change}, code=2)
-        self.assertEqual(
-            self.db().execute("SELECT count(*) FROM outbox").fetchone()[0], 0
-        )
-
-    def test_v2_rows_carry_any_preset_key_or_none_at_all(self):
-        self.installation_state()
-        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
-        self.call("collect", data={**local, "orchestrator": "cron"})
-        refs = (
-            "orchestrator_agent_ref",
-            "orchestrator_run_ref",
-            "orchestrator_task_ref",
-        )
-        plain = {
-            k: v for k, v in local.items() if k != "orchestrator" and k not in refs
-        }
-        plain["observation_id"] = "88888888-8888-4888-8888-888888888888"
-        self.call("collect", data=plain)
-        bare = {**plain, "orchestrator": "cron"}
-        bare["observation_id"] = "99999999-9999-4999-8999-999999999999"
-        self.call("collect", data=bare)
-        rows = [
-            json.loads(raw)
-            for (raw,) in self.db().execute("SELECT payload FROM outbox ORDER BY seq")
-        ]
-        self.assertEqual(rows[0]["orchestrator"], "cron")
-        self.assertNotIn("orchestrator", rows[1])
-        self.assertEqual(rows[2]["orchestrator"], "cron")
-        self.assertFalse(set(refs) & rows[2].keys())
-
-    def test_v2_refuses_refs_without_a_preset_key(self):
-        self.installation_state()
-        local = json.loads((FIXTURES / "local-observation-v2.json").read_bytes())
-        del local["orchestrator"]
-        self.call("collect", data=local, code=2)
-
-    def test_installation_without_advertised_v2_freezes_v1_bytes(self):
-        self.installation_state(versions=(1,))
-        row = {**self.row, "repository_ref": self.config["repository_ref"]}
-        del row["repository"]
-        self.call("collect", data=row)
-        (payload,) = self.db().execute("SELECT payload FROM outbox").fetchone()
-        self.assertEqual(payload, (FIXTURES / "wire.json").read_bytes())
+        self.assertEqual(self.pending(), 1)
 
 
 if __name__ == "__main__":

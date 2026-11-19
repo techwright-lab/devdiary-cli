@@ -25,71 +25,43 @@ change Git identity, declare named work, or affect human minute derivation.
 
 ## Experimental Rust collector (separate executable; Linux evidence only)
 
-`collector-rs` provides an opt-in **normalized-metadata** control path plus the
-separate Linux Claude raw-hook adapter below. It is not a Python replacement.
-The control path reads the local observation
-shape in `collector-rs/tests/fixtures/local-observation.json`: caller-owned UUIDs,
-exact repository/installation scope, numeric epoch `observed_at`, vendor IDs and
-`attribution_basis: unknown`. It rejects named actor claims; no identity inference.
-Null optional fields are omitted like Python's upload projection. Timestamp conversion
-uses decimal half-even rounding to UTC microseconds (years 1000–9999; earlier
-year padding differs across Python platforms and is refused). Unlisted/private fields are
-discarded before storage; IDs are validated, never repaired. Caller-assigned observation
-UUIDs provide replay identity for the normalized control path; the Claude adapter
-creates observation IDs and applies vendor-correlation dedup before collection.
+`collector-rs` builds one `devdiary` binary: `devdiary setup` pairs this machine
+with DevDiary for every tracked repository (installation scope), registers the
+Claude Code or Codex hooks after you agree in the terminal, and a systemd user
+timer delivers what they record. It is not a Python replacement. The commands that
+worked on a single repository (`init`, `collect`, `status`, `repair`,
+`claude-plan`, `claude-apply`, `claude-remove`, `hook-apply`, `hook-remove`,
+`setup DIR`, `setup-plan`, `connection-status`, `connection-sync` and
+`sync STATE KEY LIMIT`) are removed; they answer `invalid_command`.
 
-```sh
-cargo build --locked --manifest-path collector-rs/Cargo.toml
-COLLECTOR="$PWD/collector-rs/target/debug/devdiary"
-# Use a NEW empty absolute directory, never Python's observer/capture spool.
-umask 077
-mkdir "$RUST_STATE"
-# Review scope.json: exactly endpoint, collector_ref, repository (local root),
-# repository_ref (canonical GitHub URL), installation_id (UUID). Fixture examples
-# are synthetic; no credential goes in this JSON.
-"$COLLECTOR" init "$RUST_STATE" --consent < scope.json
-"$COLLECTOR" collect "$RUST_STATE" < normalized-local-metadata.json
-"$COLLECTOR" status "$RUST_STATE"
-"$COLLECTOR" sync "$RUST_STATE" "$PRIVATE_COLLECTOR_KEY_FILE" 100
-```
+The outbox is a Rust-only SQLite file under the connection folder. Its filename,
+application ID and schema version refuse Python, foreign or incompatible state;
+there is **no shared-writer mode**. Scope is frozen at pairing, including after
+delivery. Owner-only state, no symlink ancestors or hardlinks, FULL SQLite
+commits, 1400 ms lock waits, 10,000 retained rows and a 16 MiB database ceiling
+bound storage. Capacity and lock failures leave existing evidence unchanged. A
+delivered row is deleted in the same transaction that records its validated
+receipt; the delivered counter, the last receipt and a small tombstone
+(observation ID plus payload SHA-256, newest 4,000 kept) replace it, so a late
+duplicate is still deduplicated or refused as a conflict. A lost response keeps
+the row pending and the retry sends identical bytes. Admission reserves worst-case
+SQLite table/index and overflow pages for every **pending** row, so capacity
+returns as rows are acknowledged. The reservation still refuses new rows before the
+physical file is full (several hundred pending rows); the 10,000-row limit is an
+additional ceiling, not a promised capacity. Same-UID processes are trusted, not
+sandboxed.
 
-The Rust-only SQLite filename, application ID and schema version refuse Python,
-foreign or incompatible state; there is **no shared-writer mode**. A spool written
-by an older collector (schema version 1) is refused with `repair_required` until
-`"$COLLECTOR" repair "$RUST_STATE"` migrates it in place: delivered rows become a
-counter, pending rows keep their exact bytes, and the file switches to incremental
-auto-vacuum. Repair holds the sync lock and is safe to re-run after a crash. Scope
-is immutable from initialization, including after delivery. Keys stay in separate
-0600 regular files and are read only by explicit sync; rotating the key file does
-not retarget evidence. Owner-only state, no symlink ancestors or hardlinks, FULL
-SQLite commits, 1400 ms lock waits, 10,000 retained rows and a 16 MiB database ceiling
-bound storage. Capacity/lock failures leave existing evidence unchanged; callers
-must retry failed collection with the same UUID. A delivered row is deleted in the
-same transaction that records its validated receipt; the delivered counter, the
-last receipt and a small tombstone (observation ID plus payload SHA-256, newest
-4,000 kept) replace it, so a late duplicate is still deduplicated or refused as a
-conflict. A lost response keeps the row pending and the retry sends identical
-bytes. Admission reserves worst-case SQLite table/index and overflow pages for
-every **pending** row, so capacity returns as rows are acknowledged. The
-reservation still refuses new rows before the physical file is full (several
-hundred pending rows); the 10,000-row limit is an additional ceiling, not a
-promised capacity. Same-UID processes are trusted, not sandboxed.
-
-Input is capped at 64 KiB with a 700 ms stdin deadline (not a whole-hook SLA).
-Frozen ASCII allowlisted wire bytes are capped at 16 KiB. Explicit sync attempts
-1–100 rows, commits its rotating cursor before HTTP, retains exact bytes after
-crash/response loss, and acknowledges only the exact Rails receipt. 401/403/429,
-5xx and network failures stop the batch; row failures do not starve later rows.
-A `Retry-After` on 429 (seconds or an HTTP date, at most one day) is saved in the spool, and later
-syncs refuse with `sync_rate_limited` before any request until it passes.
-No redirects or ambient proxies; verified TLS except exact loopback HTTP; each
-request has a five-second timeout including the response body. Exit 0 means the
-command succeeded, sync exit 1 means pending evidence remains, and exit 2 is a
-private/generic local error. These control commands are **not host-failure-neutral**;
-never register `collect` as a vendor hook. Only `hook claude` has the separate
-silent deadline/exit contract below. No daemon, live host qualification, surveillance,
-stock-tool qualification, native Windows support, signing or Python retirement is
-included; the optional user timer is described under one-command install. Rails and human-minute attribution are unchanged.
+Frozen ASCII allowlisted wire bytes are capped at 16 KiB. Sync commits its
+rotating cursor before HTTP, retains exact bytes after crash or response loss, and
+acknowledges only the exact Rails receipt. 401/403 (revocation), 429, 5xx and
+network failures stop the batch; row failures do not starve later rows. A
+`Retry-After` on 429 (seconds or an HTTP date, at most one day) is saved in the
+spool, and later syncs stop with `sync_rate_limited` before any request until it
+passes. No redirects or ambient proxies; verified TLS except exact loopback HTTP;
+each request has a five-second timeout including the response body. Only
+`hook claude` and `hook codex` have the silent deadline/exit contract below. No
+daemon, live host qualification, native Windows support, signing or Python
+retirement is included. Rails and human-minute attribution are unchanged.
 
 Reproduce Linux checks (Rust 1.98.1, Python >=3.11):
 
@@ -102,17 +74,10 @@ cargo audit --file collector-rs/Cargo.lock
 bin/test
 ```
 
-For opt-in real Rails/Puma/PostgreSQL interoperability, use a disposable Rails
-checkout at the revision in `collector-rs/tests/fixtures/provenance.json`. Set
-`RAILS_ENV=test CI=true` and a **new local** `DATABASE_URL` whose database starts
-`devdiary_rust_collector_interop_`; use only test DB credentials. From that Rails
-checkout, run `bin/rails db:create db:schema:load`, then
-`bundle exec ruby "$CLI_CHECKOUT/collector-rs/tests/rails_interop.rb"`.
-The harness refuses a nonempty workspace/observation database, provisions only a
-disposable collector credential, tests actual response-loss replay and revocation,
-and leaves the isolated database for inspection. Drop only that test DB afterward.
-The regular Rust CI job runs the subprocess/HTTP conformance suite; it does not
-claim to run this cross-repository Rails gate.
+The Rails/Puma/PostgreSQL interoperability harnesses (`rails_interop.rb`,
+`pairing_rails.py`) still use the removed repository-scope commands and do not run
+until they are requalified on installation scope:
+[#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
 
 ## Customer browser pairing (experimental Linux client)
 
@@ -122,33 +87,10 @@ ordinary origin is `https://devdiary.me`; no manual collector ref, ingest endpoi
 installation UUID or credential file contents are needed. This is DevDiary-specific
 browser approval, not OAuth/device authorization.
 
-```sh
-# Build/install the native binary privately as described below. Choose a private
-# directory OUTSIDE source control; its parent must already be owner-only.
-CONNECTION="$HOME/.config/devdiary/customer-project"
-"$COLLECTOR" setup "$CONNECTION" "$REPO"
-# Multiple distinct GitHub remotes? Repeat with --remote origin (or your choice).
-# Paste the displayed one-time code into the browser, choose the matching active
-# workspace repository, and explicitly approve metadata collection.
+`devdiary setup` runs the pairing described here, then the registration steps
+under one-command setup. Paste the displayed one-time code into the browser and
+approve metadata collection for this machine's installation.
 
-# Approval saves a credential but DOES NOT touch Claude settings.
-# SETTINGS must be an existing private JSON file; do not overwrite customer data.
-"$COLLECTOR" setup-plan "$CONNECTION" "$SETTINGS" "$PLAN"
-# Review the private plan: repository, executable/hash, settings hash, hook entries.
-# Stop concurrent settings editors; consent separately to the exact local changes:
-"$COLLECTOR" claude-apply "$PLAN" --consent
-# Use ordinary Claude with its normal trust/organization policy. No bypass flags.
-"$COLLECTOR" connection-status "$CONNECTION" "$PLAN"
-"$COLLECTOR" connection-sync "$CONNECTION" 100
-"$COLLECTOR" claude-remove "$PLAN" --consent
-```
-
-- `setup` creates a 0700 connection directory under an existing private parent.
-  It pins the installation UUID, exact origin, local root and canonical GitHub
-  scope **before** starting HTTP. Only local read-only Git commands are run: no
-  fetch, credential helper, shell, alias/URL rewrite or global identity changes.
-  SSH/scp/HTTPS GitHub remotes map to exact canonical URLs; ambiguity needs
-  `--remote NAME`, and other hosts/aliases/query paths are refused, not guessed.
 - Verified TLS, no redirect following, no ambient proxy use, bounded responses and
   five-second request deadlines. Alternate origins require both `--origin ORIGIN`
   and `--trust-origin`; HTTP is accepted only for numeric loopback development.
@@ -160,52 +102,28 @@ CONNECTION="$HOME/.config/devdiary/customer-project"
   `Retry-After`, and stops at expiry. Start-rate cooldowns survive process restart.
   Ctrl-C leaves no hooks and no persisted pairing bearer. If exchange might have
   consumed the credential (network loss, interruption, terminal response, failed
-  persistence), inspect/revoke unused connections in the browser, then repeat with
-  **`--new-pair`**. There is no secret replay/recovery endpoint. The same pinned
-  installation is reused. If `connection.json` was committed, ordinary `setup`
-  resumes local initialization without issuing another credential.
+  persistence), setup refuses to pair again in that folder. Revoke unused
+  connections in the browser, move the connection folder aside, and run `setup`
+  again; it then pairs a new installation. There is no secret replay/recovery
+  endpoint. If `connection.json` was committed, ordinary `setup` resumes local
+  initialization without issuing another credential.
 - `connection.json` atomically commits the token and frozen scope together (0600,
   fsync, no overwrite); credentials stay outside `outbox/`. Do not print or commit
   it. A killed writer can leave a private `.pairing-*.tmp`; these are not adopted
   as credentials. An existing connection cannot be re-paired/retargeted, even
-  after delivery. For another scope use a new directory and preserve old outboxes;
-  revocation is server-side. This slice does not implement credential rotation.
-- `setup-plan` rechecks the approved local Git remote and uses the existing
-  reversible ownership-preserving planner. Plan/apply are separate explicit
-  actions; browser approval never supplies local hook consent or Claude trust.
-  Organization policy is respected, not deleted or bypassed. Ordinary customer
-  integration does **not** require proving policy absence. Health reports host
-  trust/effective managed policy as unknown, and only reports a target-file block
-  when inspected settings explicitly disable hooks or allow managed hooks only.
-- `connection-sync` treats 401/403 as revocation: it writes `CONNECTION/revoked`,
-  stops, and refuses later syncs. The hook then stops spooling and counts a
-  `revoked` drop. Pair a new connection directory to resume.
-- Health separates saved connection, local registration evidence (when PLAN is
-  supplied), observed/pending counts, deliveries with validated receipts,
-  `local_drops` (hook events not stored, by reason) and `local_revoked`.
-  Zero observations is not proof of host coverage. Current server revocation and
-  last receipt are shown by the browser, not invented from local registration.
-  Unknown attribution remains unknown; no authorship or human minutes change.
+  after delivery. To pair again, move the connection folder aside; it keeps its
+  outbox. Revocation is server-side. This slice does not implement credential
+  rotation.
+- Browser approval never supplies local hook consent or Claude trust; setup asks
+  for that separately in the terminal. Organization policy is respected, not
+  deleted or bypassed. `doctor` reports host trust and runtime qualification as
+  unknown.
+- Sync treats 401/403 as revocation: it writes `connection/revoked`, stops, and
+  refuses later syncs. The hook then stops spooling and counts a `revoked` drop.
 
-Verification:
-
-```sh
-python3 collector-rs/tests/pairing.py -v  # mock transport/subprocess fixtures
-# Optional actual Rails HTTP/PostgreSQL: reviewed credential-free server checkout,
-# installed test bundle/Ruby on PATH, local CREATE/DROP test role. No vendor run.
-python3 collector-rs/tests/pairing_rails.py \
-  --rails-checkout "$REVIEWED_RAILS_CHECKOUT" --collector "$COLLECTOR"
-```
-
-The real interop harness uses an owned, random, verified-absent loopback database,
-retains the database-target guard through schema/migrations/fixtures, and verifies
-DROP in the parent even on failure. It performs actual Rust pairing/exchange and
-scoped ingest against Puma/Rails; only login is a Warden test fixture. Browser
-approval uses real cookies and CSRF (missing token rejected); lost exchange requires
-new pairing, lost ingest response replays exact bytes with one remote record, and
-scope/actor changes are rejected. Disposable plan/apply/remove preserves settings.
-This is **fixture-driven application interoperability**, not live stock-Claude
-qualification. The stricter qualification harness below remains blocked, unchanged.
+Verification: `python3 collector-rs/tests/pairing.py -v` (mock transport and
+subprocess fixtures through `devdiary setup`). The real Rails pairing harness waits
+for [#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
 
 ## One-command setup (Linux, systemd user timer)
 
@@ -228,16 +146,16 @@ SHA, preserves the resolver symlink target in its isolated filesystem, and uses
 the ordinary hook-trust UI. CI runs only its network-inert control tests. Passing
 capture gates does not establish server minute correctness.
 
-`setup` runs the browser pairing, plan, consent and apply steps above in one
-command for an installation-scope connection, then delivers the spool from a
-systemd user timer. The hook contract does not change: it stays silent, exits 0
+`setup` runs the browser pairing above, then plans the hook entries, asks in the
+terminal and applies them, for an installation-scope connection, and delivers the
+spool from a systemd user timer. The hook contract does not change: it stays silent, exits 0
 and never performs HTTP.
 
 ```sh
 cargo build --release --locked --manifest-path collector-rs/Cargo.toml
 collector-rs/target/release/devdiary setup \
   [--settings ~/.claude/settings.json] [--record-orchestrated-outside-repos] \
-  [--origin ORIGIN --trust-origin] [--yes] [--no-browser] [--new-pair]
+  [--origin ORIGIN --trust-origin] [--no-browser]
 devdiary doctor
 devdiary sync
 devdiary upgrade [--yes]
@@ -246,8 +164,8 @@ devdiary uninstall
 
 `setup` does these steps in order, and stops at the first failure:
 
-1. Refuses at once (`consent_required`) when stdin is not a terminal and `--yes`
-   is absent, and refuses a relative `--settings` path (`unsupported_path`), a
+1. Refuses at once (`consent_required`) when stdin is not a terminal; release one
+   has no unattended setup. It refuses a relative `--settings` path (`unsupported_path`), a
    missing settings file (`settings_missing`), settings that are not valid JSON
    (`invalid_settings`), already hold a `devdiary` hook (`already_registered`) or a
    hook of the older `devdiary-collector` (`old_collector_registered`: run
@@ -255,20 +173,17 @@ devdiary uninstall
    register the Python observer. It warns, without stopping, when another
    `devdiary` comes first on `PATH`. An alternate `--origin` without `--trust-origin` is refused, as for
    `setup`. A saved connection that the server revoked is refused
-   (`connection_revoked`); `--new-pair` renames it to `connection-revoked-<time>`
-   (its pending rows stay there) and pairs again. `--new-pair` never replaces a
-   connection that was not revoked (`connection_active`). Nothing is paired or
-   changed.
+   (`connection_revoked`): run `uninstall`, move the connection folder aside (its
+   pending rows stay there) and run `setup` again. Nothing is paired or changed.
 2. Pairs installation scope into `~/.local/share/devdiary/cli/claude/connection`
    (`cli/codex` for Codex). It never reads the old `devdiary/collector` folder.
    This path is fixed under `$HOME`; `$XDG_DATA_HOME` is not used, so every shell
-   finds the same install. `--new-pair` is passed on, for a pairing that was
-   interrupted.
+   finds the same install.
 3. Copies the running binary to `~/.local/share/devdiary/cli/HARNESS/VERSION/` (0700),
    so the registered hook survives rebuilds and `cargo clean`.
-4. `setup-plan` for that copy, prints the 10 hook entries, and asks `[y/N]` on the
-   terminal (or takes `--yes`). Declining removes the plan and changes nothing.
-5. `claude-apply`. Settings edited after the plan give `stale_plan` and are left
+4. Plans the hook entries for that copy, prints the 10 entries, and asks `[y/N]` on
+   the terminal. Declining removes the plan and changes nothing.
+5. Applies the plan. Settings edited after the plan give `stale_plan` and are left
    exactly as they are; run `setup` again.
 6. Writes `devdiary-claude-sync.service` and `.timer` (`devdiary-codex-sync` for
    Codex) under
@@ -280,10 +195,9 @@ devdiary uninstall
    starts with `devdiary-selftest-`. The hook records it only in a local
    `self_test` table, which sync never reads; the outbox refuses such ids.
 8. Reads the scope endpoint once. If the server offers orchestrator names, prints
-   them and asks `[y/N]`. `--yes` never answers this question: without a terminal
-   `setup` prints the command to run and finishes. Declining keeps the hooks.
+   them and asks `[y/N]`. Declining keeps the hooks.
 
-`sync CONNECTION_DIR` runs `connection-sync DIR 100` at most 10 times and stops at the first
+`sync CONNECTION_DIR` sends batches of 100 at most 10 times and stops at the first
 batch that a 401/403, 429, 5xx or network failure stops, when no full batch is
 left, or once it has visited every row that was pending when it started. Rows the
 server rejects (other 4xx, invalid receipts) stay pending and are sent at most once
@@ -292,16 +206,14 @@ per run. Server refusals and rejections end the run with exit 0 and are kept for
 unit.
 `sync` with no argument does the same now, for every installed harness.
 
-Each `sync`, `connection-sync` and `sync CONNECTION_DIR` batch refreshes the scope first. A
+Each sync batch refreshes the scope first. A
 network failure, a non-200 reply, a read failure, or an oversized or invalid reply
 keeps the last good refs, offer, approvals and declared-run answer, and spooled rows
 are still delivered.
 A refused orchestrator entry is reported the same way, but the new refs still apply,
 and an offer is saved without the entry only when no saved offer has entries yet.
-`sync` and `connection-sync` add a `scope_refresh_error`
-code to their JSON line and print guidance to stderr. The last code is kept for
-`doctor` as `last_scope_refresh_error` and for `connection-status` as
-`local_scope_refresh_error`, until a good refresh clears it. Revocation and a
+The last code is kept for `doctor` as `last_scope_refresh_error`, until a good
+refresh clears it. Revocation and a
 server-requested wait still stop the run. `setup` and `upgrade` fail on any
 refresh error.
 
@@ -314,7 +226,7 @@ the new binary over the pinned one and install the fresh plan. Declining leaves 
 running hooks and their pinned binary untouched. The install
 record is replaced only on success, so after a failed upgrade `uninstall` still
 finds and disables the timer. `uninstall` disables and deletes the timer units,
-then runs `claude-remove`. Without a user systemd bus it still deletes the unit
+then removes the hook entries. Without a user systemd bus it still deletes the unit
 files and removes the hooks, then exits 2 with `timer_unconfirmed`. Leftover units
 without an install record are also disabled and deleted. A second `uninstall` is a
 no-op. Settings keep their key order and their compact or pretty-printed layout;
@@ -328,8 +240,7 @@ while logged out.
 ### Sessions outside repositories
 
 By default your own sessions outside a git repository are not recorded.
-`devdiary outside-repos on`, in a terminal, or `setup --record-outside-repos`
-turns that on. A row holds the event, the time and the tool name, never a path. Rows
+`devdiary outside-repos on`, in a terminal, turns that on. A row holds the event, the time and the tool name, never a path. Rows
 under `/tmp`, `/var/tmp` and the system temp folder stay out, because background tools
 run throwaway sessions there. A run with an unanswered orchestrator offer stays out too.
 `devdiary outside-repos off` turns it off, with no terminal needed. `doctor`
@@ -368,19 +279,17 @@ devdiary orchestrators approve [CONNECTION_DIR]
 The prompt prints each key with its refs and its checkout paths as separate groups.
 When an approved list already exists it also prints what was added and removed. It
 asks `[y/N]` and saves what it printed. Without a terminal `orchestrators approve`
-refuses with `approval_required`, and it has no `--yes`. `setup` and `upgrade`
-finish without a terminal and leave the change waiting; their `--yes` covers only the
-hook entries. So a server cannot widen what the hook reads unless a person agrees.
+refuses with `approval_required`, and it has no `--yes`. `upgrade --yes` finishes
+without a terminal and leaves the change waiting; its `--yes` covers only the hook
+entries. So a server cannot widen what the hook reads unless a person agrees.
 
 When the offer changes, the approved list keeps working unchanged, also when the
-offer gets smaller. `doctor` (`orchestrators`), `connection-status`
-(`local_orchestrators`) and `status` (`orchestrators_waiting`, only when true) report
-that a change waits for approval. `refused` counts entries that were refused. When a
+offer gets smaller. `doctor` (`orchestrators`) reports that a change waits for
+approval. `refused` counts entries that were refused. When a
 preset is offered and not approved, `doctor` prints a line on stderr, and `notice`
 holds the same text.
 
-A bad offered file stops no command. `doctor` and `connection-status` report
-`offered_list_unreadable` and `status` reports `orchestrators_offered_unreadable`;
+A bad offered file stops no command. `doctor` reports `offered_list_unreadable`;
 the next scope reply that has the field replaces the file. `orchestrators approve`
 refuses with `offered_list_unreadable` until then. A file with the wrong owner or mode
 is different: as for all state, every command refuses until it is fixed.
@@ -441,14 +350,14 @@ The field needs a `true` answer in the scope reply:
 Each good refresh saves the answer in the outbox database. A missing key or `false`
 turns the field off, and a reply that does not list schema v2 does too. A non-boolean
 value makes the reply invalid (`scope_refresh_invalid_response`), so the last good
-answer stays. Until the first `true`, the hook does not read the variable. `collect`
-refuses a row with the field while the answer is not `true`.
+answer stays. Until the first `true`, the hook does not read the variable, and the outbox
+refuses a row with the field.
 
 The name is fixed and is DevDiary's own, so it needs no local approval and the server
 cannot change it. The hook sends the value only when it exactly matches
 `urn:devdiary:run:` plus a lowercase UUID. Otherwise it leaves the field out and keeps
 the row. The field is independent of `orchestrator`, so an orchestrated or `unapproved`
-row can carry it. Schema v1 and repository-scope connections never send it.
+row can carry it. Schema v1 rows never send it.
 
 On Claude Code 2.1.314, a stock `claude -p` run passed the variable to the command
 hooks for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop and
@@ -461,11 +370,10 @@ pairing/ingest server and a fake systemctl; debug builds only honour
 
 ## Rust Claude raw-hook adapter: Linux fixture-qualified only
 
-This is a distinct `hook claude PLAN` command, not registration of the normalized
-`collect` command. It accepts stock Claude command-hook stdin for SessionStart,
+`devdiary setup` registers `hook claude PLAN` (or `hook codex PLAN`). It accepts stock Claude command-hook stdin for SessionStart,
 UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, Stop, SubagentStart,
 SubagentStop and SessionEnd, following `src/devdiary/observer_hook.py`. It uses
-only the existing isolated Rust outbox and explicit `sync`; it never invokes
+only the installation's Rust outbox, which the timer's `sync` delivers; it never invokes
 Python, reads a transcript, makes a network call, or reads provider credentials.
 
 **Qualification:** executable/shell fixtures, Python-reference metadata parity,
@@ -481,43 +389,25 @@ refuses setup/collection outside Linux. Codex is deliberately deferred: its
 future adapter must implement its own events, turn/child correlation and exact
 host trust/setup contract rather than aliasing the Claude command.
 
-Example **disposable** setup, after reviewing and initializing the scope above:
-
-```sh
-cargo build --release --locked --manifest-path collector-rs/Cargo.toml
-# PRIVATE_INSTALL and REGISTRATION must already be owner-only absolute dirs.
-# SETTINGS must already be a JSON object file owned by you; it and its directory
-# may be readable by others (0644 under 0755) but never group/world-writable.
-# Explicitly create {} if it does not exist. Do not overwrite it.
-install -m 700 collector-rs/target/release/devdiary "$PRIVATE_INSTALL/collector"
-COLLECTOR="$PRIVATE_INSTALL/collector"
-PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
-"$COLLECTOR" claude-plan "$RUST_STATE" "$SETTINGS" "$PLAN"
-# Review PLAN locally: exact scope, executable SHA-256, settings hash and hooks.
-# Stop Claude and other settings editors before applying/removing.
-"$COLLECTOR" claude-apply "$PLAN" --consent
-# Start Claude normally and approve its normal hook/trust UI yourself.
-"$COLLECTOR" status "$RUST_STATE"
-"$COLLECTOR" sync "$RUST_STATE" "$PRIVATE_COLLECTOR_KEY_FILE" 100
-"$COLLECTOR" claude-remove "$PLAN" --consent
-```
+Registration, review and removal go through `devdiary setup` (which prints the
+entries and asks before writing them), `devdiary doctor` and `devdiary uninstall`.
 
 - The executable is an absolute, owner-only native ELF file with private/trusted
   ancestors, shell-quoted paths and a SHA-256 pin verified at plan and apply. The
   hook compares a stat fingerprint (device, inode, size, mtime and ctime in ns)
-  saved in STATE after the last full hash; any replacement, write or chmod forces
+  saved in the outbox after the last full hash; any replacement, write or chmod forces
   a full re-hash. Each sync hashes its own binary and saves that fingerprint (or
   discards the saved one when hashing fails). Symlinks, hardlinks and
   shared state permissions are refused, not repaired. Settings and their directory
   only need to be owned by you and not group/world-writable, with exactly one link
   and no symlinked ancestor; a replaced settings file keeps its original mode.
-  `claude-plan` refuses settings that already register the Python observer hook
+  Setup refuses settings that already register the Python observer hook
   (`python_observer_registered`).
   Updates require removal and a freshly reviewed plan; removal remains possible
   after executable/spool failures. Same-UID processes remain trusted.
 - Plan and settings are bounded to 64 KiB. The plan stores only ownership, hashes
-  and scope, **not a copy of settings secrets**. Both mutations require explicit
-  `--consent`. Apply validates the complete proposal, including original key
+  and scope, **not a copy of settings secrets**. Setup applies only after your
+  answer in the terminal. Apply validates the complete proposal, including original key
   presence against the hash-matched settings, before persisting ownership. Unknown
   fields, duplicate keys and inconsistent removal metadata are refused. The private
   `$PLAN.registration.json` receipt binds all validated plan fields by hash; retain
@@ -525,12 +415,12 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   exact installation is harmless. Edited, duplicate or partially missing owned
   entries block removal instead of deleting customer changes. Pre-receipt
   experimental installations are not adopted automatically.
-- Setup/removal use a stable, nonblocking advisory lock (`STATE/claude-settings.lock`,
+- Setup/removal use a stable, nonblocking advisory lock (`outbox/claude-settings.lock`,
   so the settings directory need not be private) and private fsynced atomic
   replacement, with an immediate pre-rename content check. Cooperating hooks hold
   a shared lock. Noncooperating editors cannot be made transactional: keep the
   host/settings editors quiescent. A crash leaves the old or complete new JSON;
-  retry apply or removal. Removal records its target hash before replacing settings
+  run `setup` or `uninstall` again. Removal records its target hash before replacing settings
   and retains a final removal receipt, so retry after the settings rename completes
   without reinstalling hooks. A prepared-but-unapplied registration can be removed.
   If settings change after an interrupted removal's rename, recovery fails closed
@@ -566,10 +456,10 @@ PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
   captures are dropped, not retried by the hook: zero exit is **not** proof of
   capture. Every refusal after the plan loads is counted by reason
   (`outside_scope`, `spool_full`, `permission`, `invalid`, `observation_conflict`,
-  `revoked`, `stale_plan`, `busy`, `error`) as one byte appended to `STATE/drops.log`
+  `revoked`, `stale_plan`, `busy`, `error`) as one byte appended to `outbox/drops.log`
   without opening SQLite; sync folds it into the spool's `drops` table, and
-  `status` / `connection-status` print the totals. Drops before the plan loads
-  cannot be attributed to a STATE and are not counted.
+  `doctor` prints the totals. Drops before the plan loads cannot be attributed to
+  an outbox and are not counted.
 
 Additional Linux fixture gate:
 
@@ -579,7 +469,13 @@ PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
 
 ## Repeatable stock-Claude qualification (live mode currently blocked)
 
-**Live qualification now fails closed before any vendor execution.** Local
+**The collector stages are removed until they are requalified on installation
+scope ([#57](https://github.com/techwright-lab/devdiary-cli/issues/57)).** After its
+preflight checks the harness stops at `installation_scope_requalification_required`,
+before any collector command or model run. The registration, spool and Rails
+descriptions below record the repository-scope design that #57 replaces.
+
+**Live qualification also fails closed before any vendor execution.** Local
 managed files (including Linux `/etc/claude-code/managed-settings.d/`) are refused.
 Even their absence cannot establish absence of cached or freshly delivered
 server policy. There is no supported pre-launch remote-policy proof implemented

@@ -5,8 +5,6 @@ import json
 import os
 import pty
 import select
-import shlex
-import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -18,6 +16,8 @@ import uuid
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import terminal
 
 CRATE = Path(__file__).resolve().parents[1]
 BIN = CRATE / "target/debug/devdiary"
@@ -217,57 +217,18 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn(b"dc_live_", result.stdout + result.stderr)
         return result
 
-    def install(self, *extra, code=0):
-        return self.run_collector(*self.install_args(*extra)[1:], code=code)
-
-    @unittest.skipUnless(
-        os.environ.get("DEVDIARY_UPGRADE_FROM"),
-        "set DEVDIARY_UPGRADE_FROM to a released 0.3.1 binary",
-    )
-    def test_real_released_binary_upgrades_and_uninstalls_without_losing_hooks(self):
-        # Mount the fake at the release binary's fixed systemctl path. Its
-        # debug-only environment override deliberately does not exist in releases.
-        self.assertIsNotNone(shutil.which("bwrap"))
-        released = self.root / "collector-0.3.1"
-        shutil.copyfile(os.environ["DEVDIARY_UPGRADE_FROM"], released)
-        released.chmod(0o700)
-        wrapper = self.root / "released-install"
-        wrapper.write_text(
-            "#!/bin/sh\nexec bwrap --tmpfs / --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --ro-bind /etc /etc --dev /dev --proc /proc --tmpfs /tmp --chdir / --bind "
-            + shlex.quote(str(self.root))
-            + " "
-            + shlex.quote(str(self.root))
-            + " --ro-bind "
-            + shlex.quote(str(self.fake))
-            + " /usr/bin/systemctl -- "
-            + shlex.quote(str(released))
-            + ' "$@"\n'
-        )
-        wrapper.chmod(0o700)
-        self.run_collector(*self.install_args("--yes")[1:], exe=wrapper)
-        self.assertEqual(self.record()["version"], "0.3.1")
-        doc = json.loads(self.settings.read_bytes())
-        extra = {"hooks": [{"type": "command", "command": "keep-after-old-install"}]}
-        doc["hooks"]["Stop"].append(extra)
-        self.settings.write_text(json.dumps(doc))
-        self.run_collector("upgrade", "--yes")
-        self.assertEqual(self.record()["version"], VERSION)
-        self.run_collector("uninstall")
-        expected = json.loads(self.original)
-        expected["hooks"]["Stop"] = [extra]
-        self.assertEqual(json.loads(self.settings.read_bytes()), expected)
+    def install(self, *extra, code=0, answers=(b"y\n",), env=None):
+        args = self.install_args(*extra)
+        status, out, err, _ = terminal.answering(args, env or self.env(), answers)
+        self.assertEqual(status, code, err)
+        self.assertNotIn(b"dc_live_", out + err)
+        return subprocess.CompletedProcess(args, status, out, err)
 
     def test_codex_uses_its_active_configuration_home(self):
         self.runtime = "codex"
         custom = self.home / "control-plane-codex"
-        result = subprocess.run(
-            self.install_args("--vendor", "codex", "--yes"),
-            env={**self.env(), "CODEX_HOME": str(custom)},
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        env = {**self.env(), "CODEX_HOME": str(custom)}
+        self.install("--vendor", "codex", env=env, answers=(b"y\n", b"y\n"))
         self.assertTrue((custom / "hooks.json").is_file())
         self.assertFalse((self.home / ".codex/hooks.json").exists())
 
@@ -276,7 +237,7 @@ class InstallTest(unittest.TestCase):
         directory = self.home / ".codex"
         directory.mkdir(mode=0o755)
         (directory / "config.toml").write_text('model = "fixture"\n')
-        self.install("--vendor", "codex", "--yes")
+        self.install("--vendor", "codex", answers=(b"y\n", b"y\n"))
         self.assertTrue((directory / "hooks.json").is_file())
         self.assertEqual((directory / "config.toml").read_text(), 'model = "fixture"\n')
 
@@ -299,7 +260,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.systemctl_log(), [])
 
     def test_codex_installs_alongside_claude_without_replacing_it(self):
-        self.install("--yes")
+        self.install()
         claude_settings = self.settings.read_bytes()
         claude_service = self.config / "systemd/user/devdiary-claude-sync.service"
         original_service = claude_service.read_bytes()
@@ -309,7 +270,7 @@ class InstallTest(unittest.TestCase):
         settings.write_text(
             '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}}'
         )
-        self.install("--yes", "--vendor", "codex")
+        self.install("--vendor", "codex", answers=(b"y\n", b"y\n"))
         self.assertEqual(self.requested_runtime, "codex")
         self.assertEqual(self.settings.read_bytes(), claude_settings)
         self.assertEqual(claude_service.read_bytes(), original_service)
@@ -404,7 +365,7 @@ class InstallTest(unittest.TestCase):
         return json.loads(self.run_collector("doctor").stdout)
 
     def test_install_yes_registers_nine_entries_beside_codegraph(self):
-        out = self.install("--yes").stdout.decode()
+        out = self.install().stdout.decode()
         doc = json.loads(self.settings.read_bytes())
         self.assertEqual(doc["hooks"]["UserPromptSubmit"][0], CODEGRAPH)
         entries = self.owned_entries()
@@ -424,7 +385,7 @@ class InstallTest(unittest.TestCase):
         )
 
     def test_unit_files_snapshot(self):
-        self.install("--yes")
+        self.install()
         units = self.config / "systemd/user"
         exe = self.data / VERSION / "devdiary"
         self.assertEqual(
@@ -441,7 +402,7 @@ class InstallTest(unittest.TestCase):
         )
 
     def test_self_test_row_is_never_selected_by_sync(self):
-        self.install("--yes")
+        self.install()
         outbox = self.data / "connection/outbox/collector-rust-v1.sqlite3"
         with sqlite3.connect(outbox) as db:
             (selftests,) = db.execute("SELECT count(*) FROM self_test").fetchone()
@@ -449,14 +410,13 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((selftests, pending), (1, 0))
         exe = self.data / VERSION / "devdiary"
         self.run_collector("sync", self.data / "connection", exe=exe)
-        self.run_collector("connection-sync", self.data / "connection", "100")
         self.assertEqual(self.received, [])
         with sqlite3.connect(outbox) as db:
             (selftests,) = db.execute("SELECT count(*) FROM self_test").fetchone()
         self.assertEqual(selftests, 1)
 
     def test_uninstall_restores_the_original_sha_and_repeats_as_a_no_op(self):
-        self.install("--yes")
+        self.install()
         self.run_collector("uninstall")
         self.assertEqual(
             hashlib.sha256(self.settings.read_bytes()).hexdigest(),
@@ -478,7 +438,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.systemctl_log(), log)
 
     def test_doctor_reports_registration_timer_and_drops(self):
-        self.install("--yes")
+        self.install()
         doctor = json.loads(self.run_collector("doctor").stdout)
         self.assertEqual(doctor["registration"]["registration"], "installed")
         self.assertEqual(doctor["timer"], {"enabled": "enabled", "active": "active"})
@@ -487,9 +447,9 @@ class InstallTest(unittest.TestCase):
         self.assertIsNone(doctor["last_sync_error"])
 
     def test_upgrade_replaces_the_registration_with_a_fresh_plan(self):
-        self.install("--yes")
+        self.install()
         before = self.owned_entries()["Stop"][0]["hooks"][0]["command"]
-        self.install("--yes", code=2)
+        self.install(code=2)
         out = self.run_collector("upgrade", "--yes").stdout.decode()
         self.assertIn("Self-test passed", out)
         entries = self.owned_entries()
@@ -506,16 +466,17 @@ class InstallTest(unittest.TestCase):
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
 
-    def test_without_a_tty_or_yes_install_refuses_before_pairing(self):
-        result = self.install(code=2)
+    def test_without_a_terminal_setup_refuses_before_pairing(self):
+        result = self.run_collector(*self.install_args()[1:], code=2)
         self.assertIn(b"consent_required", result.stderr)
+        self.assertNotIn(b"--yes", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse(self.data.exists())
         self.assertEqual(self.systemctl_log(), [])
 
     def test_invalid_settings_json_refuses(self):
         self.settings.write_bytes(b'{"hooks": ')
-        result = self.install("--yes", code=2)
+        result = self.install(code=2)
         self.assertIn(b"invalid_settings", result.stderr)
         self.assertEqual(self.settings.read_bytes(), b'{"hooks": ')
         self.assertFalse((self.data / "connection").exists())
@@ -523,7 +484,7 @@ class InstallTest(unittest.TestCase):
 
     def test_uninstall_without_a_user_bus_still_removes_the_hooks(self):
         self.fake.write_text(NO_USER_BUS)
-        self.assertIn(b"timer_unavailable", self.install("--yes", code=2).stderr)
+        self.assertIn(b"timer_unavailable", self.install(code=2).stderr)
         result = self.run_collector("uninstall", code=2)
         self.assertIn(b"timer_unconfirmed", result.stderr)
         self.assertNotIn(b"Hooks are registered", result.stderr)
@@ -540,7 +501,7 @@ class InstallTest(unittest.TestCase):
         self.settings.write_text(json.dumps(doc))
 
     def test_upgrade_takes_over_a_registration_without_a_newer_hook(self):
-        self.install("--yes")
+        self.install()
         self.older_registration()
         self.assertEqual(
             json.loads(self.run_collector("doctor").stdout)["registration"][
@@ -558,7 +519,7 @@ class InstallTest(unittest.TestCase):
         )
 
     def test_foreign_newer_hook_survives_upgrade_and_uninstall(self):
-        self.install("--yes")
+        self.install()
         doc = json.loads(self.settings.read_bytes())
         foreign = {"hooks": [{"type": "command", "command": "customer permission"}]}
         doc["hooks"]["PermissionRequest"] = [foreign]
@@ -584,7 +545,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(json.loads(self.settings.read_bytes()), expected)
 
     def test_uninstall_keeps_a_foreign_newer_hook_without_upgrade(self):
-        self.install("--yes")
+        self.install()
         doc = json.loads(self.settings.read_bytes())
         foreign = {"hooks": [{"type": "command", "command": "customer permission"}]}
         doc["hooks"]["PermissionRequest"] = [foreign]
@@ -596,13 +557,13 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.data / "install.json").exists())
 
     def test_uninstall_removes_a_registration_without_a_newer_hook(self):
-        self.install("--yes")
+        self.install()
         self.older_registration()
         self.run_collector("uninstall")
         self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 0)
 
     def test_a_missing_original_hook_still_reads_as_changed(self):
-        self.install("--yes")
+        self.install()
         self.older_registration("Stop")
         self.assertEqual(
             json.loads(self.run_collector("doctor").stdout)["registration"][
@@ -612,7 +573,7 @@ class InstallTest(unittest.TestCase):
         )
 
     def test_upgrade_refused_by_the_settings_changes_nothing(self):
-        self.install("--yes")
+        self.install()
         doc = json.loads(self.settings.read_bytes())
         doc["env"] = {"X": "observer_hook"}
         edited = (json.dumps(doc, indent=2) + "\n").encode()
@@ -625,7 +586,7 @@ class InstallTest(unittest.TestCase):
         self.assertTrue((self.data / "install.json").exists())
 
     def test_upgrade_failing_after_removal_can_still_be_uninstalled(self):
-        self.install("--yes")
+        self.install()
         (self.data / "connection/connection.json").write_bytes(b"{}")
         self.run_collector("upgrade", "--yes", code=2)
         self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 0)
@@ -640,7 +601,7 @@ class InstallTest(unittest.TestCase):
         )
 
     def test_uninstall_without_a_record_still_disables_leftover_units(self):
-        self.install("--yes")
+        self.install()
         (self.data / "install.json").unlink()
         self.run_collector("uninstall")
         self.assertIn(
@@ -655,20 +616,20 @@ class InstallTest(unittest.TestCase):
 
     def test_install_without_a_settings_file_says_so(self):
         self.settings.unlink()
-        result = self.install("--yes", code=2)
+        result = self.install(code=2)
         self.assertIn(b"settings_missing", result.stderr)
         self.assertNotIn(b"Setup incomplete", result.stderr)
         self.assertFalse(self.data.exists())
 
     def test_install_refuses_a_relative_settings_path(self):
-        result = self.install("--yes", "--settings", "settings.json", code=2)
+        result = self.install("--settings", "settings.json", code=2)
         self.assertIn(b"unsupported_path", result.stderr)
         self.assertNotIn(b"Setup incomplete", result.stderr)
         self.assertFalse(self.data.exists())
 
     def test_group_writable_settings_refuse_before_pairing(self):
         self.settings.chmod(0o664)
-        result = self.install("--yes", code=2)
+        result = self.install(code=2)
         self.assertIn(b"unsafe_settings", result.stderr)
         self.assertFalse(self.data.exists())
 
@@ -676,14 +637,14 @@ class InstallTest(unittest.TestCase):
         self.settings.write_bytes(
             self.original.replace(b"codegraph hook prompt", b"observer_hook")
         )
-        result = self.install("--yes", code=2)
+        result = self.install(code=2)
         self.assertIn(b"python_observer_registered", result.stderr)
         self.assertFalse(self.data.exists())
 
     def test_old_collector_hooks_refuse_before_pairing(self):
         old = b"'/home/u/.local/share/devdiary/collector/0.4.0/devdiary-collector' claude-hook '/home/u/plan.json' >/dev/null 2>&1 || :"
         self.settings.write_bytes(self.original.replace(b"codegraph hook prompt", old))
-        result = self.install("--yes", code=2)
+        result = self.install(code=2)
         self.assertIn(b"old_collector_registered", result.stderr)
         self.assertIn(b"devdiary-collector uninstall", result.stderr)
         self.assertFalse(hasattr(self, "installation"))
@@ -691,14 +652,7 @@ class InstallTest(unittest.TestCase):
 
     def setup_with_path(self, *dirs):
         path = os.pathsep.join([*map(str, dirs), os.environ["PATH"]])
-        return subprocess.run(
-            self.install_args("--yes"),
-            env={**self.env(), "PATH": path},
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=40,
-            check=False,
-        )
+        return self.install(env={**self.env(), "PATH": path})
 
     def test_setup_warns_when_another_devdiary_comes_first_on_path(self):
         other = self.root / "other-bin"
@@ -706,20 +660,18 @@ class InstallTest(unittest.TestCase):
         (other / "devdiary").write_text("#!/bin/sh\n")
         (other / "devdiary").chmod(0o755)
         result = self.setup_with_path(other)
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(other / "devdiary").encode(), result.stderr)
         self.assertTrue((self.data / "install.json").is_file())
 
     def test_setup_does_not_warn_when_it_is_first_on_path(self):
         result = self.setup_with_path(BIN.parent)
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn(b"PATH", result.stderr)
 
     def test_sync_sends_every_installed_harness_now(self):
-        self.install("--yes")
+        self.install()
         self.spool(2)
         self.runtime = "codex"
-        self.install("--yes", "--vendor", "codex")
+        self.install("--vendor", "codex", answers=(b"y\n", b"y\n"))
         claude, self.data = self.data, self.codex_data
         self.spool(1, vendor="codex")
         self.data = claude
@@ -727,13 +679,53 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(len(self.received), 3)
         self.assertEqual(self.pending(), 0)
 
+    def test_repository_scope_commands_and_old_setup_flags_are_gone(self):
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        plan = self.root / "plan.json"
+        removed = [
+            ["init", state, "--consent"],
+            ["collect", state],
+            ["sync", state, self.root / "key", "10"],
+            ["status", state],
+            ["repair", state],
+            ["claude-plan", state, self.settings, plan],
+            ["claude-apply", plan, "--consent"],
+            ["claude-remove", plan, "--consent"],
+            ["hook-apply", plan, "--consent"],
+            ["hook-remove", plan, "--consent"],
+            ["setup", state],
+            ["setup-plan", state, self.settings, plan],
+            ["connection-status", state],
+            ["connection-sync", state, "10"],
+            [*self.install_args("--yes")[1:]],
+            [*self.install_args("--new-pair")[1:]],
+            [*self.install_args("--record-outside-repos")[1:]],
+        ]
+        for args in removed:
+            with self.subTest(args=args[:2]):
+                result = self.run_collector(*args, code=2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"collector_error: invalid_command", result.stderr)
+                self.assertEqual(list(state.iterdir()), [])
+        self.assertFalse(hasattr(self, "installation"))
+        self.assertFalse(self.data.exists())
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        help = self.run_collector("--help").stdout
+        for word in [b"init ", b"collect ", b"claude-plan", b"hook-apply", b"STATE"]:
+            self.assertNotIn(word, help)
+        for word in [b"setup-plan", b"connection-sync", b"--new-pair"]:
+            self.assertNotIn(word, help)
+        (setup,) = [line for line in help.splitlines() if line.startswith(b"setup ")]
+        self.assertNotIn(b"--yes", setup)
+
     def test_sync_with_nothing_installed_sends_nothing(self):
         out = self.run_collector("sync").stdout
         self.assertIn(b"Not installed", out)
         self.assertEqual(self.received, [])
 
     def test_timer_sync_delivers_pending_rows_but_never_the_self_test(self):
-        self.install("--yes")
+        self.install()
         self.spool(3)
         doctor = self.timer_sync()
         self.assertEqual(len(self.received), 3)
@@ -742,7 +734,7 @@ class InstallTest(unittest.TestCase):
         self.assertFalse(any("selftest" in json.dumps(r) for r in self.received))
 
     def test_timer_sync_sends_each_rejected_row_once_per_run(self):
-        self.install("--yes")
+        self.install()
         self.spool(120)
         self.observation_status = 422
         doctor = self.timer_sync()
@@ -751,7 +743,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(doctor["last_sync_error"], "http_422")
 
     def test_timer_sync_stops_on_the_first_server_error(self):
-        self.install("--yes")
+        self.install()
         self.spool(5)
         self.observation_status = 503
         doctor = self.timer_sync()
@@ -759,7 +751,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(doctor["last_sync_error"], "http_503")
 
     def test_timer_sync_stops_quietly_on_revocation(self):
-        self.install("--yes")
+        self.install()
         self.spool(5)
         self.observation_status = 401
         doctor = self.timer_sync()
@@ -773,7 +765,7 @@ class InstallTest(unittest.TestCase):
         )
 
     def test_a_hook_event_with_the_self_test_prefix_never_reaches_the_outbox(self):
-        self.install("--yes")
+        self.install()
         self.spool(1)
         record = self.record()
         event = {
@@ -796,7 +788,7 @@ class InstallTest(unittest.TestCase):
             separators=(",", ":"),
         ).encode()
         self.settings.write_bytes(compact)
-        self.install("--yes")
+        self.install()
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), compact)
 
@@ -862,7 +854,7 @@ class InstallTest(unittest.TestCase):
         return json.loads(self.run_collector("doctor").stdout)["orchestrators"]
 
     def test_scope_compatibility_upgrade_reports_refresh_refusal(self):
-        self.install("--yes")
+        self.install()
         outbox = self.data / "connection/outbox"
         refs = (outbox / "repository-refs.json").read_bytes()
         offer = outbox / "orchestrators-offered.json"
@@ -882,12 +874,12 @@ class InstallTest(unittest.TestCase):
 
     def test_install_reports_a_refresh_refusal(self):
         self.scope_status = 503
-        result = self.install("--yes", code=2)
+        result = self.install(code=2)
         self.assertIn(b"server refused scope refresh", result.stderr)
         self.assertNotIn(b"response-secret", result.stdout + result.stderr)
 
     def test_timer_sync_delivers_through_a_failed_refresh_and_doctor_shows_it(self):
-        self.install("--yes")
+        self.install()
         self.spool(3)
         self.scope_status = 503
         doctor = self.timer_sync()
@@ -929,9 +921,10 @@ class InstallTest(unittest.TestCase):
         self.assertIsNone(self.approved())
         self.assertTrue(self.waiting()["waiting_for_approval"])
 
-    def test_yes_never_approves_names_without_a_terminal(self):
+    def test_upgrade_yes_never_approves_names_without_a_terminal(self):
         self.orchestrators = [PAPERCLIP]
-        out = self.install("--yes").stdout
+        self.install()
+        out = self.run_collector("upgrade", "--yes").stdout
         self.assertIn(b"orchestrators approve", out)
         self.assertIsNone(self.approved())
         self.assertEqual(
@@ -941,13 +934,13 @@ class InstallTest(unittest.TestCase):
 
     def test_install_with_nothing_offered_asks_nothing_about_names(self):
         self.orchestrators = []
-        out = self.install("--yes").stdout
+        out = self.install().stdout
         self.assertNotIn(b"orchestrators approve", out)
         self.assertFalse(self.waiting()["waiting_for_approval"])
 
     def test_orchestrators_approve_without_a_terminal_refuses(self):
         self.orchestrators = [PAPERCLIP]
-        self.install("--yes")
+        self.install()
         result = self.run_collector("orchestrators", "approve", code=2)
         self.assertIn(b"approval_required", result.stderr)
         self.assertIn(b"terminal", result.stderr)
@@ -955,13 +948,13 @@ class InstallTest(unittest.TestCase):
 
     def test_orchestrators_approve_has_no_unattended_flag(self):
         self.orchestrators = [PAPERCLIP]
-        self.install("--yes")
+        self.install()
         self.run_collector("orchestrators", "approve", "--yes", code=2)
         self.assertIsNone(self.approved())
 
     def test_orchestrators_approve_on_a_terminal_shows_and_saves_the_offer(self):
         self.orchestrators = [PAPERCLIP]
-        self.install("--yes")
+        self.install()
         args = [str(BIN), "orchestrators", "approve"]
         code, out, err = self.converse(args, [b"y\n"])
         self.assertEqual(code, 0, err)
@@ -984,13 +977,13 @@ class InstallTest(unittest.TestCase):
 
     def test_doctor_warns_that_unapproved_runs_may_look_interactive(self):
         self.orchestrators = [PAPERCLIP]
-        self.install("--yes")
+        self.install()
         result = self.run_collector("doctor")
         self.assertIn(b"stay unknown until approved", result.stderr)
         self.assertIn("paperclip", json.loads(result.stdout)["orchestrators"]["notice"])
 
     def test_doctor_says_nothing_when_no_name_is_offered(self):
-        self.install("--yes")
+        self.install()
         result = self.run_collector("doctor")
         self.assertNotIn(b"until approved", result.stderr)
         self.assertIsNone(json.loads(result.stdout)["orchestrators"]["notice"])
@@ -1001,7 +994,7 @@ class InstallTest(unittest.TestCase):
         offered.chmod(0o600)
 
     def test_a_bad_offered_file_stops_neither_doctor_nor_upgrade(self):
-        self.install("--yes")
+        self.install()
         self.spoil_offer()
         self.assertTrue(self.waiting()["offered_list_unreadable"])
         out = self.run_collector("upgrade", "--yes").stdout
@@ -1009,7 +1002,7 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"next sync replaces it", out)
 
     def test_orchestrators_approve_names_a_bad_offered_file(self):
-        self.install("--yes")
+        self.install()
         self.spoil_offer()
         args = [str(BIN), "orchestrators", "approve"]
         code, _, err = self.converse(args, [])
@@ -1018,14 +1011,14 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"next sync replaces it", err)
 
     def test_orchestrators_approve_with_nothing_waiting_asks_nothing(self):
-        self.install("--yes")
+        self.install()
         args = [str(BIN), "orchestrators", "approve"]
         code, out, err = self.converse(args, [])
         self.assertEqual(code, 0, err)
         self.assertIn(b"No orchestrator change waits", out)
 
     def test_upgrade_offers_the_names_a_first_install_never_saw(self):
-        self.install("--yes")
+        self.install()
         self.orchestrators = [PAPERCLIP]
         code, out, err = self.converse([str(BIN), "upgrade"], [b"y\n", b"y\n"])
         self.assertEqual(code, 0, err)
@@ -1059,7 +1052,7 @@ class InstallTest(unittest.TestCase):
         )
 
     def test_upgrade_shows_the_new_entries_before_asking(self):
-        self.install("--yes")
+        self.install()
         before = self.settings.read_bytes()
         log = self.systemctl_log()
         code, err = self.interactive(b"n\n", args=[str(BIN), "upgrade"])
@@ -1070,7 +1063,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.systemctl_log(), log)
 
     def test_declining_an_upgrade_from_a_rebuild_keeps_capture_working(self):
-        self.install("--yes")
+        self.install()
         rebuilt = self.rebuilt()
         code, err = self.interactive(b"n\n", args=[str(rebuilt), "upgrade"])
         self.assertEqual(code, 2)
@@ -1080,46 +1073,39 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(json.loads(self.run_collector("doctor").stdout)["drops"], {})
 
     def test_upgrade_from_a_rebuild_pins_and_registers_the_new_build(self):
-        self.install("--yes")
+        self.install()
         rebuilt = self.rebuilt()
         self.run_collector("upgrade", "--yes", exe=rebuilt)
         self.assertEqual(self.pinned(), rebuilt.read_bytes())
         self.spool(1)
 
     def test_install_refuses_a_revoked_connection_before_registering(self):
-        self.install("--yes")
+        self.install()
         self.revoke()
         self.run_collector("uninstall")
         log = self.systemctl_log()
-        result = self.install("--yes", code=2)
+        result = self.install(code=2)
         self.assertIn(b"connection_revoked", result.stderr)
-        self.assertIn(b"setup --new-pair", result.stderr)
+        self.assertIn(b"move the connection folder", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse((self.data / "install.json").exists())
         self.assertEqual(self.systemctl_log(), log)
 
-    def test_install_new_pair_sets_a_revoked_connection_aside_and_pairs_again(self):
-        self.install("--yes")
+    def test_a_revoked_connection_moved_aside_pairs_again(self):
+        self.install()
         self.revoke()
         self.run_collector("uninstall")
-        self.install("--yes", "--new-pair")
+        connection = self.data / "connection"
+        connection.rename(self.data / "connection-revoked")
+        self.install()
         doctor = json.loads(self.run_collector("doctor").stdout)
         self.assertFalse(doctor["revoked"])
         self.assertEqual(doctor["registration"]["registration"], "installed")
-        retired = [p for p in self.data.iterdir() if p.name.startswith("connection-")]
-        self.assertEqual(len(retired), 1)
-        self.assertTrue((retired[0] / "revoked").exists())
+        self.assertTrue((self.data / "connection-revoked/revoked").exists())
         self.spool(1)
 
-    def test_install_new_pair_refuses_a_connection_that_still_works(self):
-        self.install("--yes")
-        self.run_collector("uninstall")
-        result = self.install("--yes", "--new-pair", code=2)
-        self.assertIn(b"connection_active", result.stderr)
-        self.assertEqual(self.settings.read_bytes(), self.original)
-
     def test_upgrade_refuses_a_revoked_connection(self):
-        self.install("--yes")
+        self.install()
         self.revoke()
         before, log = self.settings.read_bytes(), self.systemctl_log()
         result = self.run_collector("upgrade", "--yes", code=2)
@@ -1128,8 +1114,10 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.systemctl_log(), log)
 
     def test_another_origin_needs_trust_origin(self):
-        args = [a for a in self.install_args("--yes") if a != "--trust-origin"]
-        result = self.run_collector(*args[1:], code=2)
+        args = [a for a in self.install_args() if a != "--trust-origin"]
+        status, _, err, _ = terminal.answering(args, self.env())
+        self.assertEqual(status, 2, err)
+        result = subprocess.CompletedProcess(args, status, b"", err)
         self.assertIn(b"--trust-origin", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse((self.data / "connection").exists())
@@ -1139,28 +1127,22 @@ class InstallTest(unittest.TestCase):
     ):
         elsewhere = self.root / "xdg-data"
         env = {**self.env(), "XDG_DATA_HOME": str(elsewhere)}
-        subprocess.run(
-            self.install_args("--yes"),
-            env=env,
-            check=True,
-            capture_output=True,
-            timeout=40,
-        )
+        self.install(env=env)
         self.assertFalse(elsewhere.exists())
         self.assertTrue((self.data / "install.json").exists())
 
     def test_install_output_names_no_manual_registration_steps(self):
-        out = self.install("--yes").stdout
+        out = self.install().stdout
         for manual in [b"claude-apply", b"setup-plan", b"NEW_PLAN"]:
             self.assertNotIn(manual, out)
 
     def test_install_persists_the_outside_repos_choice(self):
-        self.install("--yes", "--record-orchestrated-outside-repos")
+        self.install("--record-orchestrated-outside-repos")
         connection = json.loads((self.data / "connection/connection.json").read_text())
         self.assertTrue(connection["scope"]["record_orchestrated_outside_repos"])
 
     def test_doctor_shows_the_last_receipt_after_a_timer_sync(self):
-        self.install("--yes")
+        self.install()
         self.spool(1)
         self.assertIsNotNone(self.timer_sync()["last_receipt"])
 

@@ -1,27 +1,20 @@
 #![forbid(unsafe_code)]
-use devdiary::{
-    MAX_HOOK_INPUT, MAX_INPUT, Result, drops, install, orchestrators,
-    store::{Report, Store, repair, sync_outcome},
-    systemd::Systemctl,
-};
+use devdiary::{MAX_HOOK_INPUT, Result, install, systemd::Systemctl};
 use std::{io::Read, path::Path, sync::mpsc, time::Duration};
 
 // Static refusal codes only; other errors can carry input or paths.
-const REPORTED: [&str; 5] = [
+const REPORTED: [&str; 26] = [
+    "invalid_command",
     "python_observer_registered",
     "already_registered",
     "unsafe_settings",
-    "stale_plan",
     "repair_required",
-];
-const INSTALL_REPORTED: [&str; 22] = [
     "old_collector_registered",
     "unsupported_vendor",
     "codex_hooks_json_required",
     "approval_required",
     "offered_list_unreadable",
     "connection_revoked",
-    "connection_active",
     "consent_required",
     "consent_declined",
     "stale_plan",
@@ -38,8 +31,9 @@ const INSTALL_REPORTED: [&str; 22] = [
     "owned_entry_changed",
     "owned_entry_missing",
 ];
-fn install_hint(code: &str) -> &'static str {
+fn hint(code: &str) -> &'static str {
     match code {
+        "invalid_command" => "Run `devdiary --help` for the commands.",
         "unsupported_vendor" => "Use --vendor claude or --vendor codex.",
         "codex_hooks_json_required" => "Use a Codex hooks.json file, not config.toml.",
         "approval_required" => {
@@ -48,7 +42,7 @@ fn install_hint(code: &str) -> &'static str {
         "offered_list_unreadable" => {
             "The saved orchestrator offer cannot be read. The next sync replaces it; run this command again after that."
         }
-        "consent_required" => "Run setup in a terminal to review the hook entries, or pass --yes.",
+        "consent_required" => "Run setup in a terminal to review the hook entries.",
         "consent_declined" => "Nothing was registered. Settings and timers are unchanged.",
         "stale_plan" => {
             "Settings changed after the plan was made and were left as they are. Run setup again."
@@ -74,10 +68,7 @@ fn install_hint(code: &str) -> &'static str {
             "Use an absolute path without the characters \" \\ % or $, which systemd would reinterpret."
         }
         "connection_revoked" => {
-            "The server revoked the saved connection, so the hooks would record nothing. Run uninstall if it is set up, then setup --new-pair to set the old connection aside and pair again."
-        }
-        "connection_active" => {
-            "The saved connection was not revoked. Run setup without --new-pair to reuse it."
+            "The server revoked the saved connection, so the hooks would record nothing. Run uninstall if it is set up, then move the connection folder aside and run setup again. The folder is ~/.local/share/devdiary/cli/claude/connection, or codex/connection for Codex; it keeps any pending rows."
         }
         "self_test_failed" => {
             "Hooks and the timer are in place, but the installed hook did not record the local test event. Run doctor to see the drop reason, or uninstall."
@@ -89,7 +80,7 @@ fn install_hint(code: &str) -> &'static str {
         _ => "",
     }
 }
-fn install_options(
+fn setup_options(
     args: &[String],
     vendor: devdiary::vendor::Vendor,
 ) -> Result<install::Options<'_>> {
@@ -99,10 +90,7 @@ fn install_options(
         trust_origin: false,
         settings: None,
         record_orchestrated_outside_repos: false,
-        record_outside_repos: false,
-        yes: false,
         browser: true,
-        new_pair: false,
     };
     let mut seen = std::collections::HashSet::new();
     let mut i = 0;
@@ -121,9 +109,6 @@ fn install_options(
             }
             "--trust-origin" => o.trust_origin = true,
             "--record-orchestrated-outside-repos" => o.record_orchestrated_outside_repos = true,
-            "--record-outside-repos" => o.record_outside_repos = true,
-            "--new-pair" => o.new_pair = true,
-            "--yes" => o.yes = true,
             "--no-browser" => o.browser = false,
             _ => return Err("invalid_command".into()),
         }
@@ -131,15 +116,12 @@ fn install_options(
     }
     Ok(o)
 }
-// `setup` with no positional argument is the guided install; `setup DIR` is the
-// repository-scope pairing that the next change removes.
-fn guided_setup(args: &[String]) -> bool {
-    args.get(1).is_some_and(|c| c == "setup") && args.get(2).is_none_or(|a| a.starts_with("--"))
-}
-fn installed_sync(args: &[String]) -> bool {
-    args.get(1).is_some_and(|c| c == "sync") && args.len() <= 3
-}
-fn lifecycle(args: &[String]) -> Result<Option<i32>> {
+fn run() -> Result<()> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--help" {
+        println!("{HELP}");
+        return Ok(());
+    }
     let mut rest = args[2.min(args.len())..].to_vec();
     let mut vendor = devdiary::vendor::Vendor::Claude;
     if let Some(index) = rest.iter().position(|a| a == "--vendor") {
@@ -151,35 +133,45 @@ fn lifecycle(args: &[String]) -> Result<Option<i32>> {
     }
     let rest = rest.as_slice();
     match args.get(1).map(String::as_str) {
-        Some("setup") if guided_setup(args) => {
-            install::setup(install_options(rest, vendor)?, &Systemctl)?
-        }
+        Some("setup") => install::setup(setup_options(rest, vendor)?, &Systemctl),
         Some("upgrade") if rest.is_empty() || rest == ["--yes"] => {
-            install::upgrade(!rest.is_empty(), &Systemctl, vendor)?
+            install::upgrade(!rest.is_empty(), &Systemctl, vendor)
         }
-        Some("uninstall") if rest.is_empty() => install::uninstall(&Systemctl, vendor)?,
-        Some("doctor") if rest.is_empty() => install::doctor(&Systemctl, vendor)?,
-        Some("sync") if installed_sync(args) => match args.get(2) {
-            None => install::sync_all()?,
-            Some(dir) if dir.starts_with('/') => install::timer_sync(Path::new(dir))?,
-            Some(_) => return Err("invalid_command".into()),
+        Some("uninstall") if rest.is_empty() => install::uninstall(&Systemctl, vendor),
+        Some("doctor") if rest.is_empty() => install::doctor(&Systemctl, vendor),
+        Some("sync") => match args.get(2..).unwrap_or_default() {
+            [] => install::sync_all(),
+            [dir] if dir.starts_with('/') => install::timer_sync(Path::new(dir)),
+            _ => Err("invalid_command".into()),
         },
         Some("outside-repos") => match rest {
-            [choice] if choice == "on" => install::outside_repos(true, vendor)?,
-            [choice] if choice == "off" => install::outside_repos(false, vendor)?,
-            _ => return Err("invalid_command".into()),
+            [choice] if choice == "on" => install::outside_repos(true, vendor),
+            [choice] if choice == "off" => install::outside_repos(false, vendor),
+            _ => Err("invalid_command".into()),
         },
         Some("orchestrators") if rest.first().is_some_and(|c| c == "approve") => match &rest[1..] {
-            [] => install::approve_orchestrators(None, vendor)?,
+            [] => install::approve_orchestrators(None, vendor),
             [dir] if dir.starts_with('/') => {
-                install::approve_orchestrators(Some(Path::new(dir)), vendor)?
+                install::approve_orchestrators(Some(Path::new(dir)), vendor)
             }
-            _ => return Err("invalid_command".into()),
+            _ => Err("invalid_command".into()),
         },
-        _ => return Ok(None),
+        _ => Err("invalid_command".into()),
     }
-    Ok(Some(0))
 }
+const HELP: &str = "devdiary records your coding-agent sessions and sends them to DevDiary.
+Harness selector: --vendor claude|codex on setup, upgrade, doctor, uninstall, outside-repos and orchestrators approve. Claude is the default. Codex hooks must be reviewed in /hooks; runtime qualification is unverified.
+setup [--settings SETTINGS] [--record-orchestrated-outside-repos]
+  Pairs this machine, pins this binary under ~/.local/share/devdiary/cli/HARNESS/VERSION, asks in the terminal before appending the selected harness hook entries, then enables a systemd user timer that syncs every 2 minutes.
+doctor
+sync (sends every installed harness now)
+upgrade [--yes]
+  --yes never approves orchestrator names.
+uninstall
+outside-repos on|off
+  Also records your sessions outside git repositories: event, time and tool name, never a path. Temp folders stay out.
+orchestrators approve [CONNECTION_DIR]
+  Shows the environment names the server offers and asks. Needs a terminal.";
 fn input(limit: usize) -> Result<Vec<u8>> {
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -195,170 +187,6 @@ fn input(limit: usize) -> Result<Vec<u8>> {
         return Err("input_too_large".into());
     }
     Ok(data)
-}
-fn finish_sync(report: &Report) -> i32 {
-    let failed = report.scope_refresh_error;
-    let scope = failed.map_or(String::new(), |code| {
-        format!(",\"scope_refresh_error\":\"{code}\"")
-    });
-    println!(
-        "{{\"pending\":{},\"delivered\":{}{scope}}}",
-        report.pending, report.delivered
-    );
-    if let Some(hint) = failed.and_then(devdiary::pairing::guidance) {
-        eprintln!("{hint}");
-    }
-    i32::from(report.pending > 0)
-}
-fn run() -> Result<i32> {
-    let args: Vec<_> = std::env::args().collect();
-    if let Some(code) = lifecycle(&args)? {
-        return Ok(code);
-    }
-    if args.get(1).is_some_and(|s| s == "setup") && args.len() >= 3 {
-        let repository = args.get(3).filter(|a| !a.starts_with("--"));
-        let mut options = devdiary::pairing::Options {
-            vendor: Default::default(),
-            root: Path::new(&args[2]),
-            repository: repository.map(Path::new),
-            remote: None,
-            origin: devdiary::pairing::DEFAULT_ORIGIN,
-            trust_origin: false,
-            browser: true,
-            new_pair: false,
-            record_orchestrated_outside_repos: false,
-            next_steps: true,
-        };
-        let mut i = if repository.is_some() { 4 } else { 3 };
-        let mut seen = std::collections::HashSet::new();
-        while i < args.len() {
-            if !seen.insert(args[i].as_str()) {
-                return Err("invalid_command".into());
-            }
-            match args[i].as_str() {
-                "--vendor" => {
-                    i += 1;
-                    options.vendor =
-                        devdiary::vendor::Vendor::parse(args.get(i).ok_or("invalid_command")?)?;
-                }
-                "--remote" => {
-                    i += 1;
-                    options.remote = Some(args.get(i).ok_or("invalid_command")?);
-                }
-                "--origin" => {
-                    i += 1;
-                    options.origin = args.get(i).ok_or("invalid_command")?;
-                }
-                "--trust-origin" => options.trust_origin = true,
-                "--no-browser" => options.browser = false,
-                "--new-pair" => options.new_pair = true,
-                "--record-orchestrated-outside-repos" => {
-                    options.record_orchestrated_outside_repos = true
-                }
-                _ => return Err("invalid_command".into()),
-            }
-            i += 1;
-        }
-        devdiary::pairing::setup(options)?;
-        return Ok(0);
-    }
-    match args.get(1).map(String::as_str) {
-        Some("setup-plan") if args.len() == 5 => {
-            devdiary::pairing::plan(
-                Path::new(&args[2]),
-                Path::new(&args[3]),
-                Path::new(&args[4]),
-            )?;
-            return Ok(0);
-        }
-        Some("connection-status") if (3..=4).contains(&args.len()) => {
-            devdiary::pairing::health(Path::new(&args[2]), args.get(3).map(Path::new))?;
-            return Ok(0);
-        }
-        Some("connection-sync") if args.len() == 4 => {
-            let report = devdiary::pairing::sync(Path::new(&args[2]), args[3].parse()?)?;
-            return Ok(finish_sync(&report));
-        }
-        _ => {}
-    }
-    if args.len() == 2 && args[1] == "--help" {
-        println!(
-            "Harness selector: --vendor claude|codex on setup, upgrade, doctor, uninstall, outside-repos and orchestrators approve. Claude is the default. Codex hooks must be reviewed in /hooks; runtime qualification is unverified."
-        );
-        println!(
-            "setup [--settings SETTINGS] [--record-orchestrated-outside-repos] [--record-outside-repos] [--yes] [--new-pair]\n  Pairs this machine, pins this binary under ~/.local/share/devdiary/cli/HARNESS/VERSION, asks before appending the selected harness hook entries, then enables a systemd user timer that syncs every 2 minutes.\n  --yes never approves orchestrator names.\ndoctor\nsync (sends every installed harness now)\nupgrade [--yes]\nuninstall\noutside-repos on|off\n  Also records your sessions outside git repositories: event, time and tool name, never a path. Temp folders stay out.\norchestrators approve [CONNECTION_DIR]\n  Shows the environment names the server offers and asks. Needs a terminal."
-        );
-        println!(
-            "setup PRIVATE_CONNECTION_DIR [REPOSITORY [--remote NAME]] [--record-orchestrated-outside-repos] [--origin ORIGIN --trust-origin] [--no-browser] [--new-pair]\n  Without REPOSITORY the connection covers every tracked repository of the workspace (installation scope).\nsetup-plan CONNECTION_DIR SETTINGS NEW_PLAN\nconnection-status CONNECTION_DIR\nconnection-sync CONNECTION_DIR LIMIT\nPairing requires server PR #571 deployed. Approval is separate from local hook consent and host trust."
-        );
-        println!(
-            "Experimental Linux collector; harness adapters runtime-unqualified.\ninit STATE --consent < scope.json\ncollect STATE < normalized-local-metadata.json\nsync STATE PRIVATE_KEY_FILE LIMIT\nstatus STATE\nrepair STATE (migrates an older spool; pending rows keep their bytes)\nclaude-plan STATE SETTINGS NEW_PLAN\nclaude-apply PLAN --consent\nclaude-remove PLAN --consent\nhook-apply PLAN --consent (either harness)\nhook-remove PLAN --consent (either harness)\nclaude-hook PLAN (host-only, silent, failure-neutral)\nSTATE must be an existing empty private absolute directory; never a Python spool."
-        );
-        return Ok(0);
-    }
-    match args.get(1).map(String::as_str) {
-        Some("claude-plan") if args.len() == 5 => {
-            devdiary::claude::plan(
-                Path::new(&args[2]),
-                Path::new(&args[3]),
-                Path::new(&args[4]),
-            )?;
-            return Ok(0);
-        }
-        Some("claude-apply" | "claude-remove" | "hook-apply" | "hook-remove")
-            if args.len() == 4 && args[3] == "--consent" =>
-        {
-            if args[1] == "claude-apply" || args[1] == "hook-apply" {
-                devdiary::claude::apply(Path::new(&args[2]))?;
-            } else {
-                devdiary::claude::remove(Path::new(&args[2]))?;
-            }
-            return Ok(0);
-        }
-        _ => {}
-    }
-    let state = Path::new(args.get(2).ok_or("state_required")?);
-    let counts = match args.get(1).map(String::as_str) {
-        Some("init") if args.len() == 4 && args[3] == "--consent" => {
-            Store::open(state, Some(&input(MAX_INPUT)?))?.counts()?
-        }
-        Some("collect") if args.len() == 3 => {
-            let raw = input(MAX_INPUT)?;
-            let mut store = Store::open(state, None)?;
-            store.collect(&raw)?;
-            store.counts()?
-        }
-        Some("sync") if args.len() == 5 => {
-            let report = sync_outcome(state, Path::new(&args[3]), args[4].parse()?)?;
-            return Ok(finish_sync(&report));
-        }
-        Some("status") if args.len() == 3 => {
-            let store = Store::open(state, None)?;
-            let (pending, delivered) = store.counts()?;
-            let drops = serde_json::to_string(&drops::counts(&store, state)?)?;
-            let waiting = if orchestrators::waiting(state) {
-                ",\"orchestrators_waiting\":true"
-            } else {
-                ""
-            };
-            let unreadable = if orchestrators::offer_unreadable(state) {
-                ",\"orchestrators_offered_unreadable\":true"
-            } else {
-                ""
-            };
-            println!(
-                "{{\"pending\":{pending},\"delivered\":{delivered},\"drops\":{drops}{waiting}{unreadable}}}"
-            );
-            return Ok(0);
-        }
-        Some("repair") if args.len() == 3 => {
-            repair(state)?;
-            Store::open(state, None)?.counts()?
-        }
-        _ => return Err("invalid_command".into()),
-    };
-    println!("{{\"pending\":{},\"delivered\":{}}}", counts.0, counts.1);
-    Ok(0)
 }
 fn main() {
     // Dispatch before fallible UTF-8 argument parsing or control diagnostics.
@@ -397,41 +225,19 @@ fn main() {
     }
     // Never print input, SQL, key paths/contents, URLs or server error bodies.
     let code = match run() {
-        Ok(code) => code,
+        Ok(()) => 0,
         Err(error) => {
-            let args: Vec<_> = std::env::args().collect();
-            let command = args.get(1).cloned().unwrap_or_default();
             let code = error.to_string();
-            let lifecycle = guided_setup(&args)
-                || installed_sync(&args)
-                || ["upgrade", "uninstall", "doctor", "orchestrators"].contains(&command.as_str());
-            if lifecycle
-                && let Some(code) = INSTALL_REPORTED
-                    .iter()
-                    .chain(REPORTED.iter())
-                    .find(|c| **c == code)
-            {
+            if let Some(code) = REPORTED.iter().find(|c| **c == code) {
                 eprintln!("collector_error: {code}");
-                let hint = install_hint(code);
+                let hint = hint(code);
                 if !hint.is_empty() {
                     eprintln!("{hint}");
                 }
-            } else if lifecycle {
+            } else {
                 let known = devdiary::pairing::known_diagnostic(error.as_ref());
                 eprintln!("collector_error");
                 eprintln!("{}", known.unwrap_or("Run doctor to inspect the install."));
-            } else if matches!(
-                command.as_str(),
-                "setup" | "setup-plan" | "connection-status" | "connection-sync"
-            ) {
-                eprintln!("{}", devdiary::pairing::diagnostic(error.as_ref()));
-            } else if let Some(code) = REPORTED.iter().find(|c| **c == code) {
-                eprintln!("collector_error: {code}");
-            } else if let Some(hint) = devdiary::pairing::known_diagnostic(error.as_ref()) {
-                eprintln!("collector_error");
-                eprintln!("{hint}");
-            } else {
-                eprintln!("collector_error");
             }
             2
         }

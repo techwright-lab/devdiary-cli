@@ -5,7 +5,6 @@ Raw host output is bounded in memory, never written to the report or disk.
 """
 
 import argparse
-import collections
 import contextlib
 import hashlib
 import json
@@ -13,7 +12,6 @@ import os
 import selectors
 import shutil
 import signal
-import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -173,44 +171,6 @@ def validate_host(raw):
     }
 
 
-def inspect_spool(state):
-    with contextlib.closing(sqlite3.connect(state / "collector-rust-v1.sqlite3")) as db:
-        require(
-            db.execute("pragma integrity_check").fetchone() == ("ok",),
-            "spool_integrity",
-        )
-        rows = [
-            json.loads(r[0])
-            for r in db.execute("SELECT payload FROM outbox ORDER BY seq")
-        ]
-    counts = collections.Counter(r["event"] for r in rows)
-    require(counts == {e: 1 for e in EVENTS}, "runtime_event_coverage")
-    require(len({r["session_id"] for r in rows}) == 1, "runtime_session_correlation")
-    tools = [r for r in rows if r["event"] in {"PreToolUse", "PostToolUse"}]
-    require(
-        len({r.get("tool_use_id") for r in tools}) == 1 and tools[0].get("tool_use_id"),
-        "runtime_tool_correlation",
-    )
-    require(
-        all(
-            r.get("attribution_basis") == "unknown" and "actor_ref" not in r
-            for r in rows
-        ),
-        "unknown_actor",
-    )
-    for file in state.iterdir():
-        if file.is_file():
-            require(
-                not any(s.encode() in file.read_bytes() for s in SENTINELS),
-                "spool_privacy",
-            )
-    require(
-        not any("/home/" in json.dumps(r) or "/tmp/" in json.dumps(r) for r in rows),
-        "wire_privacy",
-    )
-    return rows, dict(counts)
-
-
 def check_managed_policy(home, system=Path("/etc/claude-code")):
     # Official managed-settings and server-managed-settings docs: CLI setting
     # sources cannot disable endpoint drop-ins or cached/current remote policy.
@@ -254,9 +214,6 @@ def execute(args, report):
     with selected.open("rb") as executable:
         require(executable.read(4) == b"\x7fELF", "native_claude_required")
     report["claude"] = {"path": str(selected), "sha256": sha(selected)}
-    home = Path(env["HOME"])
-    tracked = [home / ".claude/settings.json", home / ".claude/settings.local.json"]
-    before = {p: sha(p) if p.exists() else None for p in tracked}
     with tempfile.TemporaryDirectory(prefix="claude-qualification-") as directory:
         root = Path(directory)
         report["stage"] = "rails_preflight"
@@ -266,13 +223,11 @@ def execute(args, report):
         repo.mkdir(mode=0o700)
         run(["git", "init", "--quiet", repo], env=env)
         (repo / "fixture.txt").write_text(SENTINELS[1])
-        state = root / "state"
-        state.mkdir(mode=0o700)
         collector = root / "collector"
         shutil.copyfile(args.collector.resolve(), collector)
         collector.chmod(0o700)
         report["collector_sha256"] = sha(collector)
-        settings, plan = root / "settings.json", root / "plan.json"
+        settings = root / "settings.json"
         original = {"permissions": {"allow": ["Read(./fixture.txt)"]}}
         save(settings, original)
         save(root / "mcp.json", {"mcpServers": {}})
@@ -299,85 +254,9 @@ def execute(args, report):
             },
             "subscription_required",
         )
-        # Reserve immutable endpoint while collecting; no server/provider retargeting.
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            scope = {
-                "endpoint": f"http://127.0.0.1:{reservation.getsockname()[1]}/ingest/v1/observations",
-                "collector_ref": "qualification-" + uuid.uuid4().hex,
-                "repository": str(repo),
-                "repository_ref": "https://github.com/fixture/claude-qualification",
-                "installation_id": str(uuid.uuid4()),
-            }
-            save(root / "scope.json", scope)
-            run(
-                [collector, "init", state, "--consent"],
-                data=json.dumps(scope).encode(),
-                env=env,
-            )
-            run([collector, "claude-plan", state, settings, plan], env=env)
-            try:
-                run([collector, "claude-apply", plan, "--consent"], env=env)
-                report["stage"] = "stock_runtime"
-                require(
-                    sha(selected) == report["claude"]["sha256"], "claude_pin_changed"
-                )
-                report["model_runs_started"] = (
-                    1  # No retry, including uncertain failures.
-                )
-                raw = run(
-                    [
-                        *base,
-                        "--print",
-                        "--no-session-persistence",
-                        "--strict-mcp-config",
-                        "--mcp-config",
-                        root / "mcp.json",
-                        "--disable-slash-commands",
-                        "--no-chrome",
-                        "--tools",
-                        "Read",
-                        "--allowedTools",
-                        "Read(./fixture.txt)",
-                        "--permission-mode",
-                        "dontAsk",
-                        "--permission-prompts",
-                        "none",
-                        "--output-format",
-                        "stream-json",
-                        "--verbose",
-                        "--include-hook-events",
-                        "--model",
-                        "sonnet",
-                        "--effort",
-                        "low",
-                        "--max-turns",
-                        "2",
-                        "--system-prompt",
-                        "Use only Read once on fixture.txt; access no other files or tools.",
-                        "--",
-                        f"{SENTINELS[0]} Read fixture.txt once then respond exactly {SENTINELS[2]}.",
-                    ],
-                    cwd=repo,
-                    env=env,
-                    timeout=100,
-                )
-                report["runtime"] = validate_host(raw)
-                rows, report["events"] = inspect_spool(state)
-                save(root / "observations.json", rows)
-            finally:
-                run([collector, "claude-remove", plan, "--consent"], env=env)
-                report["registration_removed"] = (
-                    json.loads(settings.read_text()) == original
-                )
-                require(report["registration_removed"], "settings_restore")
-                report["live_settings_unchanged"] = all(
-                    (sha(p) if p.exists() else None) == digest
-                    for p, digest in before.items()
-                )
-                require(report["live_settings_unchanged"], "live_settings_changed")
-        report["stage"] = "rails"
-        rails_interop(args, root, env, report)
+        # The registration, spool and Rails stages used repository scope, which
+        # is removed. They return once requalified on installation scope.
+        raise GateError("installation_scope_requalification_required")
 
 
 def rails_interop(args, root, env, report):
