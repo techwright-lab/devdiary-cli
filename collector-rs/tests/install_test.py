@@ -1,12 +1,16 @@
-"""One-command install against a mock pairing/ingest server, a temp HOME and a fake systemctl."""
+"""One-command install against a mock pairing/ingest server, a temp HOME and a fake
+scheduler: systemctl on Linux, launchctl on macOS."""
 
+import calendar
 import hashlib
 import json
 import os
+import plistlib
 import pty
 import select
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -48,32 +52,120 @@ PAPERCLIP = {
     },
 }
 CODEGRAPH = {"hooks": [{"type": "command", "command": "codegraph hook prompt"}]}
+DARWIN = sys.platform == "darwin"
+UID = os.getuid()
 FAKE_SYSTEMCTL = """#!/bin/sh
-printf '%s\\n' "$*" >> "$(dirname "$0")/systemctl.log"
+printf '%s\\n' "$*" >> "$(dirname "$0")/scheduler.log"
 case "$*" in
   *is-enabled*) echo enabled ;;
   *is-active*) echo active ;;
 esac
 """
-NO_USER_BUS = """#!/bin/sh
-printf '%s\\n' "$*" >> "$(dirname "$0")/systemctl.log"
+# Remembers which agents are loaded. Bootout of an agent that is not loaded
+# fails, as launchctl's does.
+FAKE_LAUNCHCTL = """#!/bin/sh
+dir="$(dirname "$0")"
+printf '%s\\n' "$*" >> "$dir/scheduler.log"
+case "$1" in
+  print)
+    case "$2" in
+      gui/*/*) test -e "$dir/loaded-${2##*/}" ;;
+    esac ;;
+  bootstrap) : > "$dir/loaded-$(basename "$3" .plist)" ;;
+  bootout) rm "$dir/loaded-${2##*/}" 2>/dev/null || exit 3 ;;
+esac
+"""
+# No user manager on Linux; no GUI login domain on macOS.
+UNREACHABLE = """#!/bin/sh
+printf '%s\\n' "$*" >> "$(dirname "$0")/scheduler.log"
 exit 1
 """
+# An agent that stays loaded whatever bootout says.
+STUCK_LAUNCHCTL = """#!/bin/sh
+printf '%s\\n' "$*" >> "$(dirname "$0")/scheduler.log"
+test "$1" != bootout
+"""
+
+
+class FakeScheduler:
+    """The fake systemctl or launchctl, and where its job definitions go."""
+
+    PROBES = ("print",) if DARWIN else ("--user show-environment", "--user is-")
+
+    def __init__(self, root, home, config):
+        self.fake = root / "bin" / ("launchctl" if DARWIN else "systemctl")
+        self.fake.parent.mkdir()
+        self.write(FAKE_LAUNCHCTL if DARWIN else FAKE_SYSTEMCTL)
+        self.dir = home / "Library/LaunchAgents" if DARWIN else config / "systemd/user"
+
+    def write(self, script):
+        self.fake.write_text(script)
+        self.fake.chmod(0o700)
+
+    def env(self):
+        name = "LAUNCHCTL" if DARWIN else "SYSTEMCTL"
+        return {f"DEVDIARY_COLLECTOR_{name}": str(self.fake)}
+
+    def log(self):
+        log = self.fake.parent / "scheduler.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def changes(self):
+        """Every call except the read-only probes."""
+        return [line for line in self.log() if not line.startswith(self.PROBES)]
+
+    def files(self, vendor="claude"):
+        if DARWIN:
+            return [self.dir / f"me.devdiary.{vendor}-sync.plist"]
+        return [
+            self.dir / f"devdiary-{vendor}-sync.service",
+            self.dir / f"devdiary-{vendor}-sync.timer",
+        ]
+
+    def defined(self, vendor="claude"):
+        return any(path.exists() for path in self.files(vendor))
+
+    def started(self, vendor="claude"):
+        if DARWIN:
+            return [f"bootstrap gui/{UID} {self.files(vendor)[0]}"]
+        return [
+            "--user daemon-reload",
+            f"--user enable --now devdiary-{vendor}-sync.timer",
+        ]
+
+    def restarted(self, vendor="claude"):
+        if DARWIN:
+            return [
+                f"bootout gui/{UID}/me.devdiary.{vendor}-sync",
+                *self.started(vendor),
+            ]
+        return self.started(vendor)
+
+    def stopped(self, vendor="claude"):
+        if DARWIN:
+            return [f"bootout gui/{UID}/me.devdiary.{vendor}-sync"]
+        return [
+            f"--user disable --now devdiary-{vendor}-sync.timer",
+            "--user daemon-reload",
+        ]
+
+    def running(self):
+        if DARWIN:
+            return {"loaded": True}
+        return {"enabled": "enabled", "active": "active"}
 
 
 class InstallTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="install-")
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
+        # The symlink-ancestor rule refuses macOS's /var symlink.
+        self.root = Path(tmp.name).resolve()
         self.home = self.root / "home"
         (self.home / ".claude").mkdir(parents=True)
         self.config = self.root / "config"
         self.config.mkdir()
-        self.fake = self.root / "bin/systemctl"
-        self.fake.parent.mkdir()
-        self.fake.write_text(FAKE_SYSTEMCTL)
-        self.fake.chmod(0o700)
+        self.scheduler = FakeScheduler(self.root, self.home, self.config)
         self.settings = self.home / ".claude/settings.json"
         self.original = (
             json.dumps(
@@ -195,7 +287,7 @@ class InstallTest(unittest.TestCase):
             **base,
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.config),
-            "DEVDIARY_COLLECTOR_SYSTEMCTL": str(self.fake),
+            **self.scheduler.env(),
         }
 
     def install_args(self, *extra):
@@ -262,12 +354,12 @@ class InstallTest(unittest.TestCase):
         code, _, err = self.converse(self.install_args("--vendor", "codex"), [b"n\n"])
         self.assertEqual(code, 2, err)
         self.assertFalse((self.home / ".codex/hooks.json").exists())
-        self.assertEqual(self.systemctl_log(), [])
+        self.assertEqual(self.scheduler.changes(), [])
 
     def test_codex_installs_alongside_claude_without_replacing_it(self):
         self.install()
         claude_settings = self.settings.read_bytes()
-        claude_service = self.config / "systemd/user/devdiary-claude-sync.service"
+        claude_service = self.scheduler.files("claude")[0]
         original_service = claude_service.read_bytes()
         self.runtime = "codex"
         settings = self.home / ".codex/hooks.json"
@@ -285,13 +377,7 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn("PostToolUseFailure", hooks)
         self.assertIn(" hook codex ", hooks["Interrupt"][0]["hooks"][0]["command"])
         self.assertTrue((self.codex_data / "install.json").is_file())
-        self.assertTrue(
-            (self.config / "systemd/user/devdiary-codex-sync.timer").is_file()
-        )
-
-    def systemctl_log(self):
-        log = self.fake.parent / "systemctl.log"
-        return log.read_text().splitlines() if log.exists() else []
+        self.assertTrue(self.scheduler.defined("codex"))
 
     def owned_entries(self):
         doc = json.loads(self.settings.read_bytes())
@@ -381,14 +467,9 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(exe.stat().st_mode & 0o777, 0o700)
         self.assertEqual(out.count(" hook claude "), len(EVENTS))
         self.assertIn("Self-test passed", out)
-        self.assertEqual(
-            self.systemctl_log(),
-            [
-                "--user daemon-reload",
-                "--user enable --now devdiary-claude-sync.timer",
-            ],
-        )
+        self.assertEqual(self.scheduler.changes(), self.scheduler.started())
 
+    @unittest.skipIf(DARWIN, "systemd units are Linux only")
     def test_unit_files_snapshot(self):
         self.install()
         units = self.config / "systemd/user"
@@ -405,6 +486,72 @@ class InstallTest(unittest.TestCase):
             "OnActiveSec=30s\nOnUnitActiveSec=2min\nRandomizedDelaySec=30\nPersistent=true\n"
             "Unit=devdiary-claude-sync.service\n\n[Install]\nWantedBy=timers.target\n",
         )
+
+    @unittest.skipUnless(DARWIN, "launchd agents are macOS only")
+    def test_launch_agent_snapshot(self):
+        self.install()
+        (agent,) = self.scheduler.files()
+        self.assertEqual(agent.parent, self.home / "Library/LaunchAgents")
+        info = agent.stat()
+        self.assertEqual(info.st_uid, UID)
+        self.assertEqual(info.st_mode & 0o022, 0)
+        exe = self.data / VERSION / "devdiary"
+        self.assertEqual(
+            plistlib.loads(agent.read_bytes()),
+            {
+                "Label": "me.devdiary.claude-sync",
+                "ProgramArguments": [str(exe), "sync", str(self.data / "connection")],
+                "StartInterval": 120,
+                "RunAtLoad": True,
+                "ProcessType": "Background",
+                "Nice": 10,
+                "LowPriorityIO": True,
+            },
+        )
+
+    @unittest.skipUnless(DARWIN, "launchd agents are macOS only")
+    def test_macos_consent_names_the_login_item_before_anything_loads(self):
+        code, _ = self.interactive(b"n\n")
+        self.assertEqual(code, 2)
+        question = self.seen.decode()
+        self.assertIn("background-item notification", question)
+        self.assertIn("Login Items", question)
+        self.assertIn("Switching it off there stops delivery", question)
+        self.assertEqual(self.scheduler.changes(), [])
+
+    @unittest.skipUnless(DARWIN, "launchd agents are macOS only")
+    def test_an_agent_still_loaded_after_bootout_is_unconfirmed(self):
+        self.install()
+        self.scheduler.write(STUCK_LAUNCHCTL)
+        result = self.run_collector("uninstall", code=2)
+        self.assertIn(b"timer_unconfirmed", result.stderr)
+        self.assertIn(b"launchctl bootout", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertFalse(self.scheduler.defined())
+        self.assertFalse((self.data / "install.json").exists())
+
+    def test_setup_without_a_reachable_scheduler_refuses_before_pairing(self):
+        self.scheduler.write(UNREACHABLE)
+        result = self.install(code=2)
+        self.assertIn(b"scheduler_unreachable", result.stderr)
+        self.assertIn(b"Nothing was sent", result.stderr)
+        self.assertNotIn(b"Hook entries", result.stdout)
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(hasattr(self, "installation"))
+        self.assertFalse(self.data.exists())
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertEqual(self.scheduler.changes(), [])
+
+    def test_doctor_reports_the_last_sync_run_time(self):
+        self.install()
+        self.assertIsNone(
+            json.loads(self.run_collector("doctor").stdout)["last_sync_at"]
+        )
+        before = time.time()
+        at = self.timer_sync()["last_sync_at"]
+        self.assertRegex(at, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        seconds = calendar.timegm(time.strptime(at, "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertLessEqual(abs(seconds - before), 60)
 
     def test_self_test_row_is_never_selected_by_sync(self):
         self.install()
@@ -428,25 +575,20 @@ class InstallTest(unittest.TestCase):
             hashlib.sha256(self.original).hexdigest(),
         )
         self.assertEqual(
-            self.systemctl_log()[2:],
-            [
-                "--user disable --now devdiary-claude-sync.timer",
-                "--user daemon-reload",
-            ],
+            self.scheduler.changes(),
+            [*self.scheduler.started(), *self.scheduler.stopped()],
         )
-        self.assertFalse(
-            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
-        )
-        log = self.systemctl_log()
+        self.assertFalse(self.scheduler.defined())
+        log = self.scheduler.log()
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
-        self.assertEqual(self.systemctl_log(), log)
+        self.assertEqual(self.scheduler.log(), log)
 
     def test_doctor_reports_registration_timer_and_drops(self):
         self.install()
         doctor = json.loads(self.run_collector("doctor").stdout)
         self.assertEqual(doctor["registration"]["registration"], "installed")
-        self.assertEqual(doctor["timer"], {"enabled": "enabled", "active": "active"})
+        self.assertEqual(doctor["timer"], self.scheduler.running())
         self.assertEqual(doctor["drops"], {})
         self.assertIsNone(doctor["last_receipt"])
         self.assertIsNone(doctor["last_sync_error"])
@@ -464,10 +606,8 @@ class InstallTest(unittest.TestCase):
             json.loads(self.settings.read_bytes())["hooks"]["UserPromptSubmit"][0],
             CODEGRAPH,
         )
-        self.assertEqual(
-            self.systemctl_log()[-1],
-            "--user enable --now devdiary-claude-sync.timer",
-        )
+        restarted = self.scheduler.restarted()
+        self.assertEqual(self.scheduler.changes()[-len(restarted) :], restarted)
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
 
@@ -477,7 +617,7 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn(b"--yes", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse(self.data.exists())
-        self.assertEqual(self.systemctl_log(), [])
+        self.assertEqual(self.scheduler.changes(), [])
 
     def test_invalid_settings_json_refuses(self):
         self.settings.write_bytes(b'{"hooks": ')
@@ -485,18 +625,17 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"invalid_settings", result.stderr)
         self.assertEqual(self.settings.read_bytes(), b'{"hooks": ')
         self.assertFalse((self.data / "connection").exists())
-        self.assertEqual(self.systemctl_log(), [])
+        self.assertEqual(self.scheduler.changes(), [])
 
+    @unittest.skipIf(DARWIN, "launchctl reads an absent domain as an unloaded agent")
     def test_uninstall_without_a_user_bus_still_removes_the_hooks(self):
-        self.fake.write_text(NO_USER_BUS)
-        self.assertIn(b"timer_unavailable", self.install(code=2).stderr)
+        self.install()
+        self.scheduler.write(UNREACHABLE)
         result = self.run_collector("uninstall", code=2)
         self.assertIn(b"timer_unconfirmed", result.stderr)
         self.assertNotIn(b"Hooks are registered", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
-        self.assertFalse(
-            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
-        )
+        self.assertFalse(self.scheduler.defined())
         self.assertFalse((self.data / "install.json").exists())
         self.assertIn(b"Not installed", self.run_collector("uninstall").stdout)
 
@@ -583,11 +722,11 @@ class InstallTest(unittest.TestCase):
         doc["env"] = {"X": "observer_hook"}
         edited = (json.dumps(doc, indent=2) + "\n").encode()
         self.settings.write_bytes(edited)
-        log = self.systemctl_log()
+        log = self.scheduler.changes()
         result = self.run_collector("upgrade", "--yes", code=2)
         self.assertIn(b"python_observer_registered", result.stderr)
         self.assertEqual(self.settings.read_bytes(), edited)
-        self.assertEqual(self.systemctl_log(), log)
+        self.assertEqual(self.scheduler.changes(), log)
         self.assertTrue((self.data / "install.json").exists())
 
     def test_upgrade_failing_after_removal_can_still_be_uninstalled(self):
@@ -598,26 +737,15 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(json.loads(self.run_collector("doctor").stdout)["installed"])
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
-        self.assertIn(
-            "--user disable --now devdiary-claude-sync.timer", self.systemctl_log()
-        )
-        self.assertFalse(
-            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
-        )
+        self.assertIn(self.scheduler.stopped()[0], self.scheduler.changes())
+        self.assertFalse(self.scheduler.defined())
 
     def test_uninstall_without_a_record_still_disables_leftover_units(self):
         self.install()
         (self.data / "install.json").unlink()
         self.run_collector("uninstall")
-        self.assertIn(
-            "--user disable --now devdiary-claude-sync.timer", self.systemctl_log()
-        )
-        self.assertFalse(
-            (self.config / "systemd/user/devdiary-claude-sync.timer").exists()
-        )
-        self.assertFalse(
-            (self.config / "systemd/user/devdiary-claude-sync.service").exists()
-        )
+        self.assertIn(self.scheduler.stopped()[0], self.scheduler.changes())
+        self.assertFalse(self.scheduler.defined())
 
     def test_install_without_a_settings_file_says_so(self):
         self.settings.unlink()
@@ -798,7 +926,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.settings.read_bytes(), compact)
 
     def interactive(self, answer, edit=None, args=None):
-        log = self.systemctl_log()
+        log = self.scheduler.changes()
         before = self.settings.read_bytes() if self.settings.exists() else None
         master, slave = pty.openpty()
         self.addCleanup(os.close, master)
@@ -818,7 +946,7 @@ class InstallTest(unittest.TestCase):
                 seen += os.read(process.stdout.fileno(), 4096)
         self.assertIn(b"[y/N]", seen)
         self.seen = seen
-        self.assertEqual(self.systemctl_log(), log)
+        self.assertEqual(self.scheduler.changes(), log)
         self.assertEqual(
             self.settings.read_bytes() if self.settings.exists() else None, before
         )
@@ -1042,7 +1170,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.starts, 0)
         self.assertFalse(self.data.exists())
         self.assertEqual(self.settings.read_bytes(), self.original)
-        self.assertEqual(self.systemctl_log(), [])
+        self.assertEqual(self.scheduler.changes(), [])
 
     def test_settings_edited_after_consent_give_stale_plan_and_write_nothing(self):
         edited = self.original.replace(b'"opus"', b'"sonnet"')
@@ -1053,7 +1181,7 @@ class InstallTest(unittest.TestCase):
         self.assertFalse(self.backup().exists())
         self.assertFalse((self.data / "install.json").exists())
         self.assertEqual(list((self.data / "plans").iterdir()), [])
-        self.assertEqual(self.systemctl_log(), [])
+        self.assertEqual(self.scheduler.changes(), [])
 
     def test_a_run_stopped_after_pairing_reuses_the_connection_and_asks_again(self):
         edited = self.original.replace(b'"opus"', b'"sonnet"')
@@ -1095,22 +1223,19 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(
             sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
         )
-        self.assertEqual(
-            self.systemctl_log()[-1],
-            "--user enable --now devdiary-claude-sync.timer",
-        )
+        self.assertEqual(self.scheduler.changes(), self.scheduler.started())
         self.assertFalse(self.backup().exists())
 
     def test_upgrade_shows_the_new_entries_before_asking(self):
         self.install()
         before = self.settings.read_bytes()
-        log = self.systemctl_log()
+        log = self.scheduler.changes()
         code, err = self.interactive(b"n\n", args=[str(BIN), "upgrade"])
         self.assertEqual(code, 2)
         self.assertIn(b"consent_declined", err)
         self.assertEqual(self.seen.count(b" hook claude "), len(EVENTS))
         self.assertEqual(self.settings.read_bytes(), before)
-        self.assertEqual(self.systemctl_log(), log)
+        self.assertEqual(self.scheduler.changes(), log)
 
     def test_declining_an_upgrade_from_a_rebuild_keeps_capture_working(self):
         self.install()
@@ -1133,13 +1258,13 @@ class InstallTest(unittest.TestCase):
         self.install()
         self.revoke()
         self.run_collector("uninstall")
-        log = self.systemctl_log()
+        log = self.scheduler.changes()
         result = self.install(code=2)
         self.assertIn(b"connection_revoked", result.stderr)
         self.assertIn(b"move the connection folder", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse((self.data / "install.json").exists())
-        self.assertEqual(self.systemctl_log(), log)
+        self.assertEqual(self.scheduler.changes(), log)
 
     def test_a_revoked_connection_moved_aside_pairs_again(self):
         self.install()
@@ -1157,11 +1282,11 @@ class InstallTest(unittest.TestCase):
     def test_upgrade_refuses_a_revoked_connection(self):
         self.install()
         self.revoke()
-        before, log = self.settings.read_bytes(), self.systemctl_log()
+        before, log = self.settings.read_bytes(), self.scheduler.changes()
         result = self.run_collector("upgrade", "--yes", code=2)
         self.assertIn(b"connection_revoked", result.stderr)
         self.assertEqual(self.settings.read_bytes(), before)
-        self.assertEqual(self.systemctl_log(), log)
+        self.assertEqual(self.scheduler.changes(), log)
 
     def test_another_origin_needs_trust_origin(self):
         args = [a for a in self.install_args() if a != "--trust-origin"]

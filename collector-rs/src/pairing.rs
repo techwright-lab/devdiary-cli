@@ -2,7 +2,9 @@
 //! Secrets live only in memory until one atomic private connection commit. Pairing
 //! bearers cannot be resumed: a lost exchange requires revocation and a new pair.
 use crate::{
-    Object, Result, object, scope,
+    Object, Result, object,
+    scheduler::Os,
+    scope,
     store::{Store, private},
     text,
 };
@@ -374,7 +376,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
     std::io::stdout().flush()?;
     if o.browser {
         // The constant URL is the only argument. No bearer/code in child argv/env.
-        let _ = Command::new("/usr/bin/xdg-open")
+        let _ = Command::new(opener(Os::THIS))
             .arg(format!("{origin}{verify}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -477,6 +479,12 @@ pub(crate) fn refresh_scope(root: &Path) -> Result<()> {
         Some(&root.join("revoked")),
     )
 }
+fn opener(os: Os) -> &'static str {
+    match os {
+        Os::Linux => "/usr/bin/xdg-open",
+        Os::Macos => "/usr/bin/open",
+    }
+}
 pub const SETUP_INCOMPLETE: &str = "Setup incomplete. No secret is recoverable from a consumed exchange. Revoke unused connections in the browser, then move the connection folder aside and run setup again. The folder is ~/.local/share/devdiary/cli/claude/connection, or codex/connection for Codex.";
 pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
     known_diagnostic(error).unwrap_or(SETUP_INCOMPLETE)
@@ -535,6 +543,11 @@ pub fn guidance(code: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn each_platform_opens_the_browser_with_its_own_system_opener() {
+        assert_eq!(opener(Os::Macos), "/usr/bin/open");
+        assert_eq!(opener(Os::Linux), "/usr/bin/xdg-open");
+    }
     #[test]
     fn origins_are_exact_and_explicit() {
         assert!(origin(DEFAULT_ORIGIN, false).is_ok());
