@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pairing_rails as p
 
-BIN = Path(__file__).resolve().parents[1] / "target/debug/devdiary-collector"
+BIN = Path(__file__).resolve().parents[1] / "target/debug/devdiary"
 
 
 class PairingCleanupTest(unittest.TestCase):
@@ -194,7 +194,7 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
             "cwd": str(self.repo),
             "tool_use_id": tool_use_id,
         }
-        self.run_collector("claude-hook", self.plan, data=json.dumps(event).encode())
+        self.run_collector("hook", "claude", self.plan, data=json.dumps(event).encode())
 
     def health(self):
         return json.loads(

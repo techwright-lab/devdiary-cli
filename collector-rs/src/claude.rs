@@ -170,7 +170,7 @@ fn entry(plan: &Path, exe: &str) -> Result<Value> {
 }
 fn entry_for(plan: &Path, exe: &str, vendor: Vendor) -> Result<Value> {
     Ok(
-        json!({"hooks": [{"type": "command", "command": format!("{} {} {} >/dev/null 2>&1 || :", quote(exe), vendor.hook(), quote(plan.to_str().ok_or("invalid_path")?)), "timeout": 2}]}),
+        json!({"hooks": [{"type": "command", "command": format!("{} hook {} {} >/dev/null 2>&1 || :", quote(exe), vendor.slug(), quote(plan.to_str().ok_or("invalid_path")?)), "timeout": 2}]}),
     )
 }
 fn lock(state: &Path, shared: bool) -> Result<File> {
@@ -392,10 +392,13 @@ fn refusal(raw: &[u8]) -> Result<()> {
     if String::from_utf8_lossy(raw).contains("observer_hook") {
         return Err("python_observer_registered".into());
     }
-    // Do not stack registrations or silently take over another Rust adapter.
-    if String::from_utf8_lossy(raw).contains(" claude-hook ")
-        || String::from_utf8_lossy(raw).contains(" codex-hook ")
-    {
+    let text = String::from_utf8_lossy(raw);
+    // devdiary-collector wrote these; its install must be removed by its own binary.
+    if text.contains(" claude-hook ") || text.contains(" codex-hook ") {
+        return Err("old_collector_registered".into());
+    }
+    // Do not stack registrations or silently take over another adapter.
+    if text.contains(" hook claude ") || text.contains(" hook codex ") {
         return Err("already_registered".into());
     }
     Ok(())

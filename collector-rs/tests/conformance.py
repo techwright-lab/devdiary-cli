@@ -17,7 +17,7 @@ from pathlib import Path
 from devdiary import observer_upload
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = ROOT / "target/debug/devdiary-collector"
+BIN = ROOT / "target/debug/devdiary"
 FIXTURES = ROOT / "tests/fixtures"
 
 

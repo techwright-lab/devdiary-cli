@@ -78,8 +78,7 @@ fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize
     let config = json!({"collector_ref":"collector-fixture", "endpoint":endpoint,
         "installation_id":"11111111-1111-4111-8111-111111111111", "observation_schema_versions":[1,2],
         "record_orchestrated_outside_repos":false,"scope_kind":"installation"});
-    devdiary_collector::store::Store::open(dir.path(), Some(&serde_json::to_vec(&config).unwrap()))
-        .unwrap();
+    devdiary::store::Store::open(dir.path(), Some(&serde_json::to_vec(&config).unwrap())).unwrap();
     let refs = dir.path().join("repository-refs.json");
     fs::write(&refs, b"[\"https://github.com/acme/old\"]").unwrap();
     fs::set_permissions(&refs, fs::Permissions::from_mode(0o600)).unwrap();
@@ -94,7 +93,7 @@ fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize
     let key = credentials.path().join("key");
     fs::write(&key, b"dc_live_secret_fixture").unwrap();
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_devdiary-collector"))
+    let output = Command::new(env!("CARGO_BIN_EXE_devdiary"))
         .arg("sync")
         .arg(dir.path())
         .arg(&key)

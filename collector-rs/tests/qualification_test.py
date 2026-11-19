@@ -49,7 +49,7 @@ class QualificationTest(unittest.TestCase):
             system = home / "etc/claude-code"
             (system / "managed-settings.d").mkdir(parents=True)
             (system / "managed-settings.d/audit.json").write_text("{}")
-            native = q.CLI / "collector-rs/target/debug/devdiary-collector"
+            native = q.CLI / "collector-rs/target/debug/devdiary"
 
             def fake_run(argv, **kwargs):
                 if list(map(str, argv))[:2] == ["mise", "which"]:
@@ -200,7 +200,7 @@ class QualificationTest(unittest.TestCase):
 
     def test_registration_cleanup_on_fake_vendor_failure_and_interrupt(self):
         # Real collector registration; fake vendor never constitutes qualification.
-        collector = q.CLI / "collector-rs/target/debug/devdiary-collector"
+        collector = q.CLI / "collector-rs/target/debug/devdiary"
         real_run = q.run
         for failure in (RuntimeError("fixture-secret"), KeyboardInterrupt()):
             with tempfile.TemporaryDirectory() as home:

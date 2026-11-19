@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{BufRead, IsTerminal, Read, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -19,7 +19,7 @@ use std::{
 use uuid::Uuid;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const BINARY: &str = "devdiary-collector";
+const BINARY: &str = "devdiary";
 const RECORD: &str = "install.json";
 const SYNC_STATUS: &str = "sync-status.json";
 const BATCH: usize = 100;
@@ -47,14 +47,12 @@ fn home() -> Result<PathBuf> {
         .ok_or_else(|| "home_required".into())
 }
 // Fixed under HOME, not XDG_DATA_HOME: a shell without that variable must still
-// find the same install record, connection and pinned binary.
+// find the same install record, connection and pinned binary. Never the old
+// devdiary-collector folder: setup pairs again rather than adopt its connection.
 fn data_dir(vendor: Vendor) -> Result<PathBuf> {
-    let root = home()?.join(".local/share/devdiary/collector");
-    Ok(if vendor == Vendor::Codex {
-        root.join("codex")
-    } else {
-        root
-    })
+    Ok(home()?
+        .join(".local/share/devdiary/cli")
+        .join(vendor.slug()))
 }
 fn connection(data: &Path) -> PathBuf {
     data.join("connection")
@@ -175,7 +173,29 @@ fn consent(yes: bool, question: &str) -> Result<()> {
     }
 }
 
-pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
+// The install script runs setup by path, so an older `devdiary` earlier on PATH
+// would still answer every later command the person types.
+fn warn_other_on_path() {
+    let (Ok(me), Some(path)) = (
+        std::env::current_exe().and_then(fs::canonicalize),
+        std::env::var_os("PATH"),
+    ) else {
+        return;
+    };
+    let first = std::env::split_paths(&path)
+        .map(|dir| dir.join(BINARY))
+        .find(|p| {
+            fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        });
+    if let Some(other) = first.filter(|p| fs::canonicalize(p).ok().as_deref() != Some(&*me)) {
+        eprintln!(
+            "Warning: {} comes first on PATH, so typing `devdiary` runs that program, not this one. Setup continues.",
+            other.display()
+        );
+    }
+}
+pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
+    warn_other_on_path();
     require_consent_channel(o.yes)?;
     let data = data_dir(o.vendor)?;
     let settings = match o.settings {
@@ -234,7 +254,10 @@ pub fn install(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     registration.show()?;
     if let Err(error) = consent(
         o.yes,
-        "Append these 10 entries and enable the devdiary-collector-sync user timer?",
+        &format!(
+            "Append these 10 entries and enable the {} user timer?",
+            o.vendor.timer()
+        ),
     ) {
         let _ = fs::remove_file(&registration.plan);
         return Err(error);
@@ -335,7 +358,7 @@ impl<'a> Registration<'a> {
         )?;
         self_test(exe, plan, &connection(data).join("outbox"), self.vendor)?;
         println!(
-            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\nThe timer syncs every 2 minutes. Run `devdiary-collector doctor` (add `--vendor codex` for Codex) to check it."
+            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\nThe timer syncs every 2 minutes. Run `devdiary doctor` (add `--vendor codex` for Codex) to check it."
         );
         Ok(())
     }
@@ -345,7 +368,8 @@ fn self_test(exe: &Path, plan: &Path, outbox: &Path, vendor: Vendor) -> Result<(
     let session = format!("{}{}", claude::SELF_TEST, Uuid::new_v4());
     let event = json!({"hook_event_name": "SessionStart", "session_id": session, "cwd": "/"});
     let mut child = Command::new(exe)
-        .arg(vendor.hook())
+        .arg("hook")
+        .arg(vendor.slug())
         .arg(plan)
         .env_clear()
         .stdin(Stdio::piped())
@@ -450,14 +474,14 @@ fn offer_orchestrators(data: &Path) -> Result<()> {
     }
     if !std::io::stdin().is_terminal() {
         println!(
-            "Orchestrator names wait for approval. In a terminal run: devdiary-collector orchestrators approve"
+            "Orchestrator names wait for approval. In a terminal run: devdiary orchestrators approve"
         );
         return Ok(());
     }
     match ask_orchestrators(&outbox) {
         Err(error) if error.to_string() == "consent_declined" => {
             println!(
-                "No names approved. Hooks stay registered. Run `devdiary-collector orchestrators approve` to answer again."
+                "No names approved. Hooks stay registered. Run `devdiary orchestrators approve` to answer again."
             );
             Ok(())
         }
@@ -595,6 +619,27 @@ pub fn timer_sync(root: &Path) -> Result<()> {
             }
         }
     }
+}
+pub fn sync_all() -> Result<()> {
+    let mut sent = false;
+    let mut first_error = None;
+    for vendor in [Vendor::Claude, Vendor::Codex] {
+        let data = data_dir(vendor)?;
+        if record(&data)?.is_none() {
+            continue;
+        }
+        sent = true;
+        match timer_sync(&connection(&data)) {
+            Ok(()) => println!("Synced {}.", vendor.runtime()),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if !sent {
+        println!("Not installed; nothing to send. Run `devdiary setup`.");
+    }
+    first_error.map_or(Ok(()), Err)
 }
 // Rows the server refuses stay pending and the cursor wraps, so one run visits
 // each row that was pending when it started at most once.

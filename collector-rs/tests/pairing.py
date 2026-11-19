@@ -10,7 +10,7 @@ import time
 import unittest
 from pathlib import Path
 
-BIN = Path(__file__).resolve().parents[1] / "target/debug/devdiary-collector"
+BIN = Path(__file__).resolve().parents[1] / "target/debug/devdiary"
 
 
 class PairingTest(unittest.TestCase):

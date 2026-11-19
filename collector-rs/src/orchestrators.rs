@@ -188,7 +188,7 @@ fn notice(offered: &[Value], approved: &[Value]) -> Option<String> {
         .collect();
     (!missing.is_empty()).then(|| {
         format!(
-            "Runs of {} {outcome} until approved. In a terminal run: devdiary-collector orchestrators approve",
+            "Runs of {} {outcome} until approved. In a terminal run: devdiary orchestrators approve",
             missing.join(", ")
         )
     })
