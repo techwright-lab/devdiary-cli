@@ -304,7 +304,14 @@ class PairingTest(unittest.TestCase):
         ) as p:
             os.close(slave)
             assert p.stdout is not None
-            self.assertTrue(p.stdout.readline())
+            seen = b""
+            for wanted, answer in ((terminal.PROMPT, b"y\n"), (b"Approve at", None)):
+                while wanted not in seen:
+                    chunk = os.read(p.stdout.fileno(), 4096)
+                    self.assertTrue(chunk, seen)
+                    seen += chunk
+                if answer:
+                    os.write(master, answer)
             p.send_signal(signal.SIGINT)
             p.communicate(timeout=5)
         self.assertNotEqual(p.returncode, 0)

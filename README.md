@@ -204,16 +204,24 @@ devdiary uninstall
    `setup`. A saved connection that the server revoked is refused
    (`connection_revoked`): run `uninstall`, move the connection folder aside (its
    pending rows stay there) and run `setup` again. Nothing is paired or changed.
-2. Pairs installation scope into `~/.local/share/devdiary/cli/claude/connection`
+   If an earlier setup stopped while it wrote the settings, it left a copy named
+   `<settings file>.devdiary-backup`. Setup offers to restore that copy before it
+   reads the settings. Declining keeps both files and stops with `backup_kept`.
+2. Prints the 10 hook entries and the settings file they go in, and asks `[y/N]` on
+   the terminal. Declining sends nothing and changes nothing.
+3. Pairs installation scope into `~/.local/share/devdiary/cli/claude/connection`
    (`cli/codex` for Codex). It never reads the old `devdiary/collector` folder.
    This path is fixed under `$HOME`; `$XDG_DATA_HOME` is not used, so every shell
-   finds the same install.
-3. Copies the running binary to `~/.local/share/devdiary/cli/HARNESS/VERSION/` (0700),
+   finds the same install. If setup stops after this step, the next run reuses the
+   saved connection, asks again and does not pair again.
+4. Copies the running binary to `~/.local/share/devdiary/cli/HARNESS/VERSION/` (0700),
    so the registered hook survives rebuilds and `cargo clean`.
-4. Plans the hook entries for that copy, prints the 10 entries, and asks `[y/N]` on
-   the terminal. Declining removes the plan and changes nothing.
-5. Applies the plan. Settings edited after the plan give `stale_plan` and are left
-   exactly as they are; run `setup` again.
+5. Plans the hook entries for that copy and applies the plan. Entries that differ
+   from the ones shown, or settings edited after step 1, give `stale_plan`, and the
+   settings are left exactly as they are; run `setup` again. Before the write, setup
+   copies the settings to `<settings file>.devdiary-backup` with the same mode, and
+   it removes the copy once the write succeeds. The plan never holds a copy of the
+   settings.
 6. Writes `devdiary-claude-sync.service` and `.timer` (`devdiary-codex-sync` for
    Codex) under
    `~/.config/systemd/user/` (`$XDG_CONFIG_HOME` when set), then

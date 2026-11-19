@@ -3,8 +3,9 @@ use devdiary::{MAX_HOOK_INPUT, Result, install, systemd::Systemctl};
 use std::{io::Read, path::Path, sync::mpsc, time::Duration};
 
 // Static refusal codes only; other errors can carry input or paths.
-const REPORTED: [&str; 26] = [
+const REPORTED: [&str; 27] = [
     "invalid_command",
+    "backup_kept",
     "python_observer_registered",
     "already_registered",
     "unsafe_settings",
@@ -45,7 +46,10 @@ fn hint(code: &str) -> &'static str {
         "consent_required" => "Run setup in a terminal to review the hook entries.",
         "consent_declined" => "Nothing was registered. Settings and timers are unchanged.",
         "stale_plan" => {
-            "Settings changed after the plan was made and were left as they are. Run setup again."
+            "Settings changed after you agreed to the hook entries, and were left as they are. Run setup again."
+        }
+        "backup_kept" => {
+            "The settings file and the copy setup made before an interrupted run are both kept. Remove one of the two files, then run `devdiary setup` again."
         }
         "invalid_settings" => {
             "The selected harness settings file is not valid JSON. Fix it, then run setup again."

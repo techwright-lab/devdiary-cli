@@ -93,6 +93,8 @@ class InstallTest(unittest.TestCase):
         self.observation_status = 201
         self.orchestrators = None
         self.scope_status = 200
+        self.starts = 0
+        self.on_exchange = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -124,6 +126,7 @@ class InstallTest(unittest.TestCase):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
                 data = json.loads(raw)
                 if self.path.endswith("/collector_pairings"):
+                    owner.starts += 1
                     owner.installation = data["installation_id"]
                     owner.requested_runtime = data["runtime"]
                     return self.reply(
@@ -140,6 +143,8 @@ class InstallTest(unittest.TestCase):
                         },
                     )
                 if self.path.endswith("/exchange"):
+                    if owner.on_exchange is not None:
+                        owner.on_exchange()
                     return self.reply(
                         200,
                         {
@@ -1025,20 +1030,64 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"PAPERCLIP_RUN_ID", out)
         self.assertEqual(self.approved(), [PAPERCLIP])
 
-    def test_declining_consent_changes_nothing_and_never_enables(self):
+    def backup(self):
+        return self.settings.with_name(self.settings.name + ".devdiary-backup")
+
+    def test_declining_consent_before_pairing_sends_and_changes_nothing(self):
         code, err = self.interactive(b"n\n")
         self.assertEqual(code, 2)
         self.assertIn(b"consent_declined", err)
+        self.assertIn(str(self.settings).encode(), self.seen)
+        self.assertEqual(self.seen.count(b" hook claude "), len(EVENTS))
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(self.data.exists())
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertEqual(self.systemctl_log(), [])
 
-    def test_settings_edited_between_plan_and_apply_give_stale_plan(self):
+    def test_settings_edited_after_consent_give_stale_plan_and_write_nothing(self):
         edited = self.original.replace(b'"opus"', b'"sonnet"')
-        code, err = self.interactive(b"y\n", edit=edited)
-        self.assertEqual(code, 2)
-        self.assertIn(b"stale_plan", err)
+        self.on_exchange = lambda: self.settings.write_bytes(edited)
+        result = self.install(code=2)
+        self.assertIn(b"stale_plan", result.stderr)
         self.assertEqual(self.settings.read_bytes(), edited)
+        self.assertFalse(self.backup().exists())
+        self.assertFalse((self.data / "install.json").exists())
+        self.assertEqual(list((self.data / "plans").iterdir()), [])
         self.assertEqual(self.systemctl_log(), [])
+
+    def test_a_run_stopped_after_pairing_reuses_the_connection_and_asks_again(self):
+        edited = self.original.replace(b'"opus"', b'"sonnet"')
+        self.on_exchange = lambda: self.settings.write_bytes(edited)
+        self.install(code=2)
+        self.on_exchange = None
+        out = self.install().stdout
+        self.assertEqual(self.starts, 1)
+        self.assertEqual(out.count(b" hook claude "), len(EVENTS))
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
+
+    def test_a_left_backup_is_restored_on_yes_before_the_settings_are_read(self):
+        before = b'{"model": "before-the-interrupted-run"}'
+        self.settings.write_bytes(b"not json: an interrupted run")
+        self.backup().write_bytes(before)
+        self.backup().chmod(0o640)
+        result = self.install(code=2, answers=(b"y\n", b"n\n"))
+        self.assertIn(b"consent_declined", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertEqual(self.settings.stat().st_mode & 0o777, 0o640)
+        self.assertFalse(self.backup().exists())
+        self.assertEqual(self.starts, 0)
+
+    def test_a_left_backup_kept_on_no_stops_with_backup_kept(self):
+        self.backup().write_bytes(b'{"model": "before"}')
+        result = self.install(code=2, answers=(b"n\n",))
+        self.assertIn(b"backup_kept", result.stderr)
+        self.assertIn(str(self.backup()).encode(), result.stdout)
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertEqual(self.backup().read_bytes(), b'{"model": "before"}')
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(self.data.exists())
 
     def test_consent_on_a_tty_installs_then_enables(self):
         code, err = self.interactive(b"y\n")
@@ -1050,6 +1099,7 @@ class InstallTest(unittest.TestCase):
             self.systemctl_log()[-1],
             "--user enable --now devdiary-claude-sync.timer",
         )
+        self.assertFalse(self.backup().exists())
 
     def test_upgrade_shows_the_new_entries_before_asking(self):
         self.install()

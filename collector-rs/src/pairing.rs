@@ -288,7 +288,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
     }
     if o.root.join("connection.json").exists() {
         initialize(o.root, &connection(o.root)?)?;
-        println!("Connection already saved; no new pairing or hook changes.");
+        println!("Connection already saved; this machine is not paired again.");
         return Ok(());
     }
     let attempt = o.root.join("pairing-attempted");
@@ -444,14 +444,20 @@ pub(crate) fn revoked(state: &Path) -> bool {
             root.join("connection.json").is_file() && root.join("revoked").exists()
         })
 }
-pub fn plan_with(root: &Path, settings: &Path, plan: &Path, exe: &Path) -> Result<()> {
+pub fn plan_with(
+    root: &Path,
+    settings: &Path,
+    plan: &Path,
+    exe: &Path,
+    agreed: Option<&str>,
+) -> Result<()> {
     let doc = connection(root)?;
     let config = doc["scope"].as_object().ok_or("invalid_connection")?;
     if !crate::installation(config) {
         return Err("invalid_connection".into());
     }
     initialize(root, &doc)?;
-    crate::claude::plan_for(&root.join("outbox"), settings, plan, exe)
+    crate::claude::plan_for(&root.join("outbox"), settings, plan, exe, agreed)
 }
 pub fn sync(root: &Path, limit: usize) -> Result<crate::store::Report> {
     let doc = connection(root)?;
