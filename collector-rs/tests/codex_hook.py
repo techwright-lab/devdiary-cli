@@ -15,7 +15,8 @@ class CodexHookTest(unittest.TestCase):
         self.fixture.runtime = "codex"
         self.fixture.data = self.fixture.codex_data
         self.fixture.settings = self.fixture.home / ".codex/hooks.json"
-        self.fixture.install("--vendor", "codex", "--yes")
+        # Setup asks to create hooks.json, then to append the entries.
+        self.fixture.install("--vendor", "codex", answers=(b"y\n", b"y\n"))
         self.repo = self.fixture.root / "demo"
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         subprocess.run(
@@ -133,9 +134,6 @@ class CodexHookTest(unittest.TestCase):
         self.assertNotIn("commits", rows[-1])
 
     def test_upgrade_and_remove_keep_unrelated_hooks_and_pending_evidence(self):
-        self.fixture.run_collector(
-            "hook-apply", self.fixture.record()["plan"], "--consent"
-        )
         settings = self.fixture.settings
         doc = json.loads(settings.read_bytes())
         unrelated = {"hooks": [{"type": "command", "command": "other-tool"}]}
