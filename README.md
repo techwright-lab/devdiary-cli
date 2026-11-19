@@ -70,6 +70,7 @@ cargo fmt --manifest-path collector-rs/Cargo.toml --check
 cargo test --locked --manifest-path collector-rs/Cargo.toml
 cargo clippy --locked --manifest-path collector-rs/Cargo.toml --all-targets -- -D warnings
 PYTHONPATH=src python3 collector-rs/tests/conformance.py -v
+python3 collector-rs/tests/install_script_test.py -v
 cargo audit --file collector-rs/Cargo.lock
 bin/test
 ```
@@ -89,8 +90,14 @@ binary keeps the linker's ad hoc signature: the release profile does not strip,
 and the job fails unless `codesign --verify` passes on the archived binary. The
 release carries `devdiary-X.Y.Z-<target>.tar.gz` for each target, `SHA256SUMS` and
 `install.sh`. The job writes the tag into the `RELEASE_TAG=unreleased` line of
-`collector-rs/install.sh`, and fails when that file is missing. Each archive has a
-GitHub artifact attestation:
+`collector-rs/install.sh`, and fails when that file is missing. The script
+downloads the archive for the machine's target from its own release, refuses it
+unless it matches `SHA256SUMS`, and renames it into `~/.local/bin/devdiary`. With
+a terminal open it then runs `devdiary setup` on that terminal and exits with
+setup's status. Without one it installs only. `sh -s -- --version X.Y.Z` installs
+another release. `collector-rs/tests/install_script_test.py` runs it under dash
+and `bash --posix` against a local release fixture in a throwaway home. Each
+archive has a GitHub artifact attestation:
 
 ```sh
 gh attestation verify devdiary-X.Y.Z-<target>.tar.gz --repo techwright-lab/devdiary-cli

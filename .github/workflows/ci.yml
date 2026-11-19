@@ -63,6 +63,8 @@ jobs:
           python3 collector-rs/tests/pairing_rails_test.py -v
       - name: One-command install, timer units and uninstall (fake systemctl)
         run: python3 collector-rs/tests/install_test.py -v
+      - name: Install script against a local release fixture (no network)
+        run: python3 collector-rs/tests/install_script_test.py -v
       - name: Qualification harness control-flow fixtures (no provider calls)
         run: |
           python3 collector-rs/tests/qualification_test.py -v
