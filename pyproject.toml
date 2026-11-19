@@ -13,7 +13,7 @@ authors = [{ name = "TechWright" }]
 dependencies = []
 
 [project.scripts]
-devdiary = "devdiary.cli:main"
+devdiary-launcher = "devdiary.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/devdiary"]

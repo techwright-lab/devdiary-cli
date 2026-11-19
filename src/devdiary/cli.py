@@ -33,7 +33,7 @@ def _reject_notes_arguments(message: str) -> NoReturn:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="devdiary")
+    root = argparse.ArgumentParser(prog="devdiary-launcher")
     root.add_argument("--version", action="version", version=__version__)
     root.add_argument("--config", type=Path, default=default_config_path())
     commands = root.add_subparsers(dest="command", required=True)

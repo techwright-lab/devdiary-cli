@@ -323,7 +323,7 @@ impl Target {
         match self {
             Self::Repository { reference, .. } => format!("Select repository: {reference}"),
             Self::Installation { .. } => {
-                "Select: All active repositories (this machine's installation)".into()
+                "Select: All tracked repositories (this machine's installation)".into()
             }
         }
     }

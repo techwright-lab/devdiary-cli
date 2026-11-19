@@ -130,8 +130,8 @@ jobs:
           python -m venv .verify-venv
           .verify-venv/bin/python -m pip install --upgrade pip
           .verify-venv/bin/python -m pip install dist/*.whl
-          .verify-venv/bin/devdiary --version
-          .verify-venv/bin/devdiary schema envelope
+          .verify-venv/bin/devdiary-launcher --version
+          .verify-venv/bin/devdiary-launcher schema envelope
       - name: Install and run wheel console command (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -140,5 +140,5 @@ jobs:
           & .\.verify-venv\Scripts\python.exe -m pip install --upgrade pip
           $wheel = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
           & .\.verify-venv\Scripts\python.exe -m pip install $wheel
-          & .\.verify-venv\Scripts\devdiary.exe --version
-          & .\.verify-venv\Scripts\devdiary.exe schema envelope
+          & .\.verify-venv\Scripts\devdiary-launcher.exe --version
+          & .\.verify-venv\Scripts\devdiary-launcher.exe schema envelope
