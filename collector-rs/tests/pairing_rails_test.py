@@ -5,19 +5,19 @@ import email.utils
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 import pairing_rails as p
+import saved_connection
+import terminal
 
 BIN = Path(__file__).resolve().parents[1] / "target/debug/devdiary"
 
@@ -89,15 +89,12 @@ class PairingCleanupTest(unittest.TestCase):
 
 
 class ConnectionSyncRefusalTest(unittest.TestCase):
-    """Real binary against a fake ingest server; the connection is built locally."""
+    """Real binary against a fake ingest server; the connection is saved locally."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="connection-sync-")
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        self.exe = self.root / "collector"
-        shutil.copyfile(BIN, self.exe)
-        self.exe.chmod(0o700)
         self.repo = self.root / "repo"
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         subprocess.run(
@@ -112,15 +109,27 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
+            def do_GET(self):
+                body = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "collector_ref": COLLECTOR_REF,
+                        "scope_kind": "installation",
+                        "repository_refs": ["https://github.com/acme/demo"],
+                        "observation_schema_versions": [1, 2],
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_POST(self):
                 sent = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 owner.requests.append(sent)
                 body = json.dumps(
                     {
-                        "collector_ref": "urn:devdiary:collector:"
-                        + "1" * 8
-                        + "-1111-4111-8111-"
-                        + "1" * 12,
+                        "collector_ref": COLLECTOR_REF,
                         "observation_id": sent["observation_id"],
                         "installation_id": sent["installation_id"],
                         "record_id": 9,
@@ -139,42 +148,22 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
         self.addCleanup(thread.join)
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        self.connection = self.root / "connection"
-        self.connection.mkdir(mode=0o700)
-        self.connection.chmod(0o700)
         origin = f"http://127.0.0.1:{server.server_port}"
-        installation = {
-            "installation_id": str(uuid.uuid4()),
-            "origin": origin,
-            "repository": str(self.repo.resolve()),
-            "repository_ref": "https://github.com/acme/demo",
-            "remote": None,
-        }
-        scope = {
-            "endpoint": origin + "/ingest/v1/observations",
-            "collector_ref": "urn:devdiary:collector:"
-            + "1" * 8
-            + "-1111-4111-8111-"
-            + "1" * 12,
-            **{
-                k: installation[k]
-                for k in ("installation_id", "repository", "repository_ref")
-            },
-        }
-        self.write(self.connection / "installation.json", installation)
-        self.write(
-            self.connection / "connection.json",
-            {"scope": scope, "token": "dc_live_" + "s" * 43},
+        home = self.root / "home"
+        self.connection = saved_connection.save(
+            home, origin, ["https://github.com/acme/demo"]
         )
-        self.settings = self.root / "settings.json"
-        self.write(self.settings, {})
-        self.plan = self.root / "plan.json"
-        self.run_collector("setup-plan", self.connection, self.settings, self.plan)
-        self.run_collector("claude-apply", self.plan, "--consent")
-
-    def write(self, path, value):
-        path.write_text(json.dumps(value))
-        path.chmod(0o600)
+        self.env = saved_connection.environment(self.root, home)
+        settings = self.root / "settings.json"
+        settings.write_text("{}")
+        settings.chmod(0o600)
+        args = [BIN, "setup", "--settings", settings, "--origin", origin]
+        code, _, err, _ = terminal.answering(
+            [*args, "--trust-origin", "--no-browser"], self.env
+        )
+        self.assertEqual(code, 0, err)
+        record = json.loads((self.connection.parent / "install.json").read_bytes())
+        self.exe, self.plan = record["executable"], record["plan"]
 
     def run_collector(self, *args, code=0, data=None):
         result = subprocess.run(
@@ -183,6 +172,7 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
             capture_output=True,
             check=False,
             timeout=10,
+            env=self.env,
         )
         self.assertEqual(result.returncode, code, result.stderr)
         return result
@@ -196,76 +186,77 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
         }
         self.run_collector("hook", "claude", self.plan, data=json.dumps(event).encode())
 
+    def sync(self):
+        self.run_collector("sync", self.connection)
+
     def health(self):
-        return json.loads(
-            self.run_collector("connection-status", self.connection).stdout
-        )
+        return json.loads(self.run_collector("doctor").stdout)
 
     def test_revoked_credential_stops_spooling_and_syncing(self):
         self.hook("before-revoke")
         self.status = 401
-        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.sync()
         self.assertTrue((self.connection / "revoked").exists())
         self.hook("after-revoke")
         health = self.health()
-        self.assertEqual(health["local_pending"], 1)
-        self.assertEqual(health["local_drops"], {"revoked": 1})
-        self.assertTrue(health["local_revoked"])
+        self.assertEqual(health["pending"], 1)
+        self.assertEqual(health["drops"], {"revoked": 1})
+        self.assertTrue(health["revoked"])
         self.status = 201
-        self.run_collector("connection-sync", self.connection, "10", code=2)
+        self.sync()
         self.assertEqual(len(self.requests), 1)
 
     def test_retry_after_is_respected_on_the_next_sync(self):
         self.hook("first")
         self.status, self.headers = 429, {"Retry-After": "120"}
-        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.sync()
         self.status, self.headers = 201, {}
-        result = self.run_collector("connection-sync", self.connection, "10", code=2)
-        self.assertIn(b"Retry-After", result.stderr)
+        self.sync()
+        self.assertEqual(self.health()["last_sync_error"], "sync_rate_limited")
         self.assertEqual(len(self.requests), 1)
         self.assertFalse((self.connection / "revoked").exists())
 
     def test_sync_resumes_once_retry_after_has_passed(self):
         self.hook("first")
         self.status, self.headers = 429, {"Retry-After": "1"}
-        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.sync()
         self.status, self.headers = 201, {}
-        self.run_collector("connection-sync", self.connection, "10", code=2)
+        self.sync()
+        self.assertEqual(len(self.requests), 1)
         time.sleep(1.1)
-        self.run_collector("connection-sync", self.connection, "10")
+        self.sync()
         self.assertEqual(len(self.requests), 2)
-        self.assertEqual(self.health()["local_pending"], 0)
+        self.assertEqual(self.health()["pending"], 0)
 
     def test_http_date_retry_after_blocks_the_next_sync(self):
         self.hook("first")
         later = email.utils.formatdate(time.time() + 3600, usegmt=True)
         self.status, self.headers = 429, {"Retry-After": later}
-        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.sync()
         self.status, self.headers = 201, {}
-        self.run_collector("connection-sync", self.connection, "10", code=2)
+        self.sync()
         self.assertEqual(len(self.requests), 1)
 
     def test_forbidden_is_treated_as_revocation(self):
         self.hook("first")
         self.status = 403
-        self.run_collector("connection-sync", self.connection, "10", code=1)
+        self.sync()
         self.assertTrue((self.connection / "revoked").exists())
 
 
-COLLECTOR_REF = "urn:devdiary:collector:" + "1" * 8 + "-1111-4111-8111-" + "1" * 12
+COLLECTOR_REF = saved_connection.COLLECTOR_REF
 
 
 class InstallationPairingTest(unittest.TestCase):
-    """Real binary pairs an installation scope against a fake pairing server."""
+    """`devdiary setup` pairs an installation scope against a fake pairing server."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="installation-pairing-")
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        self.exe = self.root / "collector"
-        shutil.copyfile(BIN, self.exe)
-        self.exe.chmod(0o700)
         self.starts, self.scope_status = [], 200
+        self.served_refs = ["https://github.com/acme/demo"]
+        self.served_orchestrators = None
         self.connection_shape = {}
         owner = self
 
@@ -281,19 +272,16 @@ class InstallationPairingTest(unittest.TestCase):
                 self.wfile.write(raw)
 
             def do_GET(self):
-                self.reply(
-                    owner.scope_status,
-                    {
-                        "schema_version": 1,
-                        "collector_ref": COLLECTOR_REF,
-                        "scope_kind": "installation",
-                        "repository_refs": ["https://github.com/acme/later"],
-                        "observation_schema_versions": [1, 2],
-                        "orchestrators": [
-                            {"key": "paperclip", "env": {"run_ref": "PAPERCLIP_RUN_ID"}}
-                        ],
-                    },
-                )
+                reply = {
+                    "schema_version": 1,
+                    "collector_ref": COLLECTOR_REF,
+                    "scope_kind": "installation",
+                    "repository_refs": owner.served_refs,
+                    "observation_schema_versions": [1, 2],
+                }
+                if owner.served_orchestrators is not None:
+                    reply["orchestrators"] = owner.served_orchestrators
+                self.reply(owner.scope_status, reply)
 
             def do_POST(self):
                 sent = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -341,32 +329,34 @@ class InstallationPairingTest(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.origin = f"http://127.0.0.1:{server.server_port}"
-        self.connection = self.root / "connection"
+        home = self.root / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude/settings.json").write_text("{}")
+        self.env = saved_connection.environment(self.root, home)
+        self.connection = home / ".local/share/devdiary/cli/claude/connection"
 
     def run_collector(self, *args, code=0):
         result = subprocess.run(
-            [str(self.exe), *map(str, args)],
+            [str(BIN), *map(str, args)],
             capture_output=True,
             check=False,
             timeout=20,
+            env=self.env,
         )
         self.assertEqual(result.returncode, code, result.stderr)
         self.assertNotIn(b"dc_live_", result.stdout + result.stderr)
         return result
 
     def setup_collector(self, *extra, code=0):
-        return self.run_collector(
-            "setup",
-            self.connection,
-            "--origin",
-            self.origin,
-            "--trust-origin",
-            "--no-browser",
-            *extra,
-            code=code,
+        args = [BIN, "setup", "--origin", self.origin, "--trust-origin"]
+        status, out, err, _ = terminal.answering(
+            [*args, "--no-browser", *extra], self.env
         )
+        self.assertEqual(status, code, err)
+        self.assertNotIn(b"dc_live_", out + err)
+        return subprocess.CompletedProcess(args, status, out, err)
 
-    def test_setup_without_repository_pairs_installation_scope(self):
+    def test_setup_pairs_installation_scope(self):
         out = self.setup_collector("--record-orchestrated-outside-repos").stdout
         self.assertIn(b"All tracked repositories", out)
         (start,) = self.starts
@@ -392,20 +382,19 @@ class InstallationPairingTest(unittest.TestCase):
             json.loads(refs.read_bytes()), ["https://github.com/acme/demo"]
         )
         self.assertEqual(refs.stat().st_mode & 0o777, 0o600)
-        health = json.loads(
-            self.run_collector("connection-status", self.connection).stdout
-        )
-        self.assertEqual(health["local_repository_refs"], 1)
+        self.run_collector("uninstall")
         self.setup_collector("--record-orchestrated-outside-repos")
+        self.assertEqual(len(self.starts), 1)
+        self.run_collector("uninstall")
         self.setup_collector(code=2)
-        settings, plan = self.root / "settings.json", self.root / "plan.json"
-        settings.write_text("{}")
-        settings.chmod(0o600)
-        self.run_collector("setup-plan", self.connection, settings, plan)
 
     def test_sync_refreshes_refs_and_a_revoked_scope_read_stops(self):
         self.setup_collector()
-        self.run_collector("connection-sync", self.connection, "10")
+        self.served_refs = ["https://github.com/acme/later"]
+        self.served_orchestrators = [
+            {"key": "paperclip", "env": {"run_ref": "PAPERCLIP_RUN_ID"}}
+        ]
+        self.run_collector("sync", self.connection)
         refs = json.loads(
             (self.connection / "outbox/repository-refs.json").read_bytes()
         )
@@ -415,41 +404,25 @@ class InstallationPairingTest(unittest.TestCase):
         )
         self.assertEqual(offered["orchestrators"][0]["key"], "paperclip")
         self.scope_status = 401
-        self.run_collector("connection-sync", self.connection, "10", code=2)
+        self.run_collector("sync", self.connection)
         self.assertTrue((self.connection / "revoked").exists())
 
     def test_a_failed_refresh_is_reported_until_a_good_one_clears_it(self):
         self.setup_collector()
-        self.run_collector("connection-sync", self.connection, "10")
+        self.run_collector("sync", self.connection)
         refs = self.connection / "outbox/repository-refs.json"
         before = refs.read_bytes()
         self.scope_status = 503
-        result = self.run_collector("connection-sync", self.connection, "10")
-        (line,) = result.stdout.splitlines()
-        self.assertEqual(
-            json.loads(line),
-            {
-                "pending": 0,
-                "delivered": 0,
-                "scope_refresh_error": "scope_refresh_http_failure",
-            },
-        )
-        self.assertIn(b"The server refused scope refresh", result.stderr)
+        self.run_collector("sync", self.connection)
         self.assertEqual(refs.read_bytes(), before)
-        health = json.loads(
-            self.run_collector("connection-status", self.connection).stdout
-        )
+        doctor = json.loads(self.run_collector("doctor").stdout)
         self.assertEqual(
-            health["local_scope_refresh_error"], "scope_refresh_http_failure"
+            doctor["last_scope_refresh_error"], "scope_refresh_http_failure"
         )
         self.scope_status = 200
-        result = self.run_collector("connection-sync", self.connection, "10")
-        self.assertEqual(json.loads(result.stdout), {"pending": 0, "delivered": 0})
-        self.assertEqual(result.stderr, b"")
-        health = json.loads(
-            self.run_collector("connection-status", self.connection).stdout
-        )
-        self.assertIsNone(health["local_scope_refresh_error"])
+        self.run_collector("sync", self.connection)
+        doctor = json.loads(self.run_collector("doctor").stdout)
+        self.assertIsNone(doctor["last_scope_refresh_error"])
 
     def test_a_server_without_v2_pairs_a_v1_installation(self):
         self.connection_shape = {"observation_schema_versions": [1]}
@@ -463,13 +436,10 @@ class InstallationPairingTest(unittest.TestCase):
         self.assertIn(b"--record-orchestrated-outside-repos", err)
         saved = json.loads((self.connection / "connection.json").read_bytes())
         self.assertFalse(saved["scope"]["record_orchestrated_outside_repos"])
-        self.run_collector("connection-status", self.connection)
-        self.run_collector("connection-sync", self.connection, "10")
+        self.run_collector("doctor")
+        self.run_collector("sync", self.connection)
+        self.run_collector("uninstall")
         self.setup_collector("--record-orchestrated-outside-repos")
-        settings, plan = self.root / "settings.json", self.root / "plan.json"
-        settings.write_text("{}")
-        settings.chmod(0o600)
-        self.run_collector("setup-plan", self.connection, settings, plan)
 
     def test_an_outside_repo_opt_in_cannot_be_widened_after_pairing(self):
         self.connection_shape = {"observation_schema_versions": [1]}
@@ -478,10 +448,10 @@ class InstallationPairingTest(unittest.TestCase):
         saved = json.loads(path.read_bytes())
         saved["scope"]["record_orchestrated_outside_repos"] = True
         path.write_text(json.dumps(saved))
-        self.run_collector("connection-status", self.connection, code=2)
+        self.run_collector("sync", self.connection, code=2)
         saved["scope"]["observation_schema_versions"] = [1, 2]
         path.write_text(json.dumps(saved))
-        self.run_collector("connection-status", self.connection, code=2)
+        self.run_collector("sync", self.connection, code=2)
 
     def test_an_exchange_for_another_scope_is_refused(self):
         self.connection_shape = {
@@ -493,18 +463,6 @@ class InstallationPairingTest(unittest.TestCase):
         }
         self.setup_collector(code=2)
         self.assertFalse((self.connection / "connection.json").exists())
-
-    def test_outside_repo_opt_in_is_installation_only(self):
-        repo = self.root / "repo"
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        self.run_collector(
-            "setup",
-            self.connection,
-            repo,
-            "--record-orchestrated-outside-repos",
-            code=2,
-        )
-        self.assertEqual(self.starts, [])
 
 
 @unittest.skipUnless(

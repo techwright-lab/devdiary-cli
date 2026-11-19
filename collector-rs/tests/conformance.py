@@ -19,19 +19,14 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import saved_connection
 import terminal
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target/debug/devdiary"
 FIXTURES = ROOT / "tests/fixtures"
-TOKEN = "dc_live_" + "s" * 43
+TOKEN = saved_connection.TOKEN
 REF = "https://github.com/acme/demo"
-FAKE_SYSTEMCTL = """#!/bin/sh
-case "$*" in
-  *is-enabled*) echo enabled ;;
-  *is-active*) echo active ;;
-esac
-"""
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid"]
 
 
@@ -111,40 +106,21 @@ class CollectorTest(unittest.TestCase):
     def install(self, origin, code=0):
         """Save a connection as pairing leaves it, then run setup on a terminal."""
         self.home = self.root / "home"
-        data = self.home / ".local/share/devdiary/cli/claude"
-        data.parent.mkdir(parents=True)
-        data.mkdir(mode=0o700)
-        self.connection = data / "connection"
-        self.connection.mkdir(mode=0o700)
         scope = json.loads((FIXTURES / "installation-scope.json").read_bytes())
-        scope["endpoint"] = origin + "/ingest/v1/observations"
-        installation = {
-            "installation_id": scope["installation_id"],
-            "origin": origin,
-            "scope_kind": "installation",
-            "record_orchestrated_outside_repos": False,
-        }
-        connection = {"scope": scope, "token": TOKEN, "repository_refs": [REF]}
-        for name, value in (
-            ("installation.json", installation),
-            ("connection.json", connection),
-        ):
-            (self.connection / name).write_text(json.dumps(value))
-            (self.connection / name).chmod(0o600)
+        self.connection = saved_connection.save(
+            self.home,
+            origin,
+            [REF],
+            collector_ref=scope["collector_ref"],
+            installation_id=scope["installation_id"],
+        )
+        data = self.connection.parent
         settings = self.root / "settings.json"
         settings.write_text("{}")
         settings.chmod(0o600)
-        systemctl = self.root / "bin/systemctl"
-        systemctl.parent.mkdir()
-        systemctl.write_text(FAKE_SYSTEMCTL)
-        systemctl.chmod(0o700)
-        self.env = {
-            **{k: v for k, v in os.environ.items() if not k.startswith("PAPERCLIP_")},
-            "HOME": str(self.home),
-            "XDG_CONFIG_HOME": str(self.root / "config"),
-            "DEVDIARY_COLLECTOR_SYSTEMCTL": str(systemctl),
-            "HTTP_PROXY": "http://127.0.0.1:1",
-        }
+        base = {k: v for k, v in os.environ.items() if not k.startswith("PAPERCLIP_")}
+        self.env = saved_connection.environment(self.root, self.home, base)
+        self.env["HTTP_PROXY"] = "http://127.0.0.1:1"
         args = [BIN, "setup", "--settings", settings, "--origin", origin]
         args += ["--trust-origin", "--no-browser"]
         status, _, self.setup_err, _ = terminal.answering(args, self.env)

@@ -18,18 +18,13 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import saved_connection
 import terminal
 
 from devdiary import observer_hook
 
 ROOT = Path(__file__).resolve().parents[1]
 EVENTS = observer_hook.EVENTS
-FAKE_SYSTEMCTL = """#!/bin/sh
-case "$*" in
-  *is-enabled*) echo enabled ;;
-  *is-active*) echo active ;;
-esac
-"""
 
 
 AGENT = "22c99d01-c3ee-4041-9066-0a83f34bd2e2"
@@ -164,45 +159,18 @@ class InstallationFixture:
     ):
         # A saved connection, as pairing leaves it; setup then reuses it.
         self.home = self.root / getattr(self, "home_name", "home")
-        self.data = data = self.home / ".local/share/devdiary/cli/claude"
-        data.parent.mkdir(parents=True)
-        data.mkdir(mode=0o700)
-        self.connection = data / "connection"
-        self.connection.mkdir(mode=0o700)
-        installation = {
-            "installation_id": str(uuid.uuid4()),
-            "origin": self.origin,
-            "scope_kind": "installation",
-            "record_orchestrated_outside_repos": opt_in,
-        }
-        scope = {
-            "endpoint": self.origin + "/ingest/v1/observations",
-            "collector_ref": self.collector_ref,
-            "installation_id": installation["installation_id"],
-            "scope_kind": "installation",
-            "observation_schema_versions": list(versions),
-            "record_orchestrated_outside_repos": opt_in,
-        }
-        self.write(self.connection / "installation.json", installation)
-        self.write(
-            self.connection / "connection.json",
-            {
-                "scope": scope,
-                "token": "dc_live_" + "s" * 43,
-                "repository_refs": self.refs,
-            },
+        self.connection = saved_connection.save(
+            self.home,
+            self.origin,
+            self.refs,
+            versions,
+            opt_in,
+            collector_ref=self.collector_ref,
         )
+        self.data = self.connection.parent
         self.settings = self.root / "settings.json"
         self.write(self.settings, {} if settings is None else settings)
-        systemctl = self.root / "bin/systemctl"
-        systemctl.parent.mkdir()
-        systemctl.write_text(FAKE_SYSTEMCTL)
-        systemctl.chmod(0o700)
-        self.setup_env = self.env(
-            HOME=str(self.home),
-            XDG_CONFIG_HOME=str(self.root / "config"),
-            DEVDIARY_COLLECTOR_SYSTEMCTL=str(systemctl),
-        )
+        self.setup_env = saved_connection.environment(self.root, self.home, self.env())
         self.opt_in = opt_in
         # Setup refreshes the scope once. Serve what the connection was approved
         # with, so a test's offer still arrives with the first sync.
