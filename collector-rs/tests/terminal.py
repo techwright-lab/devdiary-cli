@@ -9,8 +9,10 @@ import time
 PROMPT = b"[y/N]"
 
 
-def answering(args, env, answers=(b"y\n",), later=b"n\n", timeout=40):
+def answering(args, env, answers=(b"y\n",), later=b"n\n", timeout=40, on_prompt=None):
     """Answer each question in turn; questions past `answers` get `later`.
+
+    `on_prompt(index)` runs while the command waits for that answer.
 
     Returns (exit status, stdout, stderr, number of questions asked).
     """
@@ -39,6 +41,8 @@ def answering(args, env, answers=(b"y\n",), later=b"n\n", timeout=40):
                 else:
                     err += chunk
             while out.count(PROMPT) > asked:
+                if on_prompt is not None:
+                    on_prompt(asked)
                 os.write(master, answers[asked] if asked < len(answers) else later)
                 asked += 1
         if streams:
