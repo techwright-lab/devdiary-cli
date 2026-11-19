@@ -496,62 +496,6 @@ fn create(tx: &Transaction, initial: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Migrates a version 1 spool in place: delivered rows become tombstones and a
-/// counter, pending rows keep their exact bytes. Safe to re-run after a crash.
-pub fn repair(state: &Path) -> Result<()> {
-    state_check(state)?;
-    let lock = create_private(&state.join("sync.lock"))?;
-    lock.try_lock()?;
-    let path = state.join(DB);
-    private(&path, false)?;
-    let mut db = connect(&path, false)?;
-    if pragma(&db, "application_id")? != APP_ID {
-        return Err("incompatible_spool".into());
-    }
-    match pragma(&db, "user_version")? {
-        1 => migrate(&mut db)?,
-        VERSION => {}
-        _ => return Err("incompatible_spool".into()),
-    }
-    if pragma(&db, "auto_vacuum")? != 2 {
-        db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
-    }
-    Ok(())
-}
-fn migrate(db: &mut Connection) -> Result<()> {
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute_batch(&format!(
-        "ALTER TABLE scope ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0;
-         ALTER TABLE scope ADD COLUMN last_receipt BLOB;
-         ALTER TABLE scope ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0;
-         {ADDED_TABLES}"
-    ))?;
-    let delivered: Vec<(String, Vec<u8>)> = tx
-        .prepare(
-            "SELECT observation_id,payload FROM outbox WHERE delivered=1 ORDER BY seq DESC LIMIT ?",
-        )?
-        .query_map([TOMBSTONES], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    let at = now()?;
-    for (id, payload) in delivered {
-        tx.execute(
-            "INSERT INTO delivered(observation_id,digest,at) VALUES(?,?,?)",
-            params![id, digest(&payload), at],
-        )?;
-    }
-    tx.execute_batch(&format!(
-        "UPDATE scope SET delivered=(SELECT count(*) FROM outbox WHERE delivered=1),
-            last_receipt=(SELECT receipt FROM outbox WHERE delivered=1 ORDER BY seq DESC LIMIT 1);
-         DELETE FROM outbox WHERE delivered=1;
-         DROP INDEX pending;
-         ALTER TABLE outbox DROP COLUMN delivered;
-         ALTER TABLE outbox DROP COLUMN receipt;
-         PRAGMA user_version={VERSION};"
-    ))?;
-    tx.commit()?;
-    Ok(())
-}
-
 pub fn repository_refs(value: &serde_json::Value) -> Result<Vec<String>> {
     let refs: Vec<String> = value
         .as_array()
@@ -618,34 +562,6 @@ pub(crate) fn seed_refs(state: &Path, refs: &[String]) -> Result<()> {
     replace_refs(state, refs)
 }
 
-fn credential(path: &Path) -> Result<String> {
-    private(path, false)?;
-    let mut raw = String::new();
-    File::open(path)?.take(4097).read_to_string(&mut raw)?;
-    if raw.len() > 4096 {
-        return Err("invalid_credential".into());
-    }
-    let key = raw.trim();
-    if !key.strip_prefix("dc_live_").is_some_and(|s| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    }) {
-        return Err("invalid_credential".into());
-    }
-    Ok(key.to_string())
-}
-
-pub fn sync(state: &Path, key_path: &Path, limit: usize) -> Result<(i64, i64)> {
-    sync_outcome(state, key_path, limit).map(|r| (r.pending, r.delivered))
-}
-pub fn sync_outcome(state: &Path, key_path: &Path, limit: usize) -> Result<Report> {
-    // Compatibility entrypoint for existing manually provisioned credentials.
-    if key_path.starts_with(state) {
-        return Err("separate_credential_required".into());
-    }
-    sync_report(state, &credential(key_path)?, limit, None)
-}
 pub struct Report {
     pub pending: i64,
     pub delivered: i64,
@@ -655,7 +571,7 @@ pub struct Report {
     pub refusal: Option<String>,
     pub scope_refresh_error: Option<&'static str>,
 }
-pub(crate) fn sync_report(
+pub fn sync_report(
     state: &Path,
     key: &str,
     limit: usize,

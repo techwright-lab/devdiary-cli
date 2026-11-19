@@ -332,9 +332,6 @@ fn atomic_replace(
 
 /// Plan contains hashes/scope and ownership only, never a settings backup (which
 /// could contain provider secrets). Removal restores the layout `ordered` keeps.
-pub fn plan(state: &Path, settings_path: &Path, plan_path: &Path) -> Result<()> {
-    plan_for(state, settings_path, plan_path, &std::env::current_exe()?)
-}
 pub fn plan_for(state: &Path, settings_path: &Path, plan_path: &Path, exe: &Path) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err("linux_only".into());

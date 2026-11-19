@@ -1,8 +1,7 @@
 use devdiary::{
-    Object, freeze, object,
-    store::{Store, repair, sync},
+    object,
+    store::{Store, sync_report},
 };
-use rusqlite::{Connection, params};
 use std::{
     collections::{BTreeMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
@@ -84,22 +83,19 @@ impl FakeServer {
 struct Fixture {
     _dir: tempfile::TempDir,
     state: PathBuf,
-    key: PathBuf,
+}
+const TOKEN: &str = "dc_live_SYNTHETIC_ONLY";
+fn sync(state: &Path, limit: usize) -> (i64, i64) {
+    let report = sync_report(state, TOKEN, limit, None).unwrap();
+    (report.pending, report.delivered)
 }
 fn fixture(port: u16) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     std::fs::create_dir(&state).unwrap();
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let key = dir.path().join("key");
-    std::fs::write(&key, "dc_live_SYNTHETIC_ONLY").unwrap();
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
     Store::open(&state, Some(&scope(port))).unwrap();
-    Fixture {
-        _dir: dir,
-        state,
-        key,
-    }
+    Fixture { _dir: dir, state }
 }
 fn scope(port: u16) -> Vec<u8> {
     let mut config = object(include_bytes!("fixtures/scope.json")).unwrap();
@@ -168,7 +164,7 @@ fn delivered_rows_are_reclaimed_while_pending_rows_are_kept() {
         held.insert(rejected.clone(), payload(&f.state, &rejected).unwrap());
         let mut drained = false;
         for _ in 0..5 {
-            let (pending, _) = sync(&f.state, &f.key, 100).unwrap();
+            let (pending, _) = sync(&f.state, 100);
             if pending as usize == held.len() {
                 drained = true;
                 break;
@@ -181,7 +177,7 @@ fn delivered_rows_are_reclaimed_while_pending_rows_are_kept() {
     }
     server.rejected.lock().unwrap().clear();
     for _ in 0..5 {
-        sync(&f.state, &f.key, 100).unwrap();
+        sync(&f.state, 100);
     }
     assert_eq!(
         Store::open(&f.state, None).unwrap().counts().unwrap(),
@@ -198,67 +194,11 @@ fn lost_receipt_keeps_the_row_pending_and_retries_identical_bytes() {
         .collect(observation(1).as_bytes())
         .unwrap();
     server.lose_responses.store(true, Ordering::SeqCst);
-    assert_eq!(sync(&f.state, &f.key, 1).unwrap(), (1, 0));
+    assert_eq!(sync(&f.state, 1), (1, 0));
     assert!(payload(&f.state, &id(1)).is_some());
     server.lose_responses.store(false, Ordering::SeqCst);
-    assert_eq!(sync(&f.state, &f.key, 1).unwrap(), (0, 1));
+    assert_eq!(sync(&f.state, 1), (0, 1));
     let bodies = server.bodies.lock().unwrap();
     assert_eq!(bodies.len(), 2);
     assert_eq!(bodies[0], bodies[1]);
-}
-
-fn old_format_store(state: &Path, config: &Object) -> Vec<Vec<u8>> {
-    let path = state.join("collector-rust-v1.sqlite3");
-    let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA application_id=1145328177; PRAGMA user_version=1;
-        CREATE TABLE scope (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json BLOB NOT NULL, cursor INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE outbox (seq INTEGER PRIMARY KEY, observation_id TEXT UNIQUE NOT NULL, payload BLOB NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, receipt BLOB, failure TEXT);
-        CREATE INDEX pending ON outbox(delivered, seq);").unwrap();
-    db.execute(
-        "INSERT INTO scope(singleton,json) VALUES(1,?)",
-        [serde_json::to_vec(config).unwrap()],
-    )
-    .unwrap();
-    let payloads: Vec<_> = (0..3)
-        .map(|n| freeze(observation(n).as_bytes(), config).unwrap())
-        .collect();
-    for (n, bytes) in payloads.iter().enumerate() {
-        db.execute(
-            "INSERT INTO outbox(observation_id,payload,delivered,receipt) VALUES(?,?,?,?)",
-            params![
-                id(n),
-                bytes,
-                (n < 2) as i64,
-                (n < 2).then_some(b"{}".to_vec())
-            ],
-        )
-        .unwrap();
-    }
-    drop(db);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    payloads
-}
-
-#[test]
-fn old_format_store_requires_repair_then_keeps_pending_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state");
-    std::fs::create_dir(&state).unwrap();
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let config = object(&scope(9999)).unwrap();
-    let payloads = old_format_store(&state, &config);
-    let refused = Store::open(&state, None).err().unwrap().to_string();
-    assert_eq!(refused, "repair_required");
-    repair(&state).unwrap();
-    repair(&state).unwrap();
-    let mut store = Store::open(&state, None).unwrap();
-    assert_eq!(store.counts().unwrap(), (1, 2));
-    let vacuum: i64 = store
-        .db
-        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(vacuum, 2);
-    assert_eq!(payload(&state, &id(2)), Some(payloads[2].clone()));
-    store.collect(observation(0).as_bytes()).unwrap();
-    assert_eq!(store.counts().unwrap(), (1, 2));
 }

@@ -469,6 +469,7 @@ class InstallTest(unittest.TestCase):
     def test_without_a_terminal_setup_refuses_before_pairing(self):
         result = self.run_collector(*self.install_args()[1:], code=2)
         self.assertIn(b"consent_required", result.stderr)
+        self.assertNotIn(b"--yes", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse(self.data.exists())
         self.assertEqual(self.systemctl_log(), [])
@@ -677,6 +678,46 @@ class InstallTest(unittest.TestCase):
         self.run_collector("sync")
         self.assertEqual(len(self.received), 3)
         self.assertEqual(self.pending(), 0)
+
+    def test_repository_scope_commands_and_old_setup_flags_are_gone(self):
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        plan = self.root / "plan.json"
+        removed = [
+            ["init", state, "--consent"],
+            ["collect", state],
+            ["sync", state, self.root / "key", "10"],
+            ["status", state],
+            ["repair", state],
+            ["claude-plan", state, self.settings, plan],
+            ["claude-apply", plan, "--consent"],
+            ["claude-remove", plan, "--consent"],
+            ["hook-apply", plan, "--consent"],
+            ["hook-remove", plan, "--consent"],
+            ["setup", state],
+            ["setup-plan", state, self.settings, plan],
+            ["connection-status", state],
+            ["connection-sync", state, "10"],
+            [*self.install_args("--yes")[1:]],
+            [*self.install_args("--new-pair")[1:]],
+            [*self.install_args("--record-outside-repos")[1:]],
+        ]
+        for args in removed:
+            with self.subTest(args=args[:2]):
+                result = self.run_collector(*args, code=2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"collector_error: invalid_command", result.stderr)
+                self.assertEqual(list(state.iterdir()), [])
+        self.assertFalse(hasattr(self, "installation"))
+        self.assertFalse(self.data.exists())
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        help = self.run_collector("--help").stdout
+        for word in [b"init ", b"collect ", b"claude-plan", b"hook-apply", b"STATE"]:
+            self.assertNotIn(word, help)
+        for word in [b"setup-plan", b"connection-sync", b"--new-pair"]:
+            self.assertNotIn(word, help)
+        (setup,) = [line for line in help.splitlines() if line.startswith(b"setup ")]
+        self.assertNotIn(b"--yes", setup)
 
     def test_sync_with_nothing_installed_sends_nothing(self):
         out = self.run_collector("sync").stdout
@@ -1045,7 +1086,7 @@ class InstallTest(unittest.TestCase):
         log = self.systemctl_log()
         result = self.install(code=2)
         self.assertIn(b"connection_revoked", result.stderr)
-        self.assertIn(b"setup --new-pair", result.stderr)
+        self.assertIn(b"move the connection folder", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse((self.data / "install.json").exists())
         self.assertEqual(self.systemctl_log(), log)

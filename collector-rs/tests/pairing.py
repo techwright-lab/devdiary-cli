@@ -259,6 +259,8 @@ class PairingTest(unittest.TestCase):
         count = len(self.calls)
         p = self.run_setup()
         self.assertNotEqual(p.returncode, 0)
+        self.assertIn(b"move the connection folder", p.stderr)
+        self.assertNotIn(b"--new-pair", p.stdout + p.stderr)
         self.assertEqual(len(self.calls), count)
         installation = self.installation
         self.mode = "ok"

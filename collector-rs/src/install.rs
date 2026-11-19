@@ -34,10 +34,7 @@ pub struct Options<'a> {
     pub trust_origin: bool,
     pub settings: Option<&'a Path>,
     pub record_orchestrated_outside_repos: bool,
-    pub record_outside_repos: bool,
-    pub yes: bool,
     pub browser: bool,
-    pub new_pair: bool,
 }
 
 fn home() -> Result<PathBuf> {
@@ -196,7 +193,7 @@ fn warn_other_on_path() {
 }
 pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     warn_other_on_path();
-    require_consent_channel(o.yes)?;
+    require_consent_channel(false)?;
     let data = data_dir(o.vendor)?;
     let settings = match o.settings {
         Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -219,7 +216,7 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     // Codex need not have a hooks file yet. Never initialize or rewrite config.toml.
     if o.vendor == Vendor::Codex && !settings.exists() {
         consent(
-            o.yes,
+            false,
             &format!(
                 "Create an empty Codex hooks file at {}?",
                 settings.display()
@@ -234,18 +231,16 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     }
     claude::preflight(&settings)?;
     private_dir(&data)?;
-    reuse_or_retire(&data, o.new_pair)?;
+    if revoked(&data) {
+        return Err("connection_revoked".into());
+    }
     pairing::setup(pairing::Options {
         vendor: o.vendor,
         root: &connection(&data),
-        repository: None,
-        remote: None,
         origin,
         trust_origin: o.trust_origin,
         browser: o.browser,
-        new_pair: o.new_pair,
         record_orchestrated_outside_repos: o.record_orchestrated_outside_repos,
-        next_steps: false,
     })
     .map_err(setup_failure)?;
     let exe = pin_binary(&data)?;
@@ -253,7 +248,7 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     registration.plan()?;
     registration.show()?;
     if let Err(error) = consent(
-        o.yes,
+        false,
         &format!(
             "Append these 10 entries and enable the {} user timer?",
             o.vendor.timer()
@@ -263,32 +258,10 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
         return Err(error);
     }
     registration.finish(runner)?;
-    if o.record_outside_repos {
-        crate::outside::set(&connection(&data).join("outbox"), true)?;
-        println!("{OUTSIDE_ON}");
-    }
     offer_orchestrators(&data)
 }
 fn revoked(data: &Path) -> bool {
     pairing::revoked(&connection(data).join("outbox"))
-}
-// A revoked connection is set aside rather than deleted so its pending rows stay
-// on disk; a working one is never replaced, since install can reuse it.
-fn reuse_or_retire(data: &Path, new_pair: bool) -> Result<()> {
-    let saved = connection(data).join("connection.json").is_file();
-    match (revoked(data), new_pair) {
-        (true, false) => Err("connection_revoked".into()),
-        (false, true) if saved => Err("connection_active".into()),
-        (true, true) => {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            fs::rename(
-                connection(data),
-                data.join(format!("connection-revoked-{nanos}")),
-            )?;
-            Ok(File::open(data)?.sync_all()?)
-        }
-        (false, _) => Ok(()),
-    }
 }
 fn setup_failure(error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
     if pairing::known_diagnostic(error.as_ref()).is_some() {

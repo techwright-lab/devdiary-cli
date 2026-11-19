@@ -65,85 +65,6 @@ pub fn github_remote(raw: &str) -> Result<String> {
     }
     Ok(canonical)
 }
-fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    // Native Linux slice: absolute executable, no shell, inherited Git overrides,
-    // credential helpers, pager, global config, or external command execution.
-    let mut child = Command::new("/usr/bin/git")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let stdout = child.stdout.take().ok_or("git_discovery_failed")?;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout.take(65537).read_to_end(&mut bytes).map(|_| bytes);
-        let _ = tx.send(result);
-    });
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let output = rx.recv_timeout(Duration::from_secs(3));
-    // Git config/rev-parse cannot execute helpers. Reap the one owned process
-    // even if a filesystem hangs or the bounded reader hits its output ceiling.
-    let oversized = output
-        .as_ref()
-        .is_ok_and(|r| r.as_ref().is_ok_and(|v| v.len() > 65536));
-    while !oversized && child.try_wait()?.is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    if child.try_wait()?.is_none() {
-        let _ = child.kill();
-    }
-    let status = child.wait()?;
-    let output = output??;
-    if !status.success() || output.len() > 65536 {
-        return Err("git_discovery_failed".into());
-    }
-    Ok(String::from_utf8(output)?)
-}
-fn repository(repo: &Path, remote: Option<&str>) -> Result<(String, String)> {
-    let repo = fs::canonicalize(repo)?;
-    let top = git(&repo, &["rev-parse", "--show-toplevel"])?;
-    if Path::new(top.trim_end_matches('\n')) != repo {
-        return Err("repository_root_required".into());
-    }
-    let raw = git(
-        &repo,
-        &[
-            "config",
-            "--local",
-            "--no-includes",
-            "--null",
-            "--get-regexp",
-            "^remote\\..*\\.url$",
-        ],
-    )?;
-    let mut candidates = std::collections::BTreeSet::new();
-    for record in raw.split('\0').filter(|s| !s.is_empty()) {
-        let (key, value) = record.split_once('\n').ok_or("invalid_remote")?;
-        let name = key
-            .strip_prefix("remote.")
-            .and_then(|s| s.strip_suffix(".url"))
-            .ok_or("invalid_remote")?;
-        if remote.is_none_or(|r| r == name) {
-            candidates.insert(github_remote(value)?);
-        }
-    }
-    if candidates.len() != 1 {
-        return Err("choose_remote".into());
-    }
-    Ok((
-        repo.to_str().ok_or("invalid_repository")?.to_string(),
-        candidates.into_iter().next().ok_or("choose_remote")?,
-    ))
-}
 fn read(path: &Path) -> Result<Vec<u8>> {
     private(path, false)?;
     let mut raw = Vec::new();
@@ -254,78 +175,40 @@ fn initialize(root: &Path, doc: &Object) -> Result<()> {
 pub struct Options<'a> {
     pub vendor: crate::vendor::Vendor,
     pub root: &'a Path,
-    pub repository: Option<&'a Path>,
-    pub remote: Option<&'a str>,
     pub origin: &'a str,
     pub trust_origin: bool,
     pub browser: bool,
-    pub new_pair: bool,
     pub record_orchestrated_outside_repos: bool,
-    pub next_steps: bool,
 }
-enum Target {
-    Repository { path: String, reference: String },
-    Installation { record_outside: bool },
+/// What this machine asks to pair: its installation, covering every tracked repository.
+struct Target {
+    record_outside: bool,
 }
 impl Target {
-    fn new(o: &Options<'_>) -> Result<Self> {
-        match o.repository {
-            Some(_) if o.record_orchestrated_outside_repos => Err("invalid_command".into()),
-            Some(path) => {
-                let (path, reference) = repository(path, o.remote)?;
-                Ok(Self::Repository { path, reference })
-            }
-            None if o.remote.is_some() => Err("invalid_command".into()),
-            None => Ok(Self::Installation {
-                record_outside: o.record_orchestrated_outside_repos,
-            }),
+    fn new(o: &Options<'_>) -> Self {
+        Self {
+            record_outside: o.record_orchestrated_outside_repos,
         }
     }
-    fn installation_record(&self, origin: &str, remote: Option<&str>) -> serde_json::Value {
+    fn installation_record(&self, origin: &str) -> serde_json::Value {
         let id = Uuid::new_v4().to_string();
-        match self {
-            Self::Repository { path, reference } => {
-                json!({"installation_id":id, "origin":origin, "repository":path, "repository_ref":reference, "remote":remote})
-            }
-            Self::Installation { record_outside } => {
-                json!({"installation_id":id, "origin":origin, "scope_kind":"installation", "record_orchestrated_outside_repos":record_outside})
-            }
-        }
+        json!({"installation_id":id, "origin":origin, "scope_kind":"installation", "record_orchestrated_outside_repos":self.record_outside})
     }
     fn matches(&self, saved: &Object, origin: &str) -> bool {
-        let same = match self {
-            Self::Repository { path, reference } => {
-                saved.len() == 5 + usize::from(saved.contains_key("runtime"))
-                    && saved["repository"] == *path
-                    && saved["repository_ref"] == *reference
-            }
-            Self::Installation { record_outside } => {
-                saved.len() == 4 + usize::from(saved.contains_key("runtime"))
-                    && saved.get("scope_kind") == Some(&json!("installation"))
-                    && saved.get("record_orchestrated_outside_repos")
-                        == Some(&json!(record_outside))
-            }
-        };
-        same && saved.get("origin") == Some(&json!(origin))
+        saved.len() == 4 + usize::from(saved.contains_key("runtime"))
+            && saved.get("scope_kind") == Some(&json!("installation"))
+            && saved.get("record_orchestrated_outside_repos") == Some(&json!(self.record_outside))
+            && saved.get("origin") == Some(&json!(origin))
     }
     fn start(
         &self,
         installation_id: &serde_json::Value,
         vendor: crate::vendor::Vendor,
     ) -> serde_json::Value {
-        let mut body = json!({"schema_version":1,"installation_id":installation_id,"runtime":vendor.runtime()});
-        if let Self::Installation { .. } = self {
-            body["scope_kind"] = json!("installation");
-        }
-        body
+        json!({"schema_version":1,"installation_id":installation_id,"runtime":vendor.runtime(),"scope_kind":"installation"})
     }
-    fn selection(&self) -> String {
-        match self {
-            Self::Repository { reference, .. } => format!("Select repository: {reference}"),
-            Self::Installation { .. } => {
-                "Select: All tracked repositories (this machine's installation)".into()
-            }
-        }
+    fn selection(&self) -> &'static str {
+        "Select: All tracked repositories (this machine's installation)"
     }
     fn approved(
         &self,
@@ -334,11 +217,7 @@ impl Target {
         origin: &str,
         vendor: crate::vendor::Vendor,
     ) -> Result<serde_json::Value> {
-        let keys = match self {
-            Self::Repository { .. } => 6,
-            Self::Installation { .. } => 9,
-        };
-        if c.len() != keys
+        if c.len() != 9
             || c.get("installation_id") != installation.get("installation_id")
             || c.get("runtime") != Some(&json!(vendor.runtime()))
             || c.get("endpoint_path") != Some(&json!("/ingest/v1/observations"))
@@ -354,51 +233,32 @@ impl Target {
         if vendor == crate::vendor::Vendor::Codex {
             common["runtime"] = json!(vendor.runtime());
         }
-        let (config, refs) = match self {
-            Self::Repository { path, reference } => {
-                if c.get("repository_ref") != Some(&json!(reference)) {
-                    return Err("approved_scope_mismatch".into());
-                }
-                let mut config = common;
-                config["repository"] = json!(path);
-                config["repository_ref"] = json!(reference);
-                (config, None)
-            }
-            Self::Installation { record_outside } => {
-                let versions =
-                    crate::store::accepted_versions(c.get("observation_schema_versions"))
-                        .ok_or("approved_scope_mismatch")?;
-                if c.get("scope_kind") != Some(&json!("installation"))
-                    || c.get("scope_path") != Some(&json!("/ingest/v1/collector/scope"))
-                {
-                    return Err("approved_scope_mismatch".into());
-                }
-                let refs = crate::store::repository_refs(&c["repository_refs"])
-                    .map_err(|_| "approved_scope_mismatch")?;
-                let mut config = common;
-                config["scope_kind"] = json!("installation");
-                let v2 = versions.contains(&json!(2));
-                if *record_outside && !v2 {
-                    eprintln!(
-                        "Server does not accept observation schema v2: --record-orchestrated-outside-repos is not saved."
-                    );
-                }
-                config["observation_schema_versions"] = if v2 { json!([1, 2]) } else { json!([1]) };
-                config["record_orchestrated_outside_repos"] = json!(*record_outside && v2);
-                (config, Some(refs))
-            }
-        };
-        scope(&serde_json::to_vec(&config)?)?;
-        let mut saved = json!({"scope":config,"token":c["token"]});
-        if let Some(refs) = refs {
-            saved["repository_refs"] = json!(refs);
+        let versions = crate::store::accepted_versions(c.get("observation_schema_versions"))
+            .ok_or("approved_scope_mismatch")?;
+        if c.get("scope_kind") != Some(&json!("installation"))
+            || c.get("scope_path") != Some(&json!("/ingest/v1/collector/scope"))
+        {
+            return Err("approved_scope_mismatch".into());
         }
-        Ok(saved)
+        let refs = crate::store::repository_refs(&c["repository_refs"])
+            .map_err(|_| "approved_scope_mismatch")?;
+        let mut config = common;
+        config["scope_kind"] = json!("installation");
+        let v2 = versions.contains(&json!(2));
+        if self.record_outside && !v2 {
+            eprintln!(
+                "Server does not accept observation schema v2: --record-orchestrated-outside-repos is not saved."
+            );
+        }
+        config["observation_schema_versions"] = if v2 { json!([1, 2]) } else { json!([1]) };
+        config["record_orchestrated_outside_repos"] = json!(self.record_outside && v2);
+        scope(&serde_json::to_vec(&config)?)?;
+        Ok(json!({"scope":config,"token":c["token"],"repository_refs":refs}))
     }
 }
 pub fn setup(o: Options<'_>) -> Result<()> {
     let origin = origin(o.origin, o.trust_origin)?;
-    let target = Target::new(&o)?;
+    let target = Target::new(&o);
     directory(o.root)?;
     let lock_path = o.root.join("setup.lock");
     if !lock_path.exists() {
@@ -413,7 +273,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         if fs::read_dir(o.root)?.count() != 1 {
             return Err("new_private_directory_required".into());
         }
-        let mut saved = target.installation_record(&origin, o.remote);
+        let mut saved = target.installation_record(&origin);
         if o.vendor == crate::vendor::Vendor::Codex {
             saved["runtime"] = json!(o.vendor.runtime());
         }
@@ -427,9 +287,6 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         return Err("frozen_scope_conflict".into());
     }
     if o.root.join("connection.json").exists() {
-        if o.new_pair {
-            return Err("existing_connection_use_new_directory".into());
-        }
         initialize(o.root, &connection(o.root)?)?;
         println!("Connection already saved; no new pairing or hook changes.");
         return Ok(());
@@ -447,12 +304,12 @@ pub fn setup(o: Options<'_>) -> Result<()> {
     }
     if attempt.exists() {
         private(&attempt, false)?;
-        if !o.new_pair {
-            return Err("repair_new_pair".into());
-        }
-    } else {
-        save_new(&attempt, b"A pairing may have been consumed. Revoke unused connections in the browser before --new-pair.\n")?;
+        return Err("repair_new_pair".into());
     }
+    save_new(
+        &attempt,
+        b"A pairing may have been consumed. Revoke unused connections in the browser before pairing again.\n",
+    )?;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .retry(reqwest::retry::never())
@@ -478,7 +335,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         let until = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + seconds.max(5);
         save_new(&cooldown, until.to_string().as_bytes())?;
         eprintln!(
-            "Pairing rate limited: wait at least {} seconds before --new-pair.",
+            "Pairing rate limited: wait at least {} seconds before running setup again.",
             seconds.max(5)
         );
         return Err("start_rate_limited".into());
@@ -511,7 +368,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
     let verify = verification_path(&start["verification_path"])?;
     let deadline = Instant::now() + Duration::from_secs((expiry - now) as u64);
     println!(
-        "Approve at {origin}{verify}\nOne-time code: {code}\n{}\nBrowser approval does not install hooks or establish host trust.\nIf interrupted or response is lost: revoke the unused connection in the browser, then repeat with --new-pair. Never reuse a different scope's outbox.",
+        "Approve at {origin}{verify}\nOne-time code: {code}\n{}\nBrowser approval does not install hooks or establish host trust.\nIf interrupted or the response is lost: revoke the unused connection in the browser, then move the connection folder aside and run setup again.",
         target.selection()
     );
     std::io::stdout().flush()?;
@@ -575,13 +432,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         .map_err(|_| "repair_new_pair")?;
         // If interrupted here, setup reuses the committed connection, never exchanges again.
         initialize(o.root, saved.as_object().ok_or("invalid_connection")?)?;
-        if !o.next_steps {
-            println!("Connection saved privately.");
-            return Ok(());
-        }
-        println!(
-            "Connection saved privately. Hooks remain unchanged. Next: setup-plan CONNECTION_DIR SETTINGS NEW_PLAN, review the plan, then hook-apply NEW_PLAN --consent. If a control plane starts agents here, after the first connection-sync run orchestrators approve CONNECTION_DIR in a terminal. Host trust and managed policy remain controlled by the harness; review Codex definitions in /hooks. Runtime coverage is unverified."
-        );
+        println!("Connection saved privately.");
         return Ok(());
     }
 }
@@ -593,24 +444,11 @@ pub(crate) fn revoked(state: &Path) -> bool {
             root.join("connection.json").is_file() && root.join("revoked").exists()
         })
 }
-pub fn plan(root: &Path, settings: &Path, plan: &Path) -> Result<()> {
-    plan_with(root, settings, plan, &std::env::current_exe()?)?;
-    println!(
-        "Plan saved, settings unchanged. Metadata-only harness lifecycle/tool IDs; no prompts, transcripts or tool contents; unknown actor. Review NEW_PLAN before hook-apply NEW_PLAN --consent. Browser approval is not local hook consent or host trust. Managed policy may block hooks; no policy-absence claim is made."
-    );
-    Ok(())
-}
 pub fn plan_with(root: &Path, settings: &Path, plan: &Path, exe: &Path) -> Result<()> {
     let doc = connection(root)?;
     let config = doc["scope"].as_object().ok_or("invalid_connection")?;
-    // Revalidate current local remotes at registration, not only at approval.
     if !crate::installation(config) {
-        let installation = object(&read(&root.join("installation.json"))?)?;
-        let choice = installation.get("remote").and_then(|v| v.as_str());
-        let (_, remote) = repository(Path::new(text(config, "repository")?), choice)?;
-        if remote != text(config, "repository_ref")? {
-            return Err("approved_scope_mismatch".into());
-        }
+        return Err("invalid_connection".into());
     }
     initialize(root, &doc)?;
     crate::claude::plan_for(&root.join("outbox"), settings, plan, exe)
@@ -633,30 +471,7 @@ pub(crate) fn refresh_scope(root: &Path) -> Result<()> {
         Some(&root.join("revoked")),
     )
 }
-pub fn health(root: &Path, plan: Option<&Path>) -> Result<()> {
-    let doc = connection(root)?;
-    initialize(root, &doc)?;
-    let store = Store::open(&root.join("outbox"), None)?;
-    let (pending, delivered) = store.counts()?;
-    let drops = crate::drops::counts(&store, &root.join("outbox"))?;
-    let registration = match plan {
-        Some(path) => json!(crate::claude::registration_status(
-            path,
-            &root.join("outbox")
-        )?),
-        None => json!({"registration":"unknown; provide PLAN for local inspection"}),
-    };
-    let refs = crate::store::read_refs(&root.join("outbox"))
-        .map(|r| r.len())
-        .ok();
-    let orchestrators = crate::orchestrators::summary(&root.join("outbox"));
-    println!(
-        "{}",
-        json!({"connection":"saved", "local_repository_refs":refs, "local_orchestrators":orchestrators, "local_observed":pending+delivered,"local_pending":pending,"local_delivered_with_validated_receipt":delivered,"local_drops":drops,"local_revoked":root.join("revoked").exists(),"local_scope_refresh_error":store.scope_refresh_failure()?,"local_registration":registration, "host_trust":"unknown", "managed_policy":"unknown", "runtime_qualification":"unverified", "server_current_status":"unknown; inspect browser connection page"})
-    );
-    Ok(())
-}
-pub const SETUP_INCOMPLETE: &str = "Setup incomplete. No secret is recoverable from a consumed exchange. Inspect/revoke unused browser connections before --new-pair. Existing saved credentials/outboxes are never retargeted.";
+pub const SETUP_INCOMPLETE: &str = "Setup incomplete. No secret is recoverable from a consumed exchange. Revoke unused connections in the browser, then move the connection folder aside and run setup again. The folder is ~/.local/share/devdiary/cli/claude/connection, or codex/connection for Codex.";
 pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
     known_diagnostic(error).unwrap_or(SETUP_INCOMPLETE)
 }
@@ -665,17 +480,14 @@ pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
 }
 pub fn guidance(code: &str) -> Option<&'static str> {
     Some(match code {
-        "choose_remote" => {
-            "Multiple or missing GitHub remotes: choose explicitly with --remote NAME."
-        }
         "trust_origin_required" | "invalid_origin" => {
             "Use the default HTTPS origin or an explicit --origin ORIGIN --trust-origin (HTTP only for numeric loopback)."
         }
-        "frozen_scope_conflict" | "existing_connection_use_new_directory" => {
-            "Existing installation/scope cannot be retargeted. Preserve its outbox; use a new private connection directory."
+        "frozen_scope_conflict" => {
+            "The saved connection was made for a different scope and cannot be changed. To pair again, move the connection folder aside; it keeps its outbox."
         }
         "start_rate_limited" => {
-            "Pairing starts are rate limited. The saved Retry-After cooldown must expire before an explicit --new-pair retry."
+            "Pairing starts are rate limited. The saved Retry-After cooldown must expire before setup tries again."
         }
         "pairing_unavailable" => {
             "Pairing endpoint unavailable. Requires server PR #571 deployed; do not assume this backend is enabled."
@@ -693,13 +505,13 @@ pub fn guidance(code: &str) -> Option<&'static str> {
             "The server offered an orchestrator entry that is not allowed. Check server compatibility and retry sync. The refused entry was not saved."
         }
         "revoked" => {
-            "The server revoked this connection. Capture and sync have stopped; pair a new connection directory."
+            "The server revoked this connection. Capture and sync have stopped; run uninstall, move the connection folder aside, then run setup again."
         }
         "sync_rate_limited" => {
             "The server asked the collector to wait. Sync resumes after the saved Retry-After time."
         }
         "repair_required" => {
-            "This outbox uses an older storage format. Run: repair CONNECTION_DIR/outbox"
+            "This outbox uses an older storage format that this version does not read. Move the connection folder aside and run setup again."
         }
         "python_observer_registered" => {
             "These settings already register the Python observer hook. Remove it before registering this collector."
@@ -708,7 +520,7 @@ pub fn guidance(code: &str) -> Option<&'static str> {
             "Settings and their directory must be owned by you and not writable by group or others, with no symlinks or hardlinks."
         }
         "approved_scope_mismatch" => {
-            "Approved scope does not match this installation and local repository. Revoke the unused browser connection, then --new-pair; hooks unchanged."
+            "The approved scope does not match this installation. Revoke the unused browser connection, move the connection folder aside, then run setup again. Hooks are unchanged."
         }
         _ => return None,
     })
