@@ -1,4 +1,4 @@
-use devdiary_collector::{
+use devdiary::{
     Object, freeze, object,
     store::{Store, repair, sync},
 };

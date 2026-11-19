@@ -8,8 +8,8 @@ use std::{
     process::{Command, Stdio},
 };
 
-pub const SERVICE: &str = "devdiary-collector-sync.service";
-pub const TIMER: &str = "devdiary-collector-sync.timer";
+pub const SERVICE: &str = "devdiary-claude-sync.service";
+pub const TIMER: &str = "devdiary-claude-sync.timer";
 
 pub trait Runner {
     fn run(&self, args: &[&str]) -> Result<(bool, String)>;
@@ -66,7 +66,7 @@ fn quoted(path: &Path) -> Result<String> {
 }
 pub fn service(exe: &Path, connection: &Path) -> Result<String> {
     Ok(format!(
-        "[Unit]\nDescription=DevDiary collector sync\n\n[Service]\nType=oneshot\nNice=10\nNoNewPrivileges=true\nExecStart={} timer-sync {}\n",
+        "[Unit]\nDescription=DevDiary collector sync\n\n[Service]\nType=oneshot\nNice=10\nNoNewPrivileges=true\nExecStart={} sync {}\n",
         quoted(exe)?,
         quoted(connection)?
     ))
@@ -165,13 +165,13 @@ mod tests {
     #[test]
     fn service_runs_the_bounded_sync_loop_from_the_versioned_binary() {
         let unit = service(
-            Path::new("/home/u/.local/share/devdiary/collector/0.1.0/devdiary-collector"),
-            Path::new("/home/u/.local/share/devdiary/collector/connection"),
+            Path::new("/home/u/.local/share/devdiary/cli/claude/0.1.0/devdiary"),
+            Path::new("/home/u/.local/share/devdiary/cli/claude/connection"),
         )
         .unwrap();
         assert_eq!(
             unit,
-            "[Unit]\nDescription=DevDiary collector sync\n\n[Service]\nType=oneshot\nNice=10\nNoNewPrivileges=true\nExecStart=\"/home/u/.local/share/devdiary/collector/0.1.0/devdiary-collector\" timer-sync \"/home/u/.local/share/devdiary/collector/connection\"\n"
+            "[Unit]\nDescription=DevDiary collector sync\n\n[Service]\nType=oneshot\nNice=10\nNoNewPrivileges=true\nExecStart=\"/home/u/.local/share/devdiary/cli/claude/0.1.0/devdiary\" sync \"/home/u/.local/share/devdiary/cli/claude/connection\"\n"
         );
     }
 
@@ -179,7 +179,7 @@ mod tests {
     fn timer_fires_every_two_minutes_and_catches_up() {
         assert_eq!(
             timer(),
-            "[Unit]\nDescription=DevDiary collector sync every 2 minutes\n\n[Timer]\nOnActiveSec=30s\nOnUnitActiveSec=2min\nRandomizedDelaySec=30\nPersistent=true\nUnit=devdiary-collector-sync.service\n\n[Install]\nWantedBy=timers.target\n"
+            "[Unit]\nDescription=DevDiary collector sync every 2 minutes\n\n[Timer]\nOnActiveSec=30s\nOnUnitActiveSec=2min\nRandomizedDelaySec=30\nPersistent=true\nUnit=devdiary-claude-sync.service\n\n[Install]\nWantedBy=timers.target\n"
         );
     }
 
@@ -235,20 +235,14 @@ mod tests {
         assert!(units.join(SERVICE).is_file() && units.join(TIMER).is_file());
         assert_eq!(
             *runner.0.borrow(),
-            [
-                "daemon-reload",
-                "enable --now devdiary-collector-sync.timer"
-            ]
+            ["daemon-reload", "enable --now devdiary-claude-sync.timer"]
         );
         assert!(disable(&runner, &units).unwrap());
         assert!(!units.join(SERVICE).exists() && !units.join(TIMER).exists());
         assert!(!disable(&runner, &units).unwrap());
         assert_eq!(
             runner.0.borrow()[2..],
-            [
-                "disable --now devdiary-collector-sync.timer",
-                "daemon-reload"
-            ]
+            ["disable --now devdiary-claude-sync.timer", "daemon-reload"]
         );
     }
 }

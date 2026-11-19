@@ -40,7 +40,7 @@ creates observation IDs and applies vendor-correlation dedup before collection.
 
 ```sh
 cargo build --locked --manifest-path collector-rs/Cargo.toml
-COLLECTOR="$PWD/collector-rs/target/debug/devdiary-collector"
+COLLECTOR="$PWD/collector-rs/target/debug/devdiary"
 # Use a NEW empty absolute directory, never Python's observer/capture spool.
 umask 077
 mkdir "$RUST_STATE"
@@ -86,7 +86,7 @@ No redirects or ambient proxies; verified TLS except exact loopback HTTP; each
 request has a five-second timeout including the response body. Exit 0 means the
 command succeeded, sync exit 1 means pending evidence remains, and exit 2 is a
 private/generic local error. These control commands are **not host-failure-neutral**;
-never register `collect` as a vendor hook. Only `claude-hook` has the separate
+never register `collect` as a vendor hook. Only `hook claude` has the separate
 silent deadline/exit contract below. No daemon, live host qualification, surveillance,
 stock-tool qualification, native Windows support, signing or Python retirement is
 included; the optional user timer is described under one-command install. Rails and human-minute attribution are unchanged.
@@ -207,14 +207,14 @@ scope/actor changes are rejected. Disposable plan/apply/remove preserves setting
 This is **fixture-driven application interoperability**, not live stock-Claude
 qualification. The stricter qualification harness below remains blocked, unchanged.
 
-## One-command install (Linux, systemd user timer)
+## One-command setup (Linux, systemd user timer)
 
-The Rust candidate also accepts `--vendor codex` on `install`, `setup`, `doctor`,
+The Rust binary is `devdiary`. It accepts `--vendor codex` on `setup`, `doctor`,
 `upgrade`, `uninstall`, `outside-repos` and `orchestrators approve`. Claude remains
 the default. Codex uses its active `CODEX_HOME/hooks.json` (otherwise
-`~/.codex/hooks.json`), a separate connection/spool under `collector/codex`, and a
-separate `devdiary-collector-codex-sync.timer`. Review changed definitions in
-Codex's ordinary `/hooks` screen after install or upgrade. Registration and
+`~/.codex/hooks.json`), a separate connection/spool under `cli/codex`, and a
+separate `devdiary-codex-sync.timer`. Review changed definitions in
+Codex's ordinary `/hooks` screen after setup or upgrade. Registration and
 fixture success do not qualify stock lifecycle coverage or counted minutes.
 C1 acceptance and current evidence live in the canonical vault plan:
 `_vault/products/devdiary/docs/harness-plan.md` in the TechWright workspace.
@@ -228,64 +228,71 @@ SHA, preserves the resolver symlink target in its isolated filesystem, and uses
 the ordinary hook-trust UI. CI runs only its network-inert control tests. Passing
 capture gates does not establish server minute correctness.
 
-`install` runs the browser pairing, plan, consent and apply steps above in one
+`setup` runs the browser pairing, plan, consent and apply steps above in one
 command for an installation-scope connection, then delivers the spool from a
 systemd user timer. The hook contract does not change: it stays silent, exits 0
 and never performs HTTP.
 
 ```sh
 cargo build --release --locked --manifest-path collector-rs/Cargo.toml
-collector-rs/target/release/devdiary-collector install \
+collector-rs/target/release/devdiary setup \
   [--settings ~/.claude/settings.json] [--record-orchestrated-outside-repos] \
   [--origin ORIGIN --trust-origin] [--yes] [--no-browser] [--new-pair]
-devdiary-collector doctor
-devdiary-collector upgrade [--yes]
-devdiary-collector uninstall
+devdiary doctor
+devdiary sync
+devdiary upgrade [--yes]
+devdiary uninstall
 ```
 
-`install` does these steps in order, and stops at the first failure:
+`setup` does these steps in order, and stops at the first failure:
 
 1. Refuses at once (`consent_required`) when stdin is not a terminal and `--yes`
    is absent, and refuses a relative `--settings` path (`unsupported_path`), a
    missing settings file (`settings_missing`), settings that are not valid JSON
-   (`invalid_settings`), already hold a collector hook or register the Python
-   observer. An alternate `--origin` without `--trust-origin` is refused, as for
+   (`invalid_settings`), already hold a `devdiary` hook (`already_registered`) or a
+   hook of the older `devdiary-collector` (`old_collector_registered`: run
+   `devdiary-collector uninstall` first, then set up again with a new pairing), or
+   register the Python observer. It warns, without stopping, when another
+   `devdiary` comes first on `PATH`. An alternate `--origin` without `--trust-origin` is refused, as for
    `setup`. A saved connection that the server revoked is refused
    (`connection_revoked`); `--new-pair` renames it to `connection-revoked-<time>`
    (its pending rows stay there) and pairs again. `--new-pair` never replaces a
    connection that was not revoked (`connection_active`). Nothing is paired or
    changed.
-2. `setup` without a repository into `~/.local/share/devdiary/collector/connection`.
+2. Pairs installation scope into `~/.local/share/devdiary/cli/claude/connection`
+   (`cli/codex` for Codex). It never reads the old `devdiary/collector` folder.
    This path is fixed under `$HOME`; `$XDG_DATA_HOME` is not used, so every shell
    finds the same install. `--new-pair` is passed on, for a pairing that was
    interrupted.
-3. Copies the running binary to `~/.local/share/devdiary/collector/VERSION/` (0700),
+3. Copies the running binary to `~/.local/share/devdiary/cli/HARNESS/VERSION/` (0700),
    so the registered hook survives rebuilds and `cargo clean`.
 4. `setup-plan` for that copy, prints the 10 hook entries, and asks `[y/N]` on the
    terminal (or takes `--yes`). Declining removes the plan and changes nothing.
 5. `claude-apply`. Settings edited after the plan give `stale_plan` and are left
-   exactly as they are; run `install` again.
-6. Writes `devdiary-collector-sync.service` and `.timer` under
+   exactly as they are; run `setup` again.
+6. Writes `devdiary-claude-sync.service` and `.timer` (`devdiary-codex-sync` for
+   Codex) under
    `~/.config/systemd/user/` (`$XDG_CONFIG_HOME` when set), then
    `systemctl --user daemon-reload` and `enable --now` the timer. The timer runs
-   `timer-sync` 30 s after it starts and then 2 min after each run
+   `sync CONNECTION_DIR` 30 s after it starts and then 2 min after each run
    (`RandomizedDelaySec=30`, `Nice=10`).
 7. A local self-test: the installed hook receives a `SessionStart` whose session id
    starts with `devdiary-selftest-`. The hook records it only in a local
    `self_test` table, which sync never reads; the outbox refuses such ids.
 8. Reads the scope endpoint once. If the server offers orchestrator names, prints
    them and asks `[y/N]`. `--yes` never answers this question: without a terminal
-   `install` prints the command to run and finishes. Declining keeps the hooks.
+   `setup` prints the command to run and finishes. Declining keeps the hooks.
 
-`timer-sync` runs `connection-sync DIR 100` at most 10 times and stops at the first
+`sync CONNECTION_DIR` runs `connection-sync DIR 100` at most 10 times and stops at the first
 batch that a 401/403, 429, 5xx or network failure stops, when no full batch is
 left, or once it has visited every row that was pending when it started. Rows the
 server rejects (other 4xx, invalid receipts) stay pending and are sent at most once
 per run. Server refusals and rejections end the run with exit 0 and are kept for
 `doctor` as `last_sync_error` (for example `http_422`); local failures fail the
 unit.
+`sync` with no argument does the same now, for every installed harness.
 
-Each `sync`, `connection-sync` and `timer-sync` batch refreshes the scope first. A
+Each `sync`, `connection-sync` and `sync CONNECTION_DIR` batch refreshes the scope first. A
 network failure, a non-200 reply, a read failure, or an oversized or invalid reply
 keeps the last good refs, offer, approvals and declared-run answer, and spooled rows
 are still delivered.
@@ -295,7 +302,7 @@ and an offer is saved without the entry only when no saved offer has entries yet
 code to their JSON line and print guidance to stderr. The last code is kept for
 `doctor` as `last_scope_refresh_error` and for `connection-status` as
 `local_scope_refresh_error`, until a good refresh clears it. Revocation and a
-server-requested wait still stop the run. `install` and `upgrade` fail on any
+server-requested wait still stop the run. `setup` and `upgrade` fail on any
 refresh error.
 
 `doctor` prints the registration state, `systemctl --user is-enabled/is-active` for
@@ -321,11 +328,11 @@ while logged out.
 ### Sessions outside repositories
 
 By default your own sessions outside a git repository are not recorded.
-`devdiary-collector outside-repos on`, in a terminal, or `install --record-outside-repos`
+`devdiary outside-repos on`, in a terminal, or `setup --record-outside-repos`
 turns that on. A row holds the event, the time and the tool name, never a path. Rows
 under `/tmp`, `/var/tmp` and the system temp folder stay out, because background tools
 run throwaway sessions there. A run with an unanswered orchestrator offer stays out too.
-`devdiary-collector outside-repos off` turns it off, with no terminal needed. `doctor`
+`devdiary outside-repos off` turns it off, with no terminal needed. `doctor`
 shows the choice as `outside_repos`. It is a local file, so the saved scope does not
 change and no new pairing is needed. The server must accept rows with no repository
 first; older servers refuse them and they stay pending.
@@ -352,16 +359,16 @@ Every scope refresh stores this list as `orchestrators-offered.json` (0600) in t
 outbox. The hook takes no names from it. Of the names a server can choose, the hook
 reads only those in `orchestrators-approved.json` (0600). The one fixed name it also
 reads is `DEVDIARY_RUN_REF`, below. Three commands write that file, always after
-the same prompt on a terminal: `install`, `upgrade` and:
+the same prompt on a terminal: `setup`, `upgrade` and:
 
 ```sh
-devdiary-collector orchestrators approve [CONNECTION_DIR]
+devdiary orchestrators approve [CONNECTION_DIR]
 ```
 
 The prompt prints each key with its refs and its checkout paths as separate groups.
 When an approved list already exists it also prints what was added and removed. It
 asks `[y/N]` and saves what it printed. Without a terminal `orchestrators approve`
-refuses with `approval_required`, and it has no `--yes`. `install` and `upgrade`
+refuses with `approval_required`, and it has no `--yes`. `setup` and `upgrade`
 finish without a terminal and leave the change waiting; their `--yes` covers only the
 hook entries. So a server cannot widen what the hook reads unless a person agrees.
 
@@ -454,7 +461,7 @@ pairing/ingest server and a fake systemctl; debug builds only honour
 
 ## Rust Claude raw-hook adapter: Linux fixture-qualified only
 
-This is a distinct `claude-hook PLAN` command, not registration of the normalized
+This is a distinct `hook claude PLAN` command, not registration of the normalized
 `collect` command. It accepts stock Claude command-hook stdin for SessionStart,
 UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, Stop, SubagentStart,
 SubagentStop and SessionEnd, following `src/devdiary/observer_hook.py`. It uses
@@ -482,7 +489,7 @@ cargo build --release --locked --manifest-path collector-rs/Cargo.toml
 # SETTINGS must already be a JSON object file owned by you; it and its directory
 # may be readable by others (0644 under 0755) but never group/world-writable.
 # Explicitly create {} if it does not exist. Do not overwrite it.
-install -m 700 collector-rs/target/release/devdiary-collector "$PRIVATE_INSTALL/collector"
+install -m 700 collector-rs/target/release/devdiary "$PRIVATE_INSTALL/collector"
 COLLECTOR="$PRIVATE_INSTALL/collector"
 PLAN="$REGISTRATION/claude-plan.json"  # new file, outside RUST_STATE
 "$COLLECTOR" claude-plan "$RUST_STATE" "$SETTINGS" "$PLAN"
@@ -598,7 +605,7 @@ python3 collector-rs/tests/qualification_test.py -v
 cargo build --release --locked --manifest-path collector-rs/Cargo.toml
 python3 collector-rs/tests/qualify_claude.py \
   --consent-provider-use --max-model-runs 1 --claude-version 2.1.280 \
-  --collector "$PWD/collector-rs/target/release/devdiary-collector" \
+  --collector "$PWD/collector-rs/target/release/devdiary" \
   --rails-checkout "$DISPOSABLE_RAILS_CHECKOUT" --pg-user "$USER"
 ```
 

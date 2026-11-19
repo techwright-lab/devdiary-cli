@@ -176,7 +176,7 @@ class Harness:
             tempfile.tempdir = original
         f = self.fixture
         f.runtime = "codex"
-        f.data /= "codex"
+        f.data = f.codex_data
         f.settings = f.home / ".codex/hooks.json"
         env = {
             **f.env(),
@@ -381,7 +381,7 @@ class Harness:
 
     def rows(self):
         f = self.fixture
-        f.run_collector("timer-sync", f.data / "connection")
+        f.run_collector("sync", f.data / "connection")
         rows = f.received[self.seen :]
         self.seen = len(f.received)
         require(
@@ -638,7 +638,7 @@ class Harness:
     def control_plane(self):
         f = self.fixture
         f.orchestrators = [install_test.PAPERCLIP]
-        f.run_collector("timer-sync", f.data / "connection")
+        f.run_collector("sync", f.data / "connection")
         code, _, _ = f.converse(
             [str(install_test.BIN), "orchestrators", "approve", "--vendor", "codex"],
             [b"y\n"],
@@ -659,7 +659,7 @@ class Harness:
             self.env = old
         f.observation_status = 503
         before = len(f.received)
-        f.run_collector("timer-sync", f.data / "connection")
+        f.run_collector("sync", f.data / "connection")
         require(len(f.received) == before + 1, "delivery_failure_not_exercised")
         first = f.received_raw[-1]
         status = json.loads(f.run_collector("doctor", "--vendor", "codex").stdout)

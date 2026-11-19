@@ -13,7 +13,7 @@ class CodexHookTest(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         self.fixture.runtime = "codex"
-        self.fixture.data /= "codex"
+        self.fixture.data = self.fixture.codex_data
         self.fixture.settings = self.fixture.home / ".codex/hooks.json"
         self.fixture.install("--vendor", "codex", "--yes")
         self.repo = self.fixture.root / "demo"
@@ -34,7 +34,7 @@ class CodexHookTest(unittest.TestCase):
     def fire(self, event, **metadata):
         record = self.fixture.record()
         result = subprocess.run(
-            [record["executable"], "codex-hook", record["plan"]],
+            [record["executable"], "hook", "codex", record["plan"]],
             input=json.dumps(
                 {
                     "hook_event_name": event,
@@ -51,7 +51,7 @@ class CodexHookTest(unittest.TestCase):
         self.assertEqual(result.stdout + result.stderr, b"")
 
     def sync(self):
-        self.fixture.run_collector("timer-sync", self.fixture.data / "connection")
+        self.fixture.run_collector("sync", self.fixture.data / "connection")
         return self.fixture.received
 
     def test_hook_delivers_codex_correlation_without_private_content(self):
@@ -148,9 +148,7 @@ class CodexHookTest(unittest.TestCase):
             json.loads(settings.read_bytes()), {"hooks": {"Stop": [unrelated]}}
         )
         self.assertFalse(
-            (
-                self.fixture.config / "systemd/user/devdiary-collector-codex-sync.timer"
-            ).exists()
+            (self.fixture.config / "systemd/user/devdiary-codex-sync.timer").exists()
         )
         rows = self.sync()
         self.assertEqual(len(rows), 1)

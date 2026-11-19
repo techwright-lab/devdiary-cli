@@ -1,4 +1,4 @@
-use devdiary_collector::{endpoint, freeze, receipt, scope};
+use devdiary::{endpoint, freeze, receipt, scope};
 
 #[test]
 fn exact_receipt_types_and_duplicate_keys() {
@@ -104,16 +104,13 @@ fn refuses_scope_and_identity_coercion() {
     }
 }
 
-fn installation() -> devdiary_collector::Object {
+fn installation() -> devdiary::Object {
     scope(include_bytes!("fixtures/installation-scope.json")).unwrap()
 }
 fn local_v2() -> serde_json::Value {
     serde_json::from_slice(include_bytes!("fixtures/local-observation-v2.json")).unwrap()
 }
-fn frozen(
-    config: &devdiary_collector::Object,
-    row: &serde_json::Value,
-) -> Option<serde_json::Value> {
+fn frozen(config: &devdiary::Object, row: &serde_json::Value) -> Option<serde_json::Value> {
     freeze(&serde_json::to_vec(row).unwrap(), config)
         .ok()
         .map(|w| serde_json::from_slice(&w).unwrap())

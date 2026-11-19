@@ -65,7 +65,7 @@ begin
     row = JSON.parse(File.read(cli.join("tests/fixtures/local-observation.json")))
     command = lambda do |verb, args = [], input = "", expected = 0|
       out, err, status = Timeout.timeout(10) do
-        Open3.capture3(cli.join("target/debug/devdiary-collector").to_s, verb, state, *args, stdin_data: input)
+        Open3.capture3(cli.join("target/debug/devdiary").to_s, verb, state, *args, stdin_data: input)
       end
       raise "collector failed: #{verb}: #{status.exitstatus}" unless status.exitstatus == expected
       raise "private diagnostic" if (out + err).include?(key) || (out + err).include?("PRIVATE-SENTINEL")

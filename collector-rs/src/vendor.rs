@@ -38,12 +38,6 @@ impl Vendor {
             Self::Codex => "codex",
         }
     }
-    pub fn hook(self) -> &'static str {
-        match self {
-            Self::Claude => "claude-hook",
-            Self::Codex => "codex-hook",
-        }
-    }
     pub fn events(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &crate::claude::EVENTS,
@@ -72,13 +66,13 @@ impl Vendor {
     pub fn service(self) -> &'static str {
         match self {
             Self::Claude => crate::systemd::SERVICE,
-            Self::Codex => "devdiary-collector-codex-sync.service",
+            Self::Codex => "devdiary-codex-sync.service",
         }
     }
     pub fn timer(self) -> &'static str {
         match self {
             Self::Claude => crate::systemd::TIMER,
-            Self::Codex => "devdiary-collector-codex-sync.timer",
+            Self::Codex => "devdiary-codex-sync.timer",
         }
     }
 }
