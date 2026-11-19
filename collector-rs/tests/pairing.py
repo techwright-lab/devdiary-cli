@@ -1,8 +1,9 @@
-"""Subprocess transport fixtures, not Rails or stock-runtime qualification."""
+"""Pairing transport fixtures through `devdiary setup`, not Rails or stock-runtime qualification."""
 
 import http.server
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -10,28 +11,40 @@ import time
 import unittest
 from pathlib import Path
 
+import terminal
+
 BIN = Path(__file__).resolve().parents[1] / "target/debug/devdiary"
+FAKE_SYSTEMCTL = """#!/bin/sh
+case "$*" in
+  *is-enabled*) echo enabled ;;
+  *is-active*) echo active ;;
+esac
+"""
 
 
 class PairingTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.repo = self.root / "repo"
-        self.repo.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.repo),
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:acme/demo.git",
-            ],
-            check=True,
-        )
+        self.home = self.root / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        self.settings = self.home / ".claude/settings.json"
+        self.settings.write_text("{}")
+        systemctl = self.root / "bin/systemctl"
+        systemctl.parent.mkdir()
+        systemctl.write_text(FAKE_SYSTEMCTL)
+        systemctl.chmod(0o700)
+        self.env = {
+            **os.environ,
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "DEVDIARY_COLLECTOR_SYSTEMCTL": str(systemctl),
+            "HTTP_PROXY": "http://127.0.0.1:1",
+            "HTTPS_PROXY": "http://127.0.0.1:1",
+            "ALL_PROXY": "http://127.0.0.1:1",
+            "NO_PROXY": "",
+        }
+        self.data = self.home / ".local/share/devdiary/cli/claude"
         self.calls = []
         self.mode = "ok"
         self.runtime = "claude-code"
@@ -41,6 +54,21 @@ class PairingTest(unittest.TestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, format, *args):
                 pass
+
+            def do_GET(self):
+                body = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "collector_ref": "urn:devdiary:collector:11111111-1111-4111-8111-111111111111",
+                        "scope_kind": "installation",
+                        "repository_refs": ["https://github.com/acme/demo"],
+                        "observation_schema_versions": [1, 2],
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_POST(self):
                 data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -53,10 +81,8 @@ class PairingTest(unittest.TestCase):
                     )
                 )
                 if self.path.endswith("/exchange"):
-                    if (
-                        owner.mode == "pending"
-                        and sum(x[0].endswith("/exchange") for x in owner.calls) == 1
-                    ):
+                    exchanges = sum(x[0].endswith("/exchange") for x in owner.calls)
+                    if owner.mode == "pending" and exchanges == 1:
                         self.send_response(200)
                         self.end_headers()
                         self.wfile.write(b'{"schema_version":1,"status":"pending"}')
@@ -74,10 +100,7 @@ class PairingTest(unittest.TestCase):
                         self.send_header("Location", "/leak")
                         self.end_headers()
                         return
-                    if (
-                        owner.mode == "rate"
-                        and sum(x[0].endswith("/exchange") for x in owner.calls) == 1
-                    ):
+                    if owner.mode == "rate" and exchanges == 1:
                         self.send_response(429)
                         self.send_header("Retry-After", "6")
                         self.end_headers()
@@ -90,9 +113,13 @@ class PairingTest(unittest.TestCase):
                             "token": "dc_live_" + "s" * 43,
                             "installation_id": owner.installation,
                             "runtime": owner.runtime,
-                            "repository_ref": "https://github.com/acme/"
-                            + ("other" if owner.mode == "mismatch" else "demo"),
                             "endpoint_path": "/ingest/v1/observations",
+                            "scope_kind": "repository"
+                            if owner.mode == "mismatch"
+                            else "installation",
+                            "scope_path": "/ingest/v1/collector/scope",
+                            "repository_refs": ["https://github.com/acme/demo"],
+                            "observation_schema_versions": [1, 2],
                         },
                     }
                     status = 200
@@ -146,8 +173,6 @@ class PairingTest(unittest.TestCase):
         return [
             str(BIN),
             "setup",
-            str(self.root / "connection"),
-            str(self.repo),
             "--origin",
             self.origin,
             "--trust-origin",
@@ -155,39 +180,49 @@ class PairingTest(unittest.TestCase):
             *extra,
         ]
 
-    def run_setup(self, *extra):
-        p = subprocess.run(
-            self.command(*extra),
+    def run_setup(self, *extra, answers=(b"y\n", b"y\n")):
+        code, out, err, _ = terminal.answering(self.command(*extra), self.env, answers)
+        self.assertNotIn(b"dp_pair_", out + err)
+        self.assertNotIn(b"dc_live_", out + err)
+        return subprocess.CompletedProcess(self.command(*extra), code, out, err)
+
+    def connection(self, data=None):
+        return (data or self.data) / "connection"
+
+    def set_aside(self, data=None):
+        """The manual recovery: move the connection folder aside."""
+        connection = self.connection(data)
+        if connection.exists():
+            connection.rename(connection.with_name(f"set-aside-{time.time_ns()}"))
+
+    def uninstall(self, *extra):
+        result = subprocess.run(
+            [str(BIN), "uninstall", *extra],
             capture_output=True,
+            env=self.env,
+            timeout=10,
             check=False,
-            timeout=25,
-            env={
-                **os.environ,
-                "HTTP_PROXY": "http://127.0.0.1:1",
-                "HTTPS_PROXY": "http://127.0.0.1:1",
-                "ALL_PROXY": "http://127.0.0.1:1",
-                "NO_PROXY": "",
-            },
         )
-        self.assertNotIn(b"dp_pair_", p.stdout + p.stderr)
-        self.assertNotIn(b"dc_live_", p.stdout + p.stderr)
-        return p
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_codex_connection_is_bound_to_its_requested_harness(self):
         self.runtime = "codex"
         result = self.run_setup("--vendor", "codex")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls[0][1]["runtime"], "codex")
-        path = self.root / "connection/connection.json"
+        codex = self.home / ".local/share/devdiary/cli/codex"
+        path = self.connection(codex) / "connection.json"
         saved = path.read_bytes()
         self.assertEqual(json.loads(saved)["scope"]["runtime"], "codex")
+        self.uninstall("--vendor", "codex")
         self.assertEqual(self.run_setup("--vendor", "codex").returncode, 0)
-        self.assertEqual(self.run_setup().returncode, 2)
         self.assertEqual(path.read_bytes(), saved)
+        self.assertEqual(len(self.calls), 2)
 
     def test_invalid_saved_harness_is_not_treated_as_legacy_claude(self):
         self.assertEqual(self.run_setup().returncode, 0)
-        saved = self.root / "connection/installation.json"
+        self.uninstall()
+        saved = self.connection() / "installation.json"
         doc = json.loads(saved.read_bytes())
         doc["runtime"] = None
         saved.write_text(json.dumps(doc))
@@ -196,63 +231,49 @@ class PairingTest(unittest.TestCase):
     def test_codex_setup_refuses_a_claude_exchange_response(self):
         result = self.run_setup("--vendor", "codex")
         self.assertEqual(result.returncode, 2)
-        self.assertFalse((self.root / "connection/connection.json").exists())
+        codex = self.home / ".local/share/devdiary/cli/codex"
+        self.assertFalse((self.connection(codex) / "connection.json").exists())
 
-    def test_pair_and_pin_without_hooks(self):
+    def test_pairing_saves_a_private_connection_and_reuses_it(self):
         p = self.run_setup()
         self.assertEqual(p.returncode, 0, p.stderr)
-        c = self.root / "connection/connection.json"
+        c = self.connection() / "connection.json"
         self.assertEqual(c.stat().st_mode & 0o777, 0o600)
         self.assertEqual(
-            json.loads(c.read_text())["scope"]["repository_ref"],
-            "https://github.com/acme/demo",
+            json.loads(c.read_text())["scope"]["scope_kind"], "installation"
         )
-        self.assertFalse((self.repo / ".claude").exists())
         self.assertEqual(self.calls[0][1]["runtime"], "claude-code")
-        self.assertNotIn(str(self.repo), json.dumps([x[1] for x in self.calls]))
+        self.assertEqual(self.calls[0][1]["scope_kind"], "installation")
+        self.assertNotIn(str(self.home), json.dumps([x[1] for x in self.calls]))
         self.assertEqual(self.calls[1][2], "Bearer dp_pair_" + "p" * 43)
         self.assertGreaterEqual(self.calls[1][3] - self.calls[0][3], 5)
         before = c.read_bytes()
+        self.uninstall()
         self.assertEqual(self.run_setup().returncode, 0)
         self.assertEqual(c.read_bytes(), before)
         self.assertEqual(len(self.calls), 2)
 
-    def test_ambiguous_remotes_require_choice(self):
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.repo),
-                "remote",
-                "add",
-                "upstream",
-                "https://github.com/other/demo.git",
-            ],
-            check=True,
-        )
-        self.assertNotEqual(self.run_setup().returncode, 0)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.run_setup("--remote", "origin").returncode, 0)
-
-    def test_lost_response_requires_explicit_new_pair(self):
+    def test_a_lost_response_needs_the_connection_set_aside(self):
         self.mode = "lost"
         self.assertNotEqual(self.run_setup().returncode, 0)
         count = len(self.calls)
         p = self.run_setup()
-        self.assertIn(b"new-pair", p.stderr)
+        self.assertNotEqual(p.returncode, 0)
         self.assertEqual(len(self.calls), count)
         installation = self.installation
         self.mode = "ok"
-        self.runtime = "claude-code"
-        self.assertEqual(self.run_setup("--new-pair").returncode, 0)
-        self.assertEqual(self.installation, installation)
+        self.set_aside()
+        self.assertEqual(self.run_setup().returncode, 0)
+        self.assertNotEqual(self.installation, installation)
 
     def test_scope_mismatch_consumed_redirect_fail_closed(self):
         for mode in ["mismatch", "consumed", "redirect"]:
-            self.mode = mode
-            p = self.run_setup(*(["--new-pair"] if self.calls else []))
-            self.assertNotEqual(p.returncode, 0)
-            self.assertFalse((self.root / "connection/connection.json").exists())
+            with self.subTest(mode=mode):
+                self.mode = mode
+                self.set_aside()
+                p = self.run_setup()
+                self.assertNotEqual(p.returncode, 0)
+                self.assertFalse((self.connection() / "connection.json").exists())
         self.assertNotIn("/leak", [x[0] for x in self.calls])
 
     def test_retry_after(self):
@@ -264,19 +285,28 @@ class PairingTest(unittest.TestCase):
         self.mode = "start-rate"
         self.assertNotEqual(self.run_setup().returncode, 0)
         self.mode = "ok"
-        self.runtime = "claude-code"
-        self.assertNotEqual(self.run_setup("--new-pair").returncode, 0)
+        result = self.run_setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"rate limited", result.stderr)
         self.assertEqual(len(self.calls), 1)
 
     def test_interrupt_pins_identity_and_requires_repair(self):
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
         with subprocess.Popen(
-            self.command(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            self.command(),
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
         ) as p:
+            os.close(slave)
             assert p.stdout is not None
             self.assertTrue(p.stdout.readline())
-            p.send_signal(__import__("signal").SIGINT)
+            p.send_signal(signal.SIGINT)
             p.communicate(timeout=5)
-        self.assertTrue((self.root / "connection/installation.json").exists())
+        self.assertNotEqual(p.returncode, 0)
+        self.assertTrue((self.connection() / "installation.json").exists())
         self.assertNotEqual(self.run_setup().returncode, 0)
 
     def test_pending_obeys_interval(self):
@@ -286,128 +316,28 @@ class PairingTest(unittest.TestCase):
 
     def test_expiry_bad_path_duplicate_fail_closed(self):
         for mode in ["expired", "bad-path", "duplicate"]:
-            self.mode = mode
-            self.assertNotEqual(
-                self.run_setup(*(["--new-pair"] if self.calls else [])).returncode, 0
-            )
-            self.assertFalse((self.root / "connection/connection.json").exists())
+            with self.subTest(mode=mode):
+                self.mode = mode
+                self.set_aside()
+                self.assertNotEqual(self.run_setup().returncode, 0)
+                self.assertFalse((self.connection() / "connection.json").exists())
         self.assertEqual(sum(c[0].endswith("/exchange") for c in self.calls), 1)
 
-    def test_plan_consent_health_and_frozen_scope(self):
-        import shutil
-        import sqlite3
-
-        exe = self.root / "collector"
-        shutil.copyfile(BIN, exe)
-        exe.chmod(0o700)
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.repo),
-                "remote",
-                "add",
-                "upstream",
-                "https://github.com/other/demo.git",
-            ],
-            check=True,
-        )
-        self.assertEqual(self.run_setup("--remote", "origin").returncode, 0)
-        root = self.root / "connection"
-        settings, plan = self.root / "settings.json", self.root / "plan.json"
-        original = {
-            "env": {"KEEP": "private-value"},
-            "hooks": {"Stop": []},
-            "disableAllHooks": True,
-        }
-        settings.write_text(json.dumps(original))
-        settings.chmod(0o600)
-
-        def command(*args, ok=True):
-            p = subprocess.run(
-                [str(exe), *map(str, args)], capture_output=True, timeout=5, check=False
-            )
-            self.assertEqual(p.returncode == 0, ok, p.stderr)
-            self.assertNotIn(b"dc_live_", p.stdout + p.stderr)
-            return p.stdout
-
-        command("setup-plan", root, settings, plan)
-        self.assertEqual(json.loads(settings.read_text()), original)
-        command("claude-apply", plan, ok=False)
-        command("claude-apply", plan, "--consent")
-        health = json.loads(command("connection-status", root, plan))
-        self.assertEqual(health["local_registration"]["registration"], "installed")
-        self.assertTrue(health["local_registration"]["target_settings_block"])
-        self.assertEqual(health["host_trust"], "unknown")
-        self.assertEqual(health["local_observed"], 0)
-        command("claude-remove", plan, "--consent")
-        self.assertEqual(json.loads(settings.read_text()), original)
-        self.assertNotIn("private-value", plan.read_text())
-        self.assertNotIn("dc_live_", plan.read_text())
-        data = json.loads((root / "connection.json").read_text())
-        observation = {
-            "schema_version": 1,
-            "observation_id": "22222222-2222-4222-8222-222222222222",
-            "installation_id": data["scope"]["installation_id"],
-            "repository": str(self.repo),
-            "runtime": self.runtime,
-            "session_id": "fixture",
-            "event": "SessionStart",
-            "observed_at": time.time(),
-            "attribution_basis": "unknown",
-        }
-        subprocess.run(
-            [str(exe), "collect", str(root / "outbox")],
-            input=json.dumps(observation).encode(),
-            capture_output=True,
-            check=True,
-        )
-        with sqlite3.connect(root / "outbox/collector-rust-v1.sqlite3") as db:
-            frozen = db.execute("SELECT payload FROM outbox").fetchone()[0]
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.repo),
-                "remote",
-                "set-url",
-                "origin",
-                "https://github.com/acme/other",
-            ],
-            check=True,
-        )
-        self.assertNotEqual(
-            self.run_setup("--remote", "origin", "--new-pair").returncode, 0
-        )
-        command("setup-plan", root, settings, self.root / "new-plan.json", ok=False)
-        with sqlite3.connect(root / "outbox/collector-rust-v1.sqlite3") as db:
-            self.assertEqual(
-                db.execute("SELECT payload FROM outbox").fetchone()[0], frozen
-            )
-
     def test_insecure_state_and_untrusted_origin_never_connect(self):
-        connection = self.root / "connection"
+        self.data.mkdir(parents=True, mode=0o700)
+        connection = self.connection()
         connection.mkdir()
         connection.chmod(0o755)
         self.assertNotEqual(self.run_setup().returncode, 0)
         connection.rmdir()
-        connection.symlink_to(self.repo, target_is_directory=True)
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        connection.symlink_to(elsewhere, target_is_directory=True)
         self.assertNotEqual(self.run_setup().returncode, 0)
         connection.unlink()
-        p = subprocess.run(
-            [
-                str(BIN),
-                "setup",
-                str(connection),
-                str(self.repo),
-                "--origin",
-                self.origin,
-                "--no-browser",
-            ],
-            capture_output=True,
-            check=False,
-        )
-        self.assertNotEqual(p.returncode, 0)
+        untrusted = [a for a in self.command() if a != "--trust-origin"]
+        code, _, _, _ = terminal.answering(untrusted, self.env)
+        self.assertNotEqual(code, 0)
         self.assertEqual(self.calls, [])
 
 
