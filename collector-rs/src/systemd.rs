@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn disable_without_a_user_bus_still_removes_the_units() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         for name in [SERVICE, TIMER] {
             fs::write(dir.path().join(name), "").unwrap();
         }
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn enable_writes_units_before_enabling_and_disable_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let units = dir.path().join("systemd/user");
         let runner = Recorder(Default::default());
         enable(

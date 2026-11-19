@@ -25,6 +25,13 @@ pub const MAX_HOOK_INPUT: usize = 16 * 1024 * 1024;
 pub const MAX_WIRE: usize = 16384;
 pub type Object = Map<String, Value>;
 
+// macOS puts the temp folder under the `/var` symlink, which the
+// symlink-ancestor rule refuses, so fixtures start from its canonical path.
+#[cfg(test)]
+pub(crate) fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+}
+
 // Reject duplicate top-level keys before interpretation. Nested private values
 // are discarded, never inspected or persisted; all accepted fields are scalars.
 pub fn object(raw: &[u8]) -> Result<Object> {

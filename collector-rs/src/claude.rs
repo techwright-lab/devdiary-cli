@@ -1239,7 +1239,7 @@ mod recovery_tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn fixture(original: Value) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let root = dir.path();
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         let state = root.join("state");

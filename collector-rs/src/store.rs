@@ -887,7 +887,7 @@ mod tests {
 
     const HOUR: i64 = 3_600_000_000_000;
     fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let state = dir.path().join("state");
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();

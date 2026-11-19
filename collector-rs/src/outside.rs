@@ -32,7 +32,7 @@ mod tests {
 
     #[test]
     fn consent_is_a_file_that_comes_and_goes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         assert!(!allowed(dir.path()));
         set(dir.path(), true).unwrap();
         set(dir.path(), true).unwrap();
