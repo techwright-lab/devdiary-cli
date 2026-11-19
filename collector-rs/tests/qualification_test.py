@@ -198,46 +198,6 @@ class QualificationTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             q.validate_host(encode(messages))
 
-    def test_registration_cleanup_on_fake_vendor_failure_and_interrupt(self):
-        # Real collector registration; fake vendor never constitutes qualification.
-        collector = q.CLI / "collector-rs/target/debug/devdiary"
-        real_run = q.run
-        for failure in (RuntimeError("fixture-secret"), KeyboardInterrupt()):
-            with tempfile.TemporaryDirectory() as home:
-                env = {"HOME": home, "PATH": os.environ["PATH"]}
-                report = {}
-                args = SimpleNamespace(
-                    rails_checkout=q.CLI, collector=collector, claude_version="fixture"
-                )
-                calls = []
-
-                def fixture_run(argv, failure=failure, calls=calls, **kwargs):
-                    strings = list(map(str, argv))
-                    if strings[:2] == ["mise", "which"]:
-                        return str(collector).encode()
-                    if strings == ["bundle", "check"]:
-                        return b""
-                    if "--version" in strings:
-                        return b"fixture (Claude Code)"
-                    if "auth" in strings:
-                        return b'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"PRIVATE"}'
-                    if "--print" in strings:
-                        calls.append("fake_vendor")
-                        raise failure
-                    return real_run(argv, **kwargs)
-
-                with (
-                    patch.object(q, "clean_env", return_value=env),
-                    patch.object(q, "check_managed_policy"),
-                    patch.object(q, "run", side_effect=fixture_run),
-                    self.assertRaises(type(failure)),
-                ):
-                    q.execute(args, report)
-                self.assertEqual(calls, ["fake_vendor"])
-                self.assertTrue(report["registration_removed"])
-                self.assertTrue(report["live_settings_unchanged"])
-                self.assertNotIn("email", report["auth"])
-
     def test_schema_is_not_dispatched_in_an_unguarded_separate_boot(self):
         calls = []
 

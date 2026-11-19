@@ -20,6 +20,7 @@ from pathlib import Path
 
 import install_test
 import qualify_claude
+import terminal
 
 VERSION = "0.166.0"
 COMPONENTS = (
@@ -182,14 +183,11 @@ class Harness:
             **f.env(),
             "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(f.root / "no-user-bus"),
         }
-        result = subprocess.run(
-            f.install_args("--vendor", "codex", "--yes"),
-            env=env,
-            capture_output=True,
-            timeout=30,
-            check=False,
+        # Setup asks to create hooks.json, then to append the entries.
+        code, _, _, _ = terminal.answering(
+            f.install_args("--vendor", "codex"), env, (b"y\n", b"y\n")
         )
-        require(result.returncode == 0, "collector_install_failed")
+        require(code == 0, "collector_install_failed")
         self.repo = f.root / "demo"
         subprocess.run(
             ["git", "init", "-q", str(self.repo)], check=True, capture_output=True
