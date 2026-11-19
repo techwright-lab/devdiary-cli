@@ -1,0 +1,170 @@
+name: Release
+
+# A pushed vX.Y.Z tag publishes a GitHub release. Every other trigger is a dry
+# run: it builds, checks and assembles the same files, uploads them as a
+# workflow artifact, and publishes nothing (no release, no attestation).
+on:
+  push:
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - collector-rs/Cargo.toml
+      - collector-rs/Cargo.lock
+      - collector-rs/install.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.98.1"
+
+jobs:
+  version:
+    name: Tag equals the crate version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("collector-rs/Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not equal the crate version v$version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-26
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: devdiary-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
+    steps:
+      - uses: actions/checkout@v7
+      - name: Native Apple-silicon runner
+        if: runner.os == 'macOS'
+        run: test "$(uname -m)" = arm64
+      - name: Install musl C toolchain (bundled SQLite and aws-lc)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+      - name: Build
+        run: cargo +"$RUST_TOOLCHAIN" build --locked --release --target "$TARGET" --manifest-path collector-rs/Cargo.toml
+      - name: Archive
+        run: |
+          mkdir dist
+          COPYFILE_DISABLE=1 tar --no-xattrs -C "collector-rs/target/$TARGET/release" -czf "dist/$ARCHIVE" devdiary
+          tar -tzf "dist/$ARCHIVE" | grep -qx devdiary
+          test "$(tar -tzf "dist/$ARCHIVE" | wc -l)" -eq 1
+      - name: Unpack the archived binary
+        run: mkdir unpacked && tar -xzf "dist/$ARCHIVE" -C unpacked && unpacked/devdiary --help > /dev/null
+      - name: Linker signature intact on the archived binary
+        if: runner.os == 'macOS'
+        run: |
+          lipo unpacked/devdiary -verify_arch arm64
+          codesign --verify --strict --verbose=2 unpacked/devdiary
+      - name: Archived binary is statically linked
+        if: runner.os == 'Linux'
+        run: |
+          file unpacked/devdiary
+          file unpacked/devdiary | grep -Eq 'statically linked|static-pie linked'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble release files
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - name: Stamp install.sh with its own tag
+        run: |
+          if [ ! -f collector-rs/install.sh ]; then
+            if [ "$GITHUB_REF_TYPE" = tag ]; then
+              echo "::error::collector-rs/install.sh is missing; a release must carry it."
+              exit 1
+            fi
+            echo "::warning::collector-rs/install.sh is missing; this dry run assembles without it."
+            exit 0
+          fi
+          test "$(grep -c '^RELEASE_TAG=unreleased$' collector-rs/install.sh)" -eq 1
+          sed "s/^RELEASE_TAG=unreleased\$/RELEASE_TAG=$TAG/" collector-rs/install.sh > dist/install.sh
+          grep -qx "RELEASE_TAG=$TAG" dist/install.sh
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          set -- devdiary-*.tar.gz && test "$#" -eq 2
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ env.TAG }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Attest and publish
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, assemble]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ env.TAG }}
+          path: dist
+      - name: Release carries both archives, SHA256SUMS and install.sh
+        working-directory: dist
+        run: |
+          set -- devdiary-*.tar.gz && test "$#" -eq 2
+          test -f SHA256SUMS && test -f install.sh
+          sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/devdiary-*.tar.gz
+      - name: Attestations verify
+        run: |
+          for archive in dist/devdiary-*.tar.gz; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+      - name: Create the release
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "devdiary $TAG" --generate-notes

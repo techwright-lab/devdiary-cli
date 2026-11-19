@@ -14,6 +14,11 @@ uuid = { version = "1", features = ["v4", "v5"] }
 serde = "1"
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 
+# Cargo's default strip rewrites the Mach-O after the link; the release ships the
+# linker's own ad hoc signature, so nothing may touch the binary after linking.
+[profile.release]
+strip = "none"
+
 # Keep executable pin verification inside the hook deadline in debug fixtures too.
 [profile.dev.package.sha2]
 opt-level = 3

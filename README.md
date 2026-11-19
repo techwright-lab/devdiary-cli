@@ -60,8 +60,8 @@ spool, and later syncs stop with `sync_rate_limited` before any request until it
 passes. No redirects or ambient proxies; verified TLS except exact loopback HTTP;
 each request has a five-second timeout including the response body. Only
 `hook claude` and `hook codex` have the silent deadline/exit contract below. No
-daemon, live host qualification, native Windows support, signing or Python
-retirement is included. Rails and human-minute attribution are unchanged.
+daemon, live host qualification, native Windows support, Developer ID signing,
+notarization or Python retirement is included. Rails and human-minute attribution are unchanged.
 
 Reproduce Linux checks (Rust 1.98.1, Python >=3.11):
 
@@ -78,6 +78,28 @@ The Rails/Puma/PostgreSQL interoperability harnesses (`rails_interop.rb`,
 `pairing_rails.py`) still use the removed repository-scope commands and do not run
 until they are requalified on installation scope:
 [#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
+
+### Releases
+
+`.github/workflows/release.yml` publishes a GitHub release when a tag `vX.Y.Z` is
+pushed. The tag must equal the crate version in `collector-rs/Cargo.toml`, or the
+job fails. It builds `aarch64-apple-darwin` natively on an Apple-silicon runner and
+a static `x86_64-unknown-linux-musl` binary, both with Rust 1.98.1. The macOS
+binary keeps the linker's ad hoc signature: the release profile does not strip,
+and the job fails unless `codesign --verify` passes on the archived binary. The
+release carries `devdiary-X.Y.Z-<target>.tar.gz` for each target, `SHA256SUMS` and
+`install.sh`. The job writes the tag into the `RELEASE_TAG=unreleased` line of
+`collector-rs/install.sh`, and fails when that file is missing. Each archive has a
+GitHub artifact attestation:
+
+```sh
+gh attestation verify devdiary-X.Y.Z-<target>.tar.gz --repo techwright-lab/devdiary-cli
+```
+
+A pull request that changes the workflow, the crate manifest, the lockfile or
+`install.sh` runs the same job as a dry run. So does a manual run. A dry run
+builds, checks and assembles the files as a workflow artifact. It creates no
+release and no attestation.
 
 ## Customer browser pairing (experimental Linux client)
 
