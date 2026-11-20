@@ -204,9 +204,10 @@ devdiary uninstall
    `setup`. A saved connection that the server revoked is refused
    (`connection_revoked`): run `uninstall`, move the connection folder aside (its
    pending rows stay there) and run `setup` again. Nothing is paired or changed.
-   If an earlier setup stopped while it wrote the settings, it left a copy named
-   `<settings file>.devdiary-backup`. Setup offers to restore that copy before it
-   reads the settings. Declining keeps both files and stops with `backup_kept`.
+   If an earlier setup stopped while it wrote the settings, or before it saved its
+   install record, it left a copy named `<settings file>.devdiary-backup`. Setup
+   offers to restore that copy before it reads the settings. Declining keeps both
+   files and stops with `backup_kept`.
 2. Prints the 10 hook entries and the settings file they go in, and asks `[y/N]` on
    the terminal. Declining sends nothing and changes nothing.
 3. Pairs installation scope into `~/.local/share/devdiary/cli/claude/connection`
@@ -219,9 +220,9 @@ devdiary uninstall
 5. Plans the hook entries for that copy and applies the plan. Entries that differ
    from the ones shown, or settings edited after step 1, give `stale_plan`, and the
    settings are left exactly as they are; run `setup` again. Before the write, setup
-   copies the settings to `<settings file>.devdiary-backup` with the same mode, and
-   it removes the copy once the write succeeds. The plan never holds a copy of the
-   settings.
+   copies the settings to `<settings file>.devdiary-backup` with the same mode. It
+   removes the copy once the install record that names the write is saved. The
+   plan never holds a copy of the settings.
 6. Writes `devdiary-claude-sync.service` and `.timer` (`devdiary-codex-sync` for
    Codex) under
    `~/.config/systemd/user/` (`$XDG_CONFIG_HOME` when set), then
@@ -265,8 +266,9 @@ record is replaced only on success, so after a failed upgrade `uninstall` still
 finds and disables the timer. `uninstall` disables and deletes the timer units,
 then removes the hook entries. Without a user systemd bus it still deletes the unit
 files and removes the hooks, then exits 2 with `timer_unconfirmed`. Leftover units
-without an install record are also disabled and deleted. A second `uninstall` is a
-no-op. Settings keep their key order and their compact or pretty-printed layout;
+without an install record are also disabled and deleted. Hook entries that a setup
+stopped before its install record are removed too, with that run's copy of the
+settings. A second `uninstall` is a no-op. Settings keep their key order and their compact or pretty-printed layout;
 string escapes and number spellings come back in canonical JSON form (`\u00e9`
 returns as `é`, `1.50` as `1.5`), so such files keep their meaning but not their
 sha256. The connection

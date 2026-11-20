@@ -7,6 +7,7 @@ import json
 import os
 import pty
 import re
+import select
 import shutil
 import sqlite3
 import subprocess
@@ -794,6 +795,84 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
                 self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
         with sqlite3.connect(self.outbox / "collector-rust-v1.sqlite3") as db:
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+
+    def test_setup_killed_after_the_hooks_before_the_record_is_recoverable(self):
+        self.uninstall()
+        backup = self.settings.with_name("settings.json.devdiary-backup")
+        for then in ("uninstall", "setup"):
+            with self.subTest(then=then):
+                self.setup_killed_at("hooks_written")
+                left = json.loads(self.newest_plan().read_bytes())["entry"]
+                current = json.loads(self.settings.read_bytes())
+                self.assertTrue(
+                    all(current["hooks"][e].count(left) == 1 for e in EVENTS)
+                )
+                self.assertFalse((self.data / "install.json").exists())
+                copy = backup.read_bytes()
+                self.assertEqual(json.loads(copy), self.original)
+                if then == "uninstall":
+                    out = self.uninstall().stdout
+                    self.assertIn(b"An earlier setup stopped", out)
+                    self.assertEqual(self.settings.read_bytes(), copy)
+                    self.assertFalse(backup.exists())
+                    self.install()
+                else:
+                    # Yes to restoring the copy, then yes to the hook entries.
+                    self.install(answers=(b"y\n", b"y\n"))
+                self.assertFalse(backup.exists())
+                entry = json.loads(self.plan.read_bytes())["entry"]
+                hooks = json.loads(self.settings.read_bytes())["hooks"]
+                for event in EVENTS:
+                    ours = [h for h in hooks[event] if "hook claude" in json.dumps(h)]
+                    self.assertEqual(ours, [entry], event)
+                self.hook()
+                self.uninstall()
+                self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
+                # The interrupted run's registration is not left for a later
+                # uninstall to trip on once the person edits the file.
+                edited = dict(self.original, later=True)
+                self.save(self.settings, edited)
+                self.assertIn(b"Not installed", self.uninstall().stdout)
+                self.assertEqual(json.loads(self.settings.read_bytes()), edited)
+                self.save(self.settings, self.original)
+
+    def setup_killed_at(self, stage):
+        """Answer yes on a terminal until a debug build pauses at `stage`, then kill."""
+        args = [self.exe, "setup", "--settings", self.settings, "--origin"]
+        args += [self.origin, "--trust-origin", "--no-browser"]
+        env = dict(self.setup_env, DEVDIARY_DEBUG_PAUSE_AT=stage)
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        process = subprocess.Popen(
+            [str(a) for a in args],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        os.close(slave)
+        out, err, asked = b"", b"", 0
+        marker = f"paused at {stage}".encode()
+        try:
+            deadline = time.monotonic() + 20
+            while marker not in err and time.monotonic() < deadline:
+                streams = [process.stdout, process.stderr]
+                ready, _, _ = select.select(streams, [], [], 0.5)
+                for stream in ready:
+                    chunk = os.read(stream.fileno(), 4096)
+                    if stream is process.stdout:
+                        out += chunk
+                    else:
+                        err += chunk
+                while out.count(terminal.PROMPT) > asked:
+                    os.write(master, b"y\n")
+                    asked += 1
+                if process.poll() is not None and not ready:
+                    break
+        finally:
+            process.kill()
+            process.communicate(timeout=10)
+        self.assertIn(marker, err, (out, err))
 
     def setup_then_kill(self, delay):
         """Answer setup's question on a terminal, then kill it `delay` seconds later."""
