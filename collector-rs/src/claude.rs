@@ -745,13 +745,64 @@ fn write_hooks(plan_path: &Path, backed_up: bool) -> Result<()> {
     m.insert("status".into(), json!("installed"));
     save_manifest(plan_path, &m)
 }
+/// A harness settings file that does not parse, so the hooks in it cannot be
+/// checked. `doctor` reports it in place of the registration.
+#[derive(Debug)]
+pub struct UnreadableSettings {
+    settings: PathBuf,
+    line: usize,
+    column: usize,
+    backup: Option<PathBuf>,
+}
+impl UnreadableSettings {
+    /// Wraps a JSON parse error; any other error is returned as it is.
+    fn of(settings: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+        let Some(json) = error.downcast_ref::<serde_json::Error>() else {
+            return error;
+        };
+        let copy = backup(settings);
+        Box::new(Self {
+            settings: settings.to_path_buf(),
+            line: json.line(),
+            column: json.column(),
+            backup: fs::symlink_metadata(&copy).is_ok().then_some(copy),
+        })
+    }
+    pub fn report(&self) -> Value {
+        json!({"registration": "settings_unreadable", "settings": self.settings,
+            "line": self.line, "column": self.column, "backup": self.backup})
+    }
+    pub fn next_step(&self) -> String {
+        let fix = match &self.backup {
+            Some(copy) => format!(
+                "Fix it by hand, or replace it with {}, the copy setup saved before a write that did not finish.",
+                copy.display()
+            ),
+            None => "Fix it by hand.".to_owned(),
+        };
+        format!(
+            "{} is not valid JSON: the error is at line {}, column {}. doctor cannot check the hooks in it and changed nothing. {fix} Then run `devdiary doctor` again.",
+            self.settings.display(),
+            self.line,
+            self.column
+        )
+    }
+}
+impl std::fmt::Display for UnreadableSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("invalid_settings")
+    }
+}
+impl std::error::Error for UnreadableSettings {}
+
 /// Read-only local evidence, never a statement of effective host trust/policy.
 pub fn registration_status(plan_path: &Path, state: &Path) -> Result<Object> {
     let p = load(plan_path)?;
     if Path::new(text(&p, "state")?) != state {
         return Err("scope_changed".into());
     }
-    let (_, doc) = settings(Path::new(text(&p, "settings")?))?;
+    let path = Path::new(text(&p, "settings")?);
+    let (_, doc) = settings(path).map_err(|e| UnreadableSettings::of(path, e))?;
     let status = if manifest_path(plan_path).exists() {
         let m = manifest(plan_path, &p)?;
         let status = text(&m, "status")?;

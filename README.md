@@ -276,7 +276,11 @@ refresh error.
 the timer (on macOS, `loaded` from the exit status of
 `launchctl print gui/UID/LABEL`, whose output it never reads), pending and
 delivered counts, drops, the last receipt, `last_sync_error`, `last_sync_at` (the
-last sync run, from the sync status file) and `last_scope_refresh_error`. `upgrade` first checks that the settings would accept a fresh
+last sync run, from the sync status file) and `last_scope_refresh_error`. When the harness settings file
+is not valid JSON, the registration reads `settings_unreadable` with the file's
+path, the error's line and column, and any backup setup left beside it. `doctor`
+still runs the other checks, names the fix on stderr, writes nothing and exits 1.
+`upgrade` first checks that the settings would accept a fresh
 plan once the old entries are gone and that the connection was not revoked, prints
 the 10 new entries and asks once; only then does it remove the old registration, copy
 the new binary over the pinned one and install the fresh plan. Declining leaves the

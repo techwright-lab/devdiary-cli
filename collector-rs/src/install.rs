@@ -618,16 +618,31 @@ pub fn uninstall(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {
     Ok(())
 }
 
-pub fn doctor(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {
+/// How a `doctor` run ended. It prints its report either way.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Doctor {
+    Reported,
+    CheckFailed,
+}
+pub fn doctor(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Doctor> {
     let data = data_dir(vendor)?;
     let Some(current) = record(&data)? else {
         println!(
             "{}",
             json!({"installed": false, "timer": scheduler.state(vendor)})
         );
-        return Ok(());
+        return Ok(Doctor::Reported);
     };
     let outbox = connection(&data).join("outbox");
+    // Unreadable settings are the case a person most needs doctor for, so the
+    // other checks still run.
+    let (registration, unreadable) = match claude::registration_status(&current.plan, &outbox) {
+        Ok(status) => (Value::Object(status), None),
+        Err(error) => {
+            let unreadable = error.downcast::<claude::UnreadableSettings>()?;
+            (unreadable.report(), Some(unreadable))
+        }
+    };
     let store = Store::open(&outbox, None)?;
     let (pending, delivered) = store.counts()?;
     let receipt = store
@@ -647,7 +662,7 @@ pub fn doctor(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {
             "host_trust": "unknown",
             "runtime_qualification": "unverified",
             "version": current.version,
-            "registration": claude::registration_status(&current.plan, &outbox)?,
+            "registration": registration,
             "timer": scheduler.state(vendor),
             "pending": pending,
             "delivered": delivered,
@@ -661,7 +676,13 @@ pub fn doctor(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {
             "last_sync_at": last_sync_at(status),
         })
     );
-    Ok(())
+    Ok(match unreadable {
+        Some(unreadable) => {
+            eprintln!("{}", unreadable.next_step());
+            Doctor::CheckFailed
+        }
+        None => Doctor::Reported,
+    })
 }
 
 fn start_question(os: Os, vendor: Vendor) -> String {

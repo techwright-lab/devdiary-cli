@@ -593,6 +593,41 @@ class InstallTest(unittest.TestCase):
         self.assertIsNone(doctor["last_receipt"])
         self.assertIsNone(doctor["last_sync_error"])
 
+    def test_doctor_reports_settings_that_are_not_json_and_runs_the_other_checks(self):
+        self.install()
+        self.spool(1)
+        # The comma after "opus" is missing; "hooks" starts at line 3, column 3.
+        broken = b'{\n  "model": "opus"\n  "hooks": {}\n}\n'
+        self.settings.write_bytes(broken)
+        result = self.run_collector("doctor", code=1)
+        doctor = json.loads(result.stdout)
+        self.assertEqual(
+            doctor["registration"],
+            {
+                "registration": "settings_unreadable",
+                "settings": str(self.settings),
+                "line": 3,
+                "column": 3,
+                "backup": None,
+            },
+        )
+        self.assertEqual(doctor["timer"], self.scheduler.running())
+        self.assertEqual(doctor["pending"], 1)
+        self.assertNotIn(b"collector_error", result.stderr)
+        self.assertIn(f"{self.settings} is not valid JSON".encode(), result.stderr)
+        self.assertIn(b"line 3, column 3", result.stderr)
+        self.assertEqual(self.settings.read_bytes(), broken)
+
+    def test_doctor_names_the_backup_setup_left_beside_unreadable_settings(self):
+        self.install()
+        self.settings.write_bytes(b"{")
+        self.backup().write_bytes(self.original)
+        result = self.run_collector("doctor", code=1)
+        doctor = json.loads(result.stdout)
+        self.assertEqual(doctor["registration"]["backup"], str(self.backup()))
+        self.assertIn(str(self.backup()).encode(), result.stderr)
+        self.assertEqual(self.backup().read_bytes(), self.original)
+
     def test_upgrade_replaces_the_registration_with_a_fresh_plan(self):
         self.install()
         before = self.owned_entries()["Stop"][0]["hooks"][0]["command"]
