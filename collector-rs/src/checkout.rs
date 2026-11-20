@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_stray_git_dir_is_not_a_checkout() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let stray = dir.path().join("workspace");
         fs::create_dir_all(stray.join(".git/info")).unwrap();
         assert_eq!(resolve(&stray), Checkout::Absent);
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn a_stray_git_dir_does_not_hide_the_repository_above_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let repo = repo(dir.path(), "https://github.com/acme/project.git");
         fs::create_dir_all(repo.join("nested/.git/info")).unwrap();
         assert_eq!(resolve(&repo.join("nested")), found("acme/project"));
@@ -218,7 +218,7 @@ mod tests {
             "https://github.com/acme/project.git",
             "https://github.com/acme/project",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::tempdir();
             let repo = repo(dir.path(), url);
             fs::create_dir_all(repo.join("src/deep")).unwrap();
             assert_eq!(
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn linked_worktree_git_file_resolves_through_commondir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let main = repo(dir.path(), "git@github.com:acme/project.git");
         let admin = main.join(".git/worktrees/feature");
         fs::create_dir_all(&admin).unwrap();
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn relative_gitdir_is_read_from_the_git_file_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let main = repo(dir.path(), "https://github.com/acme/project");
         let admin = main.join(".git/worktrees/rel");
         fs::create_dir_all(&admin).unwrap();
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn nested_submodule_resolves_to_its_own_remote() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let main = repo(dir.path(), "git@github.com:acme/parent.git");
         config(
             &main.join(".git/modules/vendor/lib"),
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn single_github_remote_is_used_without_origin() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let repo = dir.path().join("r");
         config(
             &repo.join(".git"),
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn located_gitdir_is_the_worktree_admin_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let main = repo(dir.path(), "git@github.com:acme/project.git");
         let admin = main.join(".git/worktrees/feature");
         fs::create_dir_all(&admin).unwrap();
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn non_github_or_missing_remote_is_unresolved() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let repo = dir.path().join("r");
         config(
             &repo.join(".git"),
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn directory_without_checkout_is_absent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let plain = dir.path().join("plain/child");
         fs::create_dir_all(&plain).unwrap();
         assert_eq!(resolve(&plain), Checkout::Absent);
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn symlink_escape_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let other = repo(dir.path(), "git@github.com:acme/secret.git");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&linked).unwrap();
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn large_config_with_many_branches_still_resolves() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let repo = dir.path().join("r");
         let branches: String = (0..3000)
             .map(|i| format!("[branch \"feature/{i}\"]\n\tremote = origin\n\tmerge = refs/heads/feature/{i}\n"))
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn non_utf8_bytes_elsewhere_in_config_do_not_matter() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let repo = repo(dir.path(), "git@github.com:acme/demo.git");
         let mut raw = fs::read(repo.join(".git/config")).unwrap();
         raw.extend_from_slice(b"[user]\n\tname = Ren\xe9\n");
@@ -381,7 +381,7 @@ mod tests {
             "git@github.com:acme/demo.git # main",
             "\"git@github.com:acme/demo.git\" ; main",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::tempdir();
             let repo = repo(dir.path(), url);
             assert_eq!(resolve(&repo), found("acme/demo"), "{url}");
         }
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn symlinked_commondir_target_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let other = repo(dir.path(), "git@github.com:acme/secret.git");
         let admin = dir.path().join("admin");
         fs::create_dir_all(&admin).unwrap();
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn oversized_or_malformed_git_file_is_unresolved() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let tree = dir.path().join("t");
         fs::create_dir_all(&tree).unwrap();
         fs::write(tree.join(".git"), "not a pointer\n").unwrap();

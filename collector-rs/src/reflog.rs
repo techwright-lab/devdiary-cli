@@ -153,7 +153,7 @@ mod tests {
         format!("{old} {new} Ann Example <ann@example.invalid> {at} +0100\t{message}\n")
     }
     fn gitdir() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let gitdir = dir.path().join(".git");
         fs::create_dir_all(gitdir.join("logs")).unwrap();
         (dir, gitdir)

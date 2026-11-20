@@ -23,12 +23,14 @@ register local metadata hooks without wrapping ordinary tool commands. Optional
 explicit upload is configured separately; hooks never perform HTTP. It does not
 change Git identity, declare named work, or affect human minute derivation.
 
-## Experimental Rust collector (separate executable; Linux evidence only)
+## Experimental Rust collector (separate executable; Linux and macOS)
 
 `collector-rs` builds one `devdiary` binary: `devdiary setup` pairs this machine
 with DevDiary for every tracked repository (installation scope), registers the
-Claude Code or Codex hooks after you agree in the terminal, and a systemd user
-timer delivers what they record. It is not a Python replacement. The commands that
+Claude Code or Codex hooks after you agree in the terminal, and a per-user
+scheduler delivers what they record: a systemd user timer on Linux, a launchd
+agent on macOS. Release one builds for Linux on x86_64 and macOS on Apple silicon;
+both stay experimental. It is not a Python replacement. The commands that
 worked on a single repository (`init`, `collect`, `status`, `repair`,
 `claude-plan`, `claude-apply`, `claude-remove`, `hook-apply`, `hook-remove`,
 `setup DIR`, `setup-plan`, `connection-status`, `connection-sync` and
@@ -63,7 +65,8 @@ each request has a five-second timeout including the response body. Only
 daemon, live host qualification, native Windows support, Developer ID signing,
 notarization or Python retirement is included. Rails and human-minute attribution are unchanged.
 
-Reproduce Linux checks (Rust 1.98.1, Python >=3.11):
+Reproduce the checks (Rust 1.98.1, Python >=3.11). They run on Linux and on an
+Apple-silicon Mac, where the install harness uses a fake `launchctl`:
 
 ```sh
 cargo fmt --manifest-path collector-rs/Cargo.toml --check
@@ -108,7 +111,7 @@ A pull request that changes the workflow, the crate manifest, the lockfile or
 builds, checks and assembles the files as a workflow artifact. It creates no
 release and no attestation.
 
-## Customer browser pairing (experimental Linux client)
+## Customer browser pairing (experimental client)
 
 Requires the backend contract in [DevDiary PR #571](https://github.com/techwright-lab/DevDiary/pull/571)
 **merged and deployed separately**. This client PR does not deploy/enable it. The
@@ -154,13 +157,13 @@ Verification: `python3 collector-rs/tests/pairing.py -v` (mock transport and
 subprocess fixtures through `devdiary setup`). The real Rails pairing harness waits
 for [#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
 
-## One-command setup (Linux, systemd user timer)
+## One-command setup (systemd user timer on Linux, launchd agent on macOS)
 
 The Rust binary is `devdiary`. It accepts `--vendor codex` on `setup`, `doctor`,
 `upgrade`, `uninstall`, `outside-repos` and `orchestrators approve`. Claude remains
 the default. Codex uses its active `CODEX_HOME/hooks.json` (otherwise
 `~/.codex/hooks.json`), a separate connection/spool under `cli/codex`, and a
-separate `devdiary-codex-sync.timer`. Review changed definitions in
+separate `devdiary-codex-sync.timer` (`me.devdiary.codex-sync` on macOS). Review changed definitions in
 Codex's ordinary `/hooks` screen after setup or upgrade. Registration and
 fixture success do not qualify stock lifecycle coverage or counted minutes.
 C1 acceptance and current evidence live in the canonical vault plan:
@@ -177,7 +180,7 @@ capture gates does not establish server minute correctness.
 
 `setup` runs the browser pairing above, then plans the hook entries, asks in the
 terminal and applies them, for an installation-scope connection, and delivers the
-spool from a systemd user timer. The hook contract does not change: it stays silent, exits 0
+spool from the scheduler. The hook contract does not change: it stays silent, exits 0
 and never performs HTTP.
 
 ```sh
@@ -194,7 +197,13 @@ devdiary uninstall
 `setup` does these steps in order, and stops at the first failure:
 
 1. Refuses at once (`consent_required`) when stdin is not a terminal; release one
-   has no unattended setup. It refuses a relative `--settings` path (`unsupported_path`), a
+   has no unattended setup. It then checks the machine before it sends anything:
+   it refuses an OS or CPU that release one does not target
+   (`platform_unsupported`), a scheduler it cannot reach
+   (`scheduler_unreachable`: no `systemctl --user` session on Linux, no GUI login
+   session on macOS, for example SSH only), and a running binary that is not this
+   build's executable format (`executable_format_unsupported`: ELF on Linux, a
+   64-bit thin or universal Mach-O on macOS). `upgrade` runs the same check. It refuses a relative `--settings` path (`unsupported_path`), a
    missing settings file (`settings_missing`), settings that are not valid JSON
    (`invalid_settings`), already hold a `devdiary` hook (`already_registered`) or a
    hook of the older `devdiary-collector` (`old_collector_registered`: run
@@ -227,7 +236,15 @@ devdiary uninstall
    `~/.config/systemd/user/` (`$XDG_CONFIG_HOME` when set), then
    `systemctl --user daemon-reload` and `enable --now` the timer. The timer runs
    `sync CONNECTION_DIR` 30 s after it starts and then 2 min after each run
-   (`RandomizedDelaySec=30`, `Nice=10`).
+   (`RandomizedDelaySec=30`, `Nice=10`). On macOS it writes
+   `~/Library/LaunchAgents/me.devdiary.claude-sync.plist` (`me.devdiary.codex-sync`
+   for Codex), owned by you and not writable by group or others, then runs
+   `launchctl bootstrap gui/UID PLIST`. The agent runs `sync CONNECTION_DIR` at load
+   and every 120 s (`ProcessType` Background, `Nice` 10, `LowPriorityIO`), with every
+   path in `ProgramArguments` and no log paths. Before it asks, setup says that macOS
+   shows a background-item notification and lists the agent under Login Items, and
+   that switching it off there stops delivery. Runs missed during sleep are not made
+   up; the outbox keeps the rows for the next run.
 7. A local self-test: the installed hook receives a `SessionStart` whose session id
    starts with `devdiary-selftest-`. The hook records it only in a local
    `self_test` table, which sync never reads; the outbox refuses such ids.
@@ -255,8 +272,10 @@ server-requested wait still stop the run. `setup` and `upgrade` fail on any
 refresh error.
 
 `doctor` prints the registration state, `systemctl --user is-enabled/is-active` for
-the timer, pending and delivered counts, drops, the last receipt,
-`last_sync_error` and `last_scope_refresh_error`. `upgrade` first checks that the settings would accept a fresh
+the timer (on macOS, `loaded` from the exit status of
+`launchctl print gui/UID/LABEL`, whose output it never reads), pending and
+delivered counts, drops, the last receipt, `last_sync_error`, `last_sync_at` (the
+last sync run, from the sync status file) and `last_scope_refresh_error`. `upgrade` first checks that the settings would accept a fresh
 plan once the old entries are gone and that the connection was not revoked, prints
 the 10 new entries and asks once; only then does it remove the old registration, copy
 the new binary over the pinned one and install the fresh plan. Declining leaves the
@@ -264,7 +283,11 @@ running hooks and their pinned binary untouched. The install
 record is replaced only on success, so after a failed upgrade `uninstall` still
 finds and disables the timer. `uninstall` disables and deletes the timer units,
 then removes the hook entries. Without a user systemd bus it still deletes the unit
-files and removes the hooks, then exits 2 with `timer_unconfirmed`. Leftover units
+files and removes the hooks, then exits 2 with `timer_unconfirmed`. On macOS it runs
+`launchctl bootout gui/UID/LABEL`, deletes the plist, then removes the hooks; an
+agent that is not loaded counts as stopped, and one still loaded after bootout
+gives `timer_unconfirmed`. `upgrade` rewrites the plist for the new pinned copy,
+then unloads and reloads the agent. Leftover units
 without an install record are also disabled and deleted. A second `uninstall` is a
 no-op. Settings keep their key order and their compact or pretty-printed layout;
 string escapes and number spellings come back in canonical JSON form (`\u00e9`
@@ -401,11 +424,12 @@ hooks for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop and
 SessionEnd.
 
 Verification: `python3 collector-rs/tests/install_test.py -v` (temp HOME, a mock
-pairing/ingest server and a fake systemctl; debug builds only honour
-`DEVDIARY_COLLECTOR_SYSTEMCTL`; release builds run the first of `/usr/bin/systemctl`,
+pairing/ingest server and a fake systemctl, or a fake launchctl on macOS; debug
+builds only honour `DEVDIARY_COLLECTOR_SYSTEMCTL` and `DEVDIARY_COLLECTOR_LAUNCHCTL`,
+and release builds run only `/bin/launchctl` on macOS; release builds run the first of `/usr/bin/systemctl`,
 `/bin/systemctl` and `/run/current-system/sw/bin/systemctl`, never a `PATH` lookup).
 
-## Rust Claude raw-hook adapter: Linux fixture-qualified only
+## Rust Claude raw-hook adapter: fixture-qualified only
 
 `devdiary setup` registers `hook claude PLAN` (or `hook codex PLAN`). It accepts stock Claude command-hook stdin for SessionStart,
 UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, Stop, SubagentStart,
@@ -421,8 +445,8 @@ disposable settings/repository, existing subscription authentication in normal
 HOME, and explicit provider-usage approval. Verify real lifecycle/tool events,
 unknown attribution, ordinary host output, delivery and clean removal. Do not
 bypass a trust prompt or call this runtime-qualified before that gate. Windows
-is unsupported (the crate requires Unix); macOS is unqualified and this adapter
-refuses setup/collection outside Linux. Codex is deliberately deferred: its
+is unsupported (the crate requires Unix). macOS on Apple silicon passes the same
+fixtures but stays experimental: it has no CI job or recorded real-Mac run yet. Codex is deliberately deferred: its
 future adapter must implement its own events, turn/child correlation and exact
 host trust/setup contract rather than aliasing the Claude command.
 
