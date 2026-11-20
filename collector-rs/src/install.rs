@@ -215,7 +215,7 @@ pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
     if o.vendor == Vendor::Codex && settings.extension().is_some_and(|e| e == "toml") {
         return Err("codex_hooks_json_required".into());
     }
-    offer_restore(&settings)?;
+    offer_restore(&data, &settings)?;
     // Codex need not have a hooks file yet. Never initialize or rewrite config.toml.
     if o.vendor == Vendor::Codex && !settings.exists() {
         consent(
@@ -254,12 +254,12 @@ pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
     .map_err(setup_failure)?;
     pin_binary(&data)?;
     registration.plan(&shown, Some(&agreed))?;
-    registration.finish(scheduler, claude::apply_with_backup)?;
+    registration.finish(scheduler, true)?;
     offer_orchestrators(&data)
 }
 // Asked before the settings are read: the copy holds them as they were before
 // an interrupted write.
-fn offer_restore(settings: &Path) -> Result<()> {
+fn offer_restore(data: &Path, settings: &Path) -> Result<()> {
     let backup = claude::backup(settings);
     if fs::symlink_metadata(&backup).is_err() {
         return Ok(());
@@ -272,12 +272,48 @@ fn offer_restore(settings: &Path) -> Result<()> {
     match consent(false, "Restore the copy? It replaces the current file.") {
         Ok(()) => {
             claude::restore(settings)?;
+            // The file is now the one that run's plan was made from, so its
+            // registration ends here rather than waiting for a later uninstall.
+            if let Some((plan, written)) = interrupted(data)?
+                && written == settings
+            {
+                claude::remove(&plan)?;
+            }
             println!("Restored {}.", settings.display());
             Ok(())
         }
         Err(error) if error.to_string() == "consent_declined" => Err("backup_kept".into()),
         Err(error) => Err(error),
     }
+}
+// The newest plan whose registration began and was not removed, with its
+// settings file. Only a setup that stopped before saving the install record
+// leaves one that no record names.
+fn interrupted(data: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+    let entries = match fs::read_dir(data.join("plans")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        entries => entries?,
+    };
+    let mut plans = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let nanos = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+            .and_then(|n| n.rsplit_once('-'))
+            .and_then(|(_, n)| n.parse::<u128>().ok());
+        if let Some(nanos) = nanos {
+            plans.push((nanos, path));
+        }
+    }
+    plans.sort_unstable_by(|a, b| b.cmp(a));
+    for (_, plan) in plans {
+        if let Some(settings) = claude::started(&plan)? {
+            return Ok(Some((plan, settings)));
+        }
+    }
+    Ok(None)
 }
 fn revoked(data: &Path) -> bool {
     pairing::revoked(&connection(data).join("outbox"))
@@ -335,9 +371,16 @@ impl<'a> Registration<'a> {
         }
         Ok(())
     }
-    fn finish(&self, scheduler: &Scheduler<'_>, write: fn(&Path) -> Result<()>) -> Result<()> {
+    // With a backup, setup keeps the copy until the install record names the
+    // write: a run killed in between leaves the copy, and the next setup offers it.
+    fn finish(&self, scheduler: &Scheduler<'_>, backup: bool) -> Result<()> {
         let (data, exe, plan) = (self.data, self.exe, &self.plan);
-        write(plan)?;
+        if backup {
+            claude::apply_with_backup(plan)?;
+        } else {
+            claude::apply(plan)?;
+        }
+        pause("hooks_written");
         if self.vendor == Vendor::Codex {
             println!(
                 "Codex: review and trust these exact definitions in /hooks before capture can run. An upgrade changes definitions and requires review again. Stock runtime qualification is unverified."
@@ -347,6 +390,9 @@ impl<'a> Registration<'a> {
             &data.join(RECORD),
             &json!({"version": VERSION, "executable": exe, "plan": plan, "settings": self.settings}),
         )?;
+        if backup {
+            claude::discard_backup(self.settings)?;
+        }
         scheduler.enable(exe, &connection(data), self.vendor)?;
         self_test(exe, plan, &connection(data).join("outbox"), self.vendor)?;
         let job = match scheduler.os {
@@ -357,6 +403,19 @@ impl<'a> Registration<'a> {
             "Self-test passed: the installed hook recorded a local test event that is never uploaded.\n{job} syncs every 2 minutes. Run `devdiary doctor` (add `--vendor codex` for Codex) to check it."
         );
         Ok(())
+    }
+}
+
+// Debug builds wait here when a test names the stage, so it can kill setup at
+// that exact point. Release builds never read the variable.
+fn pause(stage: &str) {
+    if cfg!(debug_assertions)
+        && std::env::var_os("DEVDIARY_DEBUG_PAUSE_AT").is_some_and(|s| s == stage)
+    {
+        eprintln!("paused at {stage}");
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 }
 
@@ -414,7 +473,7 @@ pub fn upgrade(yes: bool, scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<(
     claude::remove(&old.plan)?;
     pin_binary(&data)?;
     registration.plan(&shown, None)?;
-    registration.finish(scheduler, claude::apply)?;
+    registration.finish(scheduler, false)?;
     offer_orchestrators(&data)
 }
 
@@ -521,18 +580,32 @@ pub fn approve_orchestrators(root: Option<&Path>, vendor: Vendor) -> Result<()> 
 pub fn uninstall(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {
     let data = data_dir(vendor)?;
     let old = record(&data)?;
+    let left = match old {
+        None => interrupted(&data)?,
+        Some(_) => None,
+    };
     let timer = scheduler.disable(vendor);
     if let Some(old) = &old {
         claude::remove(&old.plan)?;
+        // Setup saves the record, then discards its copy, so a copy may be left.
+        claude::discard_backup(&old.settings)?;
         fs::remove_file(data.join(RECORD))?;
         File::open(&data)?.sync_all()?;
+    }
+    if let Some((plan, settings)) = &left {
+        claude::remove(plan)?;
+        claude::discard_backup(settings)?;
+        println!(
+            "An earlier setup stopped before it saved its install record. Its hook entries are removed from {}.",
+            settings.display()
+        );
     }
     let units = timer?;
     let (job, stopped) = match scheduler.os {
         Os::Linux => ("sync timer", "disabled"),
         Os::Macos => ("launch agent", "unloaded"),
     };
-    match (old.is_some(), units) {
+    match (old.is_some() || left.is_some(), units) {
         (false, false) => println!("Not installed; nothing changed."),
         (false, true) => {
             println!("Not installed; the leftover {job} was {stopped} and removed.")

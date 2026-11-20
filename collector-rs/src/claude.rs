@@ -634,13 +634,14 @@ fn validate(p: &Object) -> Result<Store> {
     Ok(store)
 }
 /// Setup copies the settings here before it writes them and removes the copy
-/// once the write succeeds, so a copy that is still here marks an interrupted run.
+/// once its install record is saved, so a copy that is still here marks a run
+/// that stopped before uninstall could find its entries.
 pub fn backup(settings_path: &Path) -> PathBuf {
     let mut name = settings_path.as_os_str().to_os_string();
     name.push(".devdiary-backup");
     name.into()
 }
-fn save_backup(settings_path: &Path, raw: &[u8]) -> Result<PathBuf> {
+fn save_backup(settings_path: &Path, raw: &[u8]) -> Result<()> {
     let path = backup(settings_path);
     let mode = fs::metadata(settings_path)?.mode() & 0o777;
     let mut file = OpenOptions::new()
@@ -652,7 +653,29 @@ fn save_backup(settings_path: &Path, raw: &[u8]) -> Result<PathBuf> {
     file.write_all(raw)?;
     file.sync_all()?;
     File::open(settings_path.parent().ok_or("invalid_path")?)?.sync_all()?;
-    Ok(path)
+    Ok(())
+}
+/// Called once the install record names the write, or once the entries of an
+/// interrupted run are removed. A missing copy is not an error.
+pub fn discard_backup(settings_path: &Path) -> Result<()> {
+    match fs::remove_file(backup(settings_path)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    }
+    File::open(settings_path.parent().ok_or("invalid_path")?)?.sync_all()?;
+    Ok(())
+}
+/// The settings file of a registration whose first write began and that is not
+/// removed yet. Setup can stop before any install record names it.
+pub fn started(plan_path: &Path) -> Result<Option<PathBuf>> {
+    if !manifest_path(plan_path).exists() {
+        return Ok(None);
+    }
+    let p = load(plan_path)?;
+    if text(&manifest(plan_path, &p)?, "status")? == "removed" {
+        return Ok(None);
+    }
+    Ok(Some(text(&p, "settings")?.into()))
 }
 /// Puts a left-behind backup back in place of the settings, which removes it.
 pub fn restore(settings_path: &Path) -> Result<()> {
@@ -714,17 +737,11 @@ fn write_hooks(plan_path: &Path, backed_up: bool) -> Result<()> {
     }
     save_manifest(plan_path, &m)?;
     checkpoint("prepared")?;
-    let copy = if backed_up {
-        Some(save_backup(path, &raw)?)
-    } else {
-        None
-    };
+    if backed_up {
+        save_backup(path, &raw)?;
+    }
     replace(path, &bytes, &raw)?;
     checkpoint("applied_settings")?;
-    if let Some(copy) = copy {
-        fs::remove_file(copy)?;
-        File::open(path.parent().ok_or("invalid_path")?)?.sync_all()?;
-    }
     m.insert("status".into(), json!("installed"));
     save_manifest(plan_path, &m)
 }
@@ -774,7 +791,10 @@ pub fn remove(plan_path: &Path) -> Result<()> {
         m.insert("status".into(), json!("removed"));
         return save_manifest(plan_path, &m);
     }
-    if status == "prepared" && hash(&raw) == text(&p, "settings_sha256")? {
+    // The plan was made from settings that held no entry of ours, so the same
+    // bytes now mean nothing is left to remove: the write never happened, or
+    // the backup was restored over it.
+    if ["prepared", "installed"].contains(&status) && hash(&raw) == text(&p, "settings_sha256")? {
         original_presence(&p, &doc)?;
         m.insert("status".into(), json!("removed"));
         return save_manifest(plan_path, &m);
@@ -1412,10 +1432,44 @@ mod recovery_tests {
     }
 
     #[test]
-    fn a_successful_write_removes_its_backup() {
+    fn a_successful_write_keeps_its_backup_until_it_is_discarded() {
         let (dir, plan) = fixture(json!({}));
+        let path = dir.path().join("settings.json");
+        let original = fs::read(&path).unwrap();
         apply_with_backup(&plan).unwrap();
-        assert!(!dir.path().join("settings.json.devdiary-backup").exists());
+        let backup = dir.path().join("settings.json.devdiary-backup");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        discard_backup(&path).unwrap();
+        assert!(!backup.exists());
+        discard_backup(&path).unwrap();
+    }
+
+    #[test]
+    fn a_registration_is_started_from_its_first_write_until_it_is_removed() {
+        let (dir, plan) = fixture(json!({}));
+        let path = dir.path().join("settings.json");
+        assert_eq!(started(&plan).unwrap(), None);
+        INTERRUPT.with(|point| point.set(Some("prepared")));
+        assert!(apply(&plan).is_err());
+        INTERRUPT.with(|point| point.set(None));
+        assert_eq!(started(&plan).unwrap(), Some(path.clone()));
+        apply(&plan).unwrap();
+        assert_eq!(started(&plan).unwrap(), Some(path));
+        remove(&plan).unwrap();
+        assert_eq!(started(&plan).unwrap(), None);
+    }
+
+    #[test]
+    fn an_installed_registration_whose_original_was_restored_is_removed_without_a_write() {
+        let (dir, plan) = fixture(json!({"hooks": {"Stop": []}}));
+        let path = dir.path().join("settings.json");
+        let original = fs::read(&path).unwrap();
+        apply_with_backup(&plan).unwrap();
+        restore(&path).unwrap();
+        remove(&plan).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let p = load(&plan).unwrap();
+        assert_eq!(manifest(&plan, &p).unwrap()["status"], "removed");
     }
 
     #[test]
