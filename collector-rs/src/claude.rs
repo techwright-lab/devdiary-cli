@@ -332,7 +332,14 @@ fn atomic_replace(
 
 /// Plan contains hashes/scope and ownership only, never a settings backup (which
 /// could contain provider secrets). Removal restores the layout `ordered` keeps.
-pub fn plan_for(state: &Path, settings_path: &Path, plan_path: &Path, exe: &Path) -> Result<()> {
+/// With `agreed`, settings whose SHA-256 differs give `stale_plan` before any write.
+pub fn plan_for(
+    state: &Path,
+    settings_path: &Path,
+    plan_path: &Path,
+    exe: &Path,
+    agreed: Option<&str>,
+) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err("linux_only".into());
     }
@@ -348,6 +355,9 @@ pub fn plan_for(state: &Path, settings_path: &Path, plan_path: &Path, exe: &Path
     }
     let _lock = lock(state, false)?;
     let (raw, doc) = registrable(settings_path)?;
+    if agreed.is_some_and(|digest| digest != hash(&raw)) {
+        return Err("stale_plan".into());
+    }
     let store = Store::open(state, None)?;
     if !crate::installation(&store.config) {
         let repo = Path::new(text(&store.config, "repository")?);
@@ -407,11 +417,14 @@ fn preflight_code(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
         _ => e,
     }
 }
-pub fn preflight(settings_path: &Path) -> Result<()> {
+/// The SHA-256 of the settings it checked, so a later plan can prove they are
+/// the ones the person agreed to change.
+pub fn preflight(settings_path: &Path) -> Result<String> {
     registrable(settings_path)
-        .map(|_| ())
+        .map(|(raw, _)| hash(&raw))
         .map_err(preflight_code)
 }
+
 /// The refusals a fresh plan would give once `plan_path`'s entries are gone,
 /// checked before anything is removed.
 pub fn preflight_replacing(plan_path: &Path) -> Result<()> {
@@ -626,7 +639,42 @@ fn validate(p: &Object) -> Result<Store> {
     }
     Ok(store)
 }
+/// Setup copies the settings here before it writes them and removes the copy
+/// once the write succeeds, so a copy that is still here marks an interrupted run.
+pub fn backup(settings_path: &Path) -> PathBuf {
+    let mut name = settings_path.as_os_str().to_os_string();
+    name.push(".devdiary-backup");
+    name.into()
+}
+fn save_backup(settings_path: &Path, raw: &[u8]) -> Result<PathBuf> {
+    let path = backup(settings_path);
+    let mode = fs::metadata(settings_path)?.mode() & 0o777;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    file.write_all(raw)?;
+    file.sync_all()?;
+    File::open(settings_path.parent().ok_or("invalid_path")?)?.sync_all()?;
+    Ok(path)
+}
+/// Puts a left-behind backup back in place of the settings, which removes it.
+pub fn restore(settings_path: &Path) -> Result<()> {
+    let path = backup(settings_path);
+    owner_writable(&path, false)?;
+    fs::rename(&path, settings_path)?;
+    File::open(settings_path.parent().ok_or("invalid_path")?)?.sync_all()?;
+    Ok(())
+}
 pub fn apply(plan_path: &Path) -> Result<()> {
+    write_hooks(plan_path, false)
+}
+pub fn apply_with_backup(plan_path: &Path) -> Result<()> {
+    write_hooks(plan_path, true)
+}
+fn write_hooks(plan_path: &Path, backed_up: bool) -> Result<()> {
     let p = load(plan_path)?;
     let path = Path::new(text(&p, "settings")?);
     let _lock = lock(Path::new(text(&p, "state")?), false)?;
@@ -672,8 +720,17 @@ pub fn apply(plan_path: &Path) -> Result<()> {
     }
     save_manifest(plan_path, &m)?;
     checkpoint("prepared")?;
+    let copy = if backed_up {
+        Some(save_backup(path, &raw)?)
+    } else {
+        None
+    };
     replace(path, &bytes, &raw)?;
     checkpoint("applied_settings")?;
+    if let Some(copy) = copy {
+        fs::remove_file(copy)?;
+        File::open(path.parent().ok_or("invalid_path")?)?.sync_all()?;
+    }
     m.insert("status".into(), json!("installed"));
     save_manifest(plan_path, &m)
 }
@@ -1343,5 +1400,65 @@ mod recovery_tests {
         assert!(remove(&plan).is_err());
         assert_eq!(read(&path).unwrap(), before);
         assert_eq!(read(&manifest_path(&plan)).unwrap(), receipt);
+    }
+
+    #[test]
+    fn an_interrupted_write_leaves_a_backup_of_the_original_with_its_mode() {
+        let (dir, plan) = fixture(json!({"env": {"TOKEN": "secret"}}));
+        let path = dir.path().join("settings.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let original = fs::read(&path).unwrap();
+        INTERRUPT.with(|point| point.set(Some("applied_settings")));
+        assert!(apply_with_backup(&plan).is_err());
+        INTERRUPT.with(|point| point.set(None));
+        let backup = dir.path().join("settings.json.devdiary-backup");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(fs::metadata(&backup).unwrap().mode() & 0o777, 0o640);
+        assert!(!fs::read_to_string(&plan).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn a_successful_write_removes_its_backup() {
+        let (dir, plan) = fixture(json!({}));
+        apply_with_backup(&plan).unwrap();
+        assert!(!dir.path().join("settings.json.devdiary-backup").exists());
+    }
+
+    #[test]
+    fn restoring_puts_the_backup_back_and_removes_it() {
+        let (dir, _) = fixture(json!({}));
+        let path = dir.path().join("settings.json");
+        let backup = dir.path().join("settings.json.devdiary-backup");
+        fs::write(&backup, b"{\"model\":\"before\"}").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o640)).unwrap();
+        restore(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{\"model\":\"before\"}");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn a_type_valid_original_presence_change_is_refused_before_any_write() {
+        for (original, change) in [
+            (
+                json!({"hooks": {"Stop": []}}),
+                json!({"absent_events": EVENTS}),
+            ),
+            (json!({}), json!({"absent_hooks": false})),
+            (json!({"hooks": {}}), json!({"absent_hooks": true})),
+        ] {
+            let (dir, plan) = fixture(original);
+            let path = dir.path().join("settings.json");
+            let before = fs::read(&path).unwrap();
+            let mut p = load(&plan).unwrap();
+            for (key, value) in change.as_object().unwrap() {
+                p.insert(key.clone(), value.clone());
+            }
+            fs::write(&plan, serde_json::to_vec(&p).unwrap()).unwrap();
+            assert!(apply_with_backup(&plan).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(!manifest_path(&plan).exists());
+            assert!(!dir.path().join("settings.json.devdiary-backup").exists());
+        }
     }
 }

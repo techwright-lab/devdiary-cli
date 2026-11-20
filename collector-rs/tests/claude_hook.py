@@ -351,11 +351,11 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
         }
 
     def refused_while_asked(self, edit, code=2):
-        """Edit the new plan or the settings while setup asks; nothing may change."""
+        """Edit the settings while setup asks; nothing more may change."""
         seen = {}
 
         def on_prompt(_):
-            edit(self.newest_plan())
+            edit()
             seen["before"] = self.files()
 
         self.install(code=code, on_prompt=on_prompt)
@@ -399,10 +399,10 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
         )
 
     def test_saved_plan_validation_precedes_all_mutations(self):
-        self.uninstall()
         other = "22222222-2222-4222-8222-222222222222"
         cases = [
             lambda p: dict(p, absent_events="invalid"),
+            lambda p: dict(p, absent_events=list(EVENTS)),
             lambda p: dict(p, absent_events=p["absent_events"] + ["Stop"]),
             lambda p: dict(p, absent_events=p["absent_events"][1:]),
             lambda p: dict(p, absent_events=["Unknown"]),
@@ -437,49 +437,22 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
 
             return edit
 
+        saved = self.plan.read_bytes()
         for index, edit in enumerate(
             [rewrite(c) for c in cases] + [rewrite_raw(c) for c in raw_cases]
         ):
             with self.subTest(case=index):
-                self.refused_while_asked(edit)
-        self.install()
-        original = json.loads(self.plan.read_bytes())
-        # Type-valid receipt metadata and scope edits must also fail after install.
-        for field, value in (
-            ("absent_hooks", True),
-            ("absent_events", list(EVENTS)),
-            ("scope", dict(original["scope"], collector_ref="changed")),
-            ("scope", dict(original["scope"], installation_id=other)),
-        ):
-            self.save(self.plan, dict(original, **{field: value}))
-            # Uninstall disables the timer before it reads the plan.
-            before = self.files(skip={"drops.log"}, units=False)
-            self.run_collector("upgrade", "--yes", env=self.setup_env, code=2)
-            self.uninstall(code=2)
-            self.hook()
-            self.assertEqual(self.files(skip={"drops.log"}, units=False), before)
-        self.save(self.plan, original)
+                edit(self.plan)
+                # Uninstall disables the timer before it reads the plan.
+                before = self.files(skip={"drops.log"}, units=False)
+                self.run_collector("upgrade", "--yes", env=self.setup_env, code=2)
+                self.uninstall(code=2)
+                self.hook()
+                self.assertEqual(self.files(skip={"drops.log"}, units=False), before)
+                self.plan.write_bytes(saved)
         self.uninstall()
         self.uninstall()
         self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
-
-    def test_type_valid_original_presence_mismatch_is_atomic(self):
-        self.uninstall()
-        for original, change in [
-            (self.original, {"absent_events": list(EVENTS)}),
-            ({}, {"absent_hooks": False}),
-            ({"hooks": {}}, {"absent_hooks": True}),
-        ]:
-            with self.subTest(original=original, change=change):
-                self.save(self.settings, original)
-                self.refused_while_asked(
-                    lambda path, change=change: self.save(
-                        path, dict(json.loads(path.read_bytes()), **change)
-                    )
-                )
-                self.install()
-                self.uninstall()
-                self.assertEqual(json.loads(self.settings.read_bytes()), original)
 
     def test_python_reference_parity_and_dedup(self):
         py = self.root / "python"
@@ -800,17 +773,22 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
                 self.setup_then_kill(delay)
                 current = json.loads(self.settings.read_bytes())
                 installed = (self.data / "install.json").exists()
+                backup = self.settings.with_name("settings.json.devdiary-backup")
+                left = backup.exists()
                 if current != self.original:
                     entry = json.loads(self.newest_plan().read_bytes())["entry"]
                     self.assertTrue(
                         all(current["hooks"][e].count(entry) == 1 for e in EVENTS)
                     )
                     # Hooks without an install record could be removed by
-                    # neither setup nor uninstall.
-                    self.assertTrue(installed, "hooks written, no install record")
+                    # neither setup nor uninstall, unless the backup is left.
+                    self.assertTrue(installed or left, "hooks written, no record")
+                if left:
+                    self.assertEqual(json.loads(backup.read_bytes()), self.original)
                 # A retry works both before and after the atomic rename.
                 if not installed:
-                    self.install()
+                    self.install(answers=(b"y\n", b"y\n") if left else (b"y\n",))
+                    self.assertFalse(backup.exists())
                 self.hook()
                 self.uninstall()
                 self.assertEqual(json.loads(self.settings.read_bytes()), self.original)
@@ -868,7 +846,7 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
         self.assertEqual(sorted((self.data / "plans").iterdir()), plans)
         self.settings.write_bytes(original)
         edited = dict(self.original, edit_after_plan=True)
-        self.refused_while_asked(lambda _: self.save(self.settings, edited))
+        self.refused_while_asked(lambda: self.save(self.settings, edited))
         self.assertEqual(json.loads(self.settings.read_bytes()), edited)
 
     def test_full_spool_neutral_without_mutation(self):

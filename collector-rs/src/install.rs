@@ -213,6 +213,7 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     if o.vendor == Vendor::Codex && settings.extension().is_some_and(|e| e == "toml") {
         return Err("codex_hooks_json_required".into());
     }
+    offer_restore(&settings)?;
     // Codex need not have a hooks file yet. Never initialize or rewrite config.toml.
     if o.vendor == Vendor::Codex && !settings.exists() {
         consent(
@@ -229,11 +230,23 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
         crate::store::owner_writable(parent, true)?;
         save_using(&settings, &json!({}), false)?;
     }
-    claude::preflight(&settings)?;
-    private_dir(&data)?;
+    let agreed = claude::preflight(&settings)?;
     if revoked(&data) {
         return Err("connection_revoked".into());
     }
+    // The entries depend only on the pinned path, the plan path and the harness,
+    // so the person agrees to them before a connection exists.
+    let exe = pinned(&data);
+    let registration = Registration::new(&data, &settings, &exe, o.vendor)?;
+    let shown = registration.show()?;
+    consent(
+        false,
+        &format!(
+            "Append these 10 entries and enable the {} user timer?",
+            o.vendor.timer()
+        ),
+    )?;
+    private_dir(&data)?;
     pairing::setup(pairing::Options {
         vendor: o.vendor,
         root: &connection(&data),
@@ -243,22 +256,32 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
         record_orchestrated_outside_repos: o.record_orchestrated_outside_repos,
     })
     .map_err(setup_failure)?;
-    let exe = pin_binary(&data)?;
-    let registration = Registration::new(&data, &settings, &exe, o.vendor)?;
-    registration.plan()?;
-    registration.show()?;
-    if let Err(error) = consent(
-        false,
-        &format!(
-            "Append these 10 entries and enable the {} user timer?",
-            o.vendor.timer()
-        ),
-    ) {
-        let _ = fs::remove_file(&registration.plan);
-        return Err(error);
-    }
-    registration.finish(runner)?;
+    pin_binary(&data)?;
+    registration.plan(&shown, Some(&agreed))?;
+    registration.finish(runner, claude::apply_with_backup)?;
     offer_orchestrators(&data)
+}
+// Asked before the settings are read: the copy holds them as they were before
+// an interrupted write.
+fn offer_restore(settings: &Path) -> Result<()> {
+    let backup = claude::backup(settings);
+    if fs::symlink_metadata(&backup).is_err() {
+        return Ok(());
+    }
+    println!(
+        "An earlier setup stopped while it wrote {}. Its copy of the file from before that run is {}.",
+        settings.display(),
+        backup.display()
+    );
+    match consent(false, "Restore the copy? It replaces the current file.") {
+        Ok(()) => {
+            claude::restore(settings)?;
+            println!("Restored {}.", settings.display());
+            Ok(())
+        }
+        Err(error) if error.to_string() == "consent_declined" => Err("backup_kept".into()),
+        Err(error) => Err(error),
+    }
 }
 fn revoked(data: &Path) -> bool {
     pairing::revoked(&connection(data).join("outbox"))
@@ -281,7 +304,6 @@ struct Registration<'a> {
 impl<'a> Registration<'a> {
     fn new(data: &'a Path, settings: &'a Path, exe: &'a Path, vendor: Vendor) -> Result<Self> {
         let plans = data.join("plans");
-        private_dir(&plans)?;
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let plan = plans.join(format!("{}-{nanos}.json", vendor.slug()));
         Ok(Self {
@@ -292,27 +314,34 @@ impl<'a> Registration<'a> {
             plan,
         })
     }
-    fn show(&self) -> Result<()> {
+    fn show(&self) -> Result<Vec<String>> {
         println!("Hook entries to append to {}:", self.settings.display());
-        for line in claude::entry_lines_for(&self.plan, self.exe, self.vendor)? {
+        let lines = claude::entry_lines_for(&self.plan, self.exe, self.vendor)?;
+        for line in &lines {
             println!("  {line}");
         }
-        Ok(())
+        Ok(lines)
     }
-    // Consent is given to the lines `show` printed, so the saved plan must match them.
-    fn plan(&self) -> Result<()> {
-        pairing::plan_with(&connection(self.data), self.settings, &self.plan, self.exe)?;
-        if claude::entries(&self.plan)?
-            != claude::entry_lines_for(&self.plan, self.exe, self.vendor)?
-        {
+    // Consent is given to the lines `show` printed and, during setup, to the
+    // settings as they were then, so the saved plan must match both.
+    fn plan(&self, shown: &[String], agreed: Option<&str>) -> Result<()> {
+        private_dir(self.plan.parent().ok_or("invalid_path")?)?;
+        pairing::plan_with(
+            &connection(self.data),
+            self.settings,
+            &self.plan,
+            self.exe,
+            agreed,
+        )?;
+        if claude::entries(&self.plan)? != shown {
             let _ = fs::remove_file(&self.plan);
             return Err("stale_plan".into());
         }
         Ok(())
     }
-    fn finish(&self, runner: &dyn Runner) -> Result<()> {
+    fn finish(&self, runner: &dyn Runner, write: fn(&Path) -> Result<()>) -> Result<()> {
         let (data, exe, plan) = (self.data, self.exe, &self.plan);
-        claude::apply(plan)?;
+        write(plan)?;
         if self.vendor == Vendor::Codex {
             println!(
                 "Codex: review and trust these exact definitions in /hooks before capture can run. An upgrade changes definitions and requires review again. Stock runtime qualification is unverified."
@@ -378,7 +407,7 @@ pub fn upgrade(yes: bool, runner: &dyn Runner, vendor: Vendor) -> Result<()> {
     claude::preflight_replacing(&old.plan)?;
     let exe = pinned(&data);
     let registration = Registration::new(&data, &old.settings, &exe, vendor)?;
-    registration.show()?;
+    let shown = registration.show()?;
     consent(
         yes,
         &format!(
@@ -388,8 +417,8 @@ pub fn upgrade(yes: bool, runner: &dyn Runner, vendor: Vendor) -> Result<()> {
     )?;
     claude::remove(&old.plan)?;
     pin_binary(&data)?;
-    registration.plan()?;
-    registration.finish(runner)?;
+    registration.plan(&shown, None)?;
+    registration.finish(runner, claude::apply)?;
     offer_orchestrators(&data)
 }
 
