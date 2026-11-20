@@ -1,4 +1,5 @@
 //! A user timer delivers the spool; the hook itself never performs HTTP.
+pub use crate::scheduler::Runner;
 use crate::{Result, vendor::Vendor};
 use std::{
     fs::{self, File, OpenOptions},
@@ -11,9 +12,6 @@ use std::{
 pub const SERVICE: &str = "devdiary-claude-sync.service";
 pub const TIMER: &str = "devdiary-claude-sync.timer";
 
-pub trait Runner {
-    fn run(&self, args: &[&str]) -> Result<(bool, String)>;
-}
 pub struct Systemctl;
 impl Runner for Systemctl {
     fn run(&self, args: &[&str]) -> Result<(bool, String)> {
@@ -44,6 +42,14 @@ fn program() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| cfg!(debug_assertions) && p.is_absolute());
     fake.or_else(|| SYSTEMCTL.iter().map(PathBuf::from).find(|p| p.is_file()))
+}
+
+/// The user manager answers only inside a systemd user session.
+pub fn reachable(runner: &dyn Runner) -> Result<()> {
+    match runner.run(&["show-environment"]) {
+        Ok((true, _)) => Ok(()),
+        _ => Err("scheduler_unreachable".into()),
+    }
 }
 
 pub fn unit_dir() -> Result<PathBuf> {
@@ -82,7 +88,7 @@ fn timer_for(vendor: Vendor) -> String {
     )
 }
 
-fn write(dir: &Path, name: &str, body: &str) -> Result<()> {
+pub(crate) fn write(dir: &Path, name: &str, body: &str) -> Result<()> {
     let temporary = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
@@ -209,8 +215,29 @@ mod tests {
     }
 
     #[test]
+    fn a_session_without_a_user_manager_is_unreachable() {
+        let runner = Recorder(Default::default());
+        reachable(&runner).unwrap();
+        assert_eq!(*runner.0.borrow(), ["show-environment"]);
+        assert_eq!(
+            reachable(&NoBus).unwrap_err().to_string(),
+            "scheduler_unreachable"
+        );
+        struct Refused;
+        impl Runner for Refused {
+            fn run(&self, _: &[&str]) -> crate::Result<(bool, String)> {
+                Ok((false, String::new()))
+            }
+        }
+        assert_eq!(
+            reachable(&Refused).unwrap_err().to_string(),
+            "scheduler_unreachable"
+        );
+    }
+
+    #[test]
     fn disable_without_a_user_bus_still_removes_the_units() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         for name in [SERVICE, TIMER] {
             fs::write(dir.path().join(name), "").unwrap();
         }
@@ -222,7 +249,7 @@ mod tests {
 
     #[test]
     fn enable_writes_units_before_enabling_and_disable_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let units = dir.path().join("systemd/user");
         let runner = Recorder(Default::default());
         enable(

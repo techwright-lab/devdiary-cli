@@ -69,10 +69,27 @@ impl Vendor {
             Self::Codex => "devdiary-codex-sync.service",
         }
     }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "me.devdiary.claude-sync",
+            Self::Codex => "me.devdiary.codex-sync",
+        }
+    }
     pub fn timer(self) -> &'static str {
         match self {
             Self::Claude => crate::systemd::TIMER,
             Self::Codex => "devdiary-codex-sync.timer",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_harness_has_its_own_launchd_label() {
+        assert_eq!(Vendor::Claude.label(), "me.devdiary.claude-sync");
+        assert_eq!(Vendor::Codex.label(), "me.devdiary.codex-sync");
     }
 }

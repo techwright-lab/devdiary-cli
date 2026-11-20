@@ -84,13 +84,18 @@ struct Fixture {
     _dir: tempfile::TempDir,
     state: PathBuf,
 }
+// macOS puts the temp folder under the `/var` symlink, which the
+// symlink-ancestor rule refuses, so fixtures start from its canonical path.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+}
 const TOKEN: &str = "dc_live_SYNTHETIC_ONLY";
 fn sync(state: &Path, limit: usize) -> (i64, i64) {
     let report = sync_report(state, TOKEN, limit, None).unwrap();
     (report.pending, report.delivered)
 }
 fn fixture(port: u16) -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let state = dir.path().join("state");
     std::fs::create_dir(&state).unwrap();
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();

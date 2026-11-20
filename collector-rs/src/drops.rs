@@ -173,7 +173,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn spool() -> (tempfile::TempDir, std::path::PathBuf, Store) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let state = dir.path().join("state");
         fs::create_dir(&state).unwrap();

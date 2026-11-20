@@ -18,6 +18,11 @@ const OFFER_REFUSED: &str = "scope_refresh_offer_refused";
 const EMPTY_OFFER: &str = r#"{"orchestrators":[],"refused":0}"#;
 const NEW_REFS: &str = "[\"https://github.com/acme/new\"]";
 
+// macOS puts the temp folder under the `/var` symlink, which the
+// symlink-ancestor rule refuses, so fixtures start from its canonical path.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+}
 fn refresh(status: u16, body: Value, want: Want) {
     refresh_raw(status, body.to_string(), want);
 }
@@ -55,6 +60,8 @@ fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize
                 Err(e) => panic!("{e}"),
             }
         };
+        // macOS hands the accepted socket the listener's non-blocking mode.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -73,7 +80,7 @@ fn refresh_over(saved: &str, status: u16, raw: String, want: Want, length: usize
         .ok();
     });
     // A saved connection, as pairing leaves it; sync is the timer's path.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path();
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     let origin = endpoint.trim_end_matches("/ingest/v1/observations");

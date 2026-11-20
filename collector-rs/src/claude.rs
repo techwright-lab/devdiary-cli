@@ -1,4 +1,4 @@
-//! Consented Linux command hooks selected by immutable harness scope.
+//! Consented command hooks selected by immutable harness scope.
 //! The module name remains compatible with the original Claude control API.
 //! Raw input is never persisted or logged.
 //! Registration uses an atomic settings replacement and a private hash-only
@@ -84,10 +84,10 @@ fn executable(path: &Path) -> Result<(String, String)> {
     if m.mode() & 0o100 == 0 || m.len() > 128 * 1024 * 1024 {
         return Err("untrusted_executable".into());
     }
-    // Native Linux executable, not an interpreter or package-manager shim.
+    // This build's native format, not an interpreter or package-manager shim.
     let mut magic = [0; 4];
     f.read_exact(&mut magic)?;
-    if magic != *b"\x7fELF" {
+    if !crate::platform::native_format(std::env::consts::OS, magic) {
         return Err("native_executable_required".into());
     }
     let mut digest = Sha256::new();
@@ -340,9 +340,6 @@ pub fn plan_for(
     exe: &Path,
     agreed: Option<&str>,
 ) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        return Err("linux_only".into());
-    }
     private(plan_path.parent().ok_or("invalid_path")?, true)?;
     if !plan_path.is_absolute() || plan_path.exists() {
         return Err("new_absolute_plan_required".into());
@@ -628,9 +625,6 @@ fn checkpoint(_stage: &'static str) -> Result<()> {
     Ok(())
 }
 fn validate(p: &Object) -> Result<Store> {
-    if !cfg!(target_os = "linux") {
-        return Err("linux_only".into());
-    }
     let state = Path::new(text(p, "state")?);
     verify_executable(p, state)?;
     let store = Store::open(state, None)?;
@@ -1259,7 +1253,7 @@ mod recovery_tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn fixture(original: Value) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir();
         let root = dir.path();
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         let state = root.join("state");
