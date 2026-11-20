@@ -1,9 +1,10 @@
-//! One-command install: pair, pin a versioned binary, register the hooks only
-//! after consent, then deliver the spool from a systemd user timer.
+//! One-command install: check the machine, pair, pin a versioned binary,
+//! register the hooks only after consent, then deliver the spool from the
+//! scheduler: a systemd user timer on Linux, a launchd agent on macOS.
 use crate::{
-    Object, Result, claude, drops, object, orchestrators, pairing,
+    Object, Result, claude, drops, object, orchestrators, pairing, platform,
+    scheduler::{Os, Scheduler},
     store::{Report, Store, private},
-    systemd::{self, Runner},
     text,
     vendor::Vendor,
 };
@@ -191,9 +192,10 @@ fn warn_other_on_path() {
         );
     }
 }
-pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
+pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
     warn_other_on_path();
     require_consent_channel(false)?;
+    platform::preflight(scheduler)?;
     let data = data_dir(o.vendor)?;
     let settings = match o.settings {
         Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -239,13 +241,7 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     let exe = pinned(&data);
     let registration = Registration::new(&data, &settings, &exe, o.vendor)?;
     let shown = registration.show()?;
-    consent(
-        false,
-        &format!(
-            "Append these 10 entries and enable the {} user timer?",
-            o.vendor.timer()
-        ),
-    )?;
+    consent(false, &start_question(scheduler.os, o.vendor))?;
     private_dir(&data)?;
     pairing::setup(pairing::Options {
         vendor: o.vendor,
@@ -258,7 +254,7 @@ pub fn setup(o: Options<'_>, runner: &dyn Runner) -> Result<()> {
     .map_err(setup_failure)?;
     pin_binary(&data)?;
     registration.plan(&shown, Some(&agreed))?;
-    registration.finish(runner, claude::apply_with_backup)?;
+    registration.finish(scheduler, claude::apply_with_backup)?;
     offer_orchestrators(&data)
 }
 // Asked before the settings are read: the copy holds them as they were before
@@ -339,7 +335,7 @@ impl<'a> Registration<'a> {
         }
         Ok(())
     }
-    fn finish(&self, runner: &dyn Runner, write: fn(&Path) -> Result<()>) -> Result<()> {
+    fn finish(&self, scheduler: &Scheduler<'_>, write: fn(&Path) -> Result<()>) -> Result<()> {
         let (data, exe, plan) = (self.data, self.exe, &self.plan);
         write(plan)?;
         if self.vendor == Vendor::Codex {
@@ -351,16 +347,14 @@ impl<'a> Registration<'a> {
             &data.join(RECORD),
             &json!({"version": VERSION, "executable": exe, "plan": plan, "settings": self.settings}),
         )?;
-        systemd::enable_for(
-            runner,
-            &systemd::unit_dir()?,
-            exe,
-            &connection(data),
-            self.vendor,
-        )?;
+        scheduler.enable(exe, &connection(data), self.vendor)?;
         self_test(exe, plan, &connection(data).join("outbox"), self.vendor)?;
+        let job = match scheduler.os {
+            Os::Linux => "The timer",
+            Os::Macos => "The launch agent",
+        };
         println!(
-            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\nThe timer syncs every 2 minutes. Run `devdiary doctor` (add `--vendor codex` for Codex) to check it."
+            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\n{job} syncs every 2 minutes. Run `devdiary doctor` (add `--vendor codex` for Codex) to check it."
         );
         Ok(())
     }
@@ -397,8 +391,10 @@ fn self_test(exe: &Path, plan: &Path, outbox: &Path, vendor: Vendor) -> Result<(
 
 // The live hooks run the pinned path, so it is overwritten only after consent and
 // removal. The old record stays until replaced, so uninstall still works on failure.
-pub fn upgrade(yes: bool, runner: &dyn Runner, vendor: Vendor) -> Result<()> {
+pub fn upgrade(yes: bool, scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {
     require_consent_channel(yes)?;
+    // The old hooks are removed before the scheduler reloads, so check first.
+    platform::preflight(scheduler)?;
     let data = data_dir(vendor)?;
     let old = record(&data)?.ok_or("not_installed")?;
     if revoked(&data) {
@@ -418,7 +414,7 @@ pub fn upgrade(yes: bool, runner: &dyn Runner, vendor: Vendor) -> Result<()> {
     claude::remove(&old.plan)?;
     pin_binary(&data)?;
     registration.plan(&shown, None)?;
-    registration.finish(runner, claude::apply)?;
+    registration.finish(scheduler, claude::apply)?;
     offer_orchestrators(&data)
 }
 
@@ -522,23 +518,27 @@ pub fn approve_orchestrators(root: Option<&Path>, vendor: Vendor) -> Result<()> 
     ask_orchestrators(&outbox)
 }
 
-pub fn uninstall(runner: &dyn Runner, vendor: Vendor) -> Result<()> {
+pub fn uninstall(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {
     let data = data_dir(vendor)?;
     let old = record(&data)?;
-    let timer = systemd::disable_for(runner, &systemd::unit_dir()?, vendor);
+    let timer = scheduler.disable(vendor);
     if let Some(old) = &old {
         claude::remove(&old.plan)?;
         fs::remove_file(data.join(RECORD))?;
         File::open(&data)?.sync_all()?;
     }
     let units = timer?;
+    let (job, stopped) = match scheduler.os {
+        Os::Linux => ("sync timer", "disabled"),
+        Os::Macos => ("launch agent", "unloaded"),
+    };
     match (old.is_some(), units) {
         (false, false) => println!("Not installed; nothing changed."),
         (false, true) => {
-            println!("Not installed; the leftover sync timer was disabled and removed.")
+            println!("Not installed; the leftover {job} was {stopped} and removed.")
         }
         (true, _) => println!(
-            "Hooks removed and the sync timer disabled. The connection and any pending rows stay in {}; revoke the connection in the browser to retire its credential.",
+            "Hooks removed and the {job} {stopped}. The connection and any pending rows stay in {}; revoke the connection in the browser to retire its credential.",
             connection(&data).display()
         ),
     }
@@ -551,12 +551,12 @@ pub enum Doctor {
     Reported,
     CheckFailed,
 }
-pub fn doctor(runner: &dyn Runner, vendor: Vendor) -> Result<Doctor> {
+pub fn doctor(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Doctor> {
     let data = data_dir(vendor)?;
     let Some(current) = record(&data)? else {
         println!(
             "{}",
-            json!({"installed": false, "timer": systemd::state_for(runner, vendor)})
+            json!({"installed": false, "timer": scheduler.state(vendor)})
         );
         return Ok(Doctor::Reported);
     };
@@ -590,7 +590,7 @@ pub fn doctor(runner: &dyn Runner, vendor: Vendor) -> Result<Doctor> {
             "runtime_qualification": "unverified",
             "version": current.version,
             "registration": registration,
-            "timer": systemd::state_for(runner, vendor),
+            "timer": scheduler.state(vendor),
             "pending": pending,
             "delivered": delivered,
             "drops": drops::counts(&store, &outbox)?,
@@ -599,7 +599,8 @@ pub fn doctor(runner: &dyn Runner, vendor: Vendor) -> Result<Doctor> {
             "revoked": connection(&data).join("revoked").exists(),
             "last_scope_refresh_error": store.scope_refresh_failure()?,
             "last_receipt": receipt,
-            "last_sync_error": status.and_then(|s| s.get("last_sync_error").cloned()),
+            "last_sync_error": status.as_ref().and_then(|s| s.get("last_sync_error").cloned()),
+            "last_sync_at": last_sync_at(status),
         })
     );
     Ok(match unreadable {
@@ -609,6 +610,25 @@ pub fn doctor(runner: &dyn Runner, vendor: Vendor) -> Result<Doctor> {
         }
         None => Doctor::Reported,
     })
+}
+
+fn start_question(os: Os, vendor: Vendor) -> String {
+    match os {
+        Os::Linux => format!(
+            "Append these 10 entries and enable the {} user timer?",
+            vendor.timer()
+        ),
+        Os::Macos => format!(
+            "macOS will show a background-item notification and list the {} agent under Login Items. Switching it off there stops delivery.\nAppend these 10 entries and load the launch agent?",
+            vendor.label()
+        ),
+    }
+}
+// Each sync run writes its time to the status file, whatever the scheduler.
+fn last_sync_at(status: Option<Object>) -> Option<String> {
+    let at = status?.get("at")?.as_i64()?;
+    let at = chrono::DateTime::from_timestamp(at, 0)?;
+    Some(at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 // Codes only: errors from lower layers can carry paths or server text.
@@ -689,6 +709,39 @@ fn drain(mut batch: impl FnMut(usize) -> Result<Report>) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_macos_the_question_names_the_login_item_and_what_switching_it_off_does() {
+        let question = start_question(Os::Macos, Vendor::Codex);
+        for part in [
+            "background-item notification",
+            "Login Items",
+            "Switching it off there stops delivery",
+            "me.devdiary.codex-sync",
+        ] {
+            assert!(question.contains(part), "{part}");
+        }
+        assert!(question.ends_with('?'));
+    }
+
+    #[test]
+    fn on_linux_the_question_names_the_user_timer() {
+        assert_eq!(
+            start_question(Os::Linux, Vendor::Claude),
+            "Append these 10 entries and enable the devdiary-claude-sync.timer user timer?"
+        );
+    }
+
+    #[test]
+    fn the_last_sync_time_comes_from_the_sync_status_file() {
+        let status = |v: Value| Some(object(&serde_json::to_vec(&v).unwrap()).unwrap());
+        assert_eq!(
+            last_sync_at(status(json!({"at": 86400, "last_sync_error": null}))).as_deref(),
+            Some("1970-01-02T00:00:00Z")
+        );
+        assert_eq!(last_sync_at(status(json!({"last_sync_error": null}))), None);
+        assert_eq!(last_sync_at(None), None);
+    }
 
     fn report(pending: i64, attempted: usize, refused: usize) -> Report {
         Report {
