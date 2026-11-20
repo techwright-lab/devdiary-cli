@@ -120,11 +120,12 @@ fn setup_options(
     }
     Ok(o)
 }
-fn run() -> Result<()> {
+/// The exit status: 0, or 1 when doctor printed its report and a check failed.
+fn run() -> Result<i32> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() == 2 && args[1] == "--help" {
         println!("{HELP}");
-        return Ok(());
+        return Ok(0);
     }
     let mut rest = args[2.min(args.len())..].to_vec();
     let mut vendor = devdiary::vendor::Vendor::Claude;
@@ -142,7 +143,12 @@ fn run() -> Result<()> {
             install::upgrade(!rest.is_empty(), &Systemctl, vendor)
         }
         Some("uninstall") if rest.is_empty() => install::uninstall(&Systemctl, vendor),
-        Some("doctor") if rest.is_empty() => install::doctor(&Systemctl, vendor),
+        Some("doctor") if rest.is_empty() => {
+            return install::doctor(&Systemctl, vendor).map(|outcome| match outcome {
+                install::Doctor::Reported => 0,
+                install::Doctor::CheckFailed => 1,
+            });
+        }
         Some("sync") => match args.get(2..).unwrap_or_default() {
             [] => install::sync_all(),
             [dir] if dir.starts_with('/') => install::timer_sync(Path::new(dir)),
@@ -162,12 +168,14 @@ fn run() -> Result<()> {
         },
         _ => Err("invalid_command".into()),
     }
+    .map(|()| 0)
 }
 const HELP: &str = "devdiary records your coding-agent sessions and sends them to DevDiary.
 Harness selector: --vendor claude|codex on setup, upgrade, doctor, uninstall, outside-repos and orchestrators approve. Claude is the default. Codex hooks must be reviewed in /hooks; runtime qualification is unverified.
 setup [--settings SETTINGS] [--record-orchestrated-outside-repos]
   Pairs this machine, pins this binary under ~/.local/share/devdiary/cli/HARNESS/VERSION, asks in the terminal before appending the selected harness hook entries, then enables a systemd user timer that syncs every 2 minutes.
 doctor
+  Exits 1 after its report when a settings file is not valid JSON.
 sync (sends every installed harness now)
 upgrade [--yes]
   --yes never approves orchestrator names.
@@ -229,7 +237,7 @@ fn main() {
     }
     // Never print input, SQL, key paths/contents, URLs or server error bodies.
     let code = match run() {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(error) => {
             let code = error.to_string();
             if let Some(code) = REPORTED.iter().find(|c| **c == code) {
