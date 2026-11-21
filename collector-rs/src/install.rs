@@ -243,9 +243,12 @@ pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
     let shown = registration.show()?;
     consent(false, &start_question(scheduler.os, o.vendor))?;
     private_dir(&data)?;
+    let root = connection(&data);
     pairing::setup(pairing::Options {
-        vendor: o.vendor,
-        root: &connection(&data),
+        harnesses: &[pairing::Harness {
+            vendor: o.vendor,
+            root: &root,
+        }],
         origin,
         trust_origin: o.trust_origin,
         browser: o.browser,

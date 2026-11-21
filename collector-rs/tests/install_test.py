@@ -21,6 +21,7 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pairing_server
 import terminal
 
 CRATE = Path(__file__).resolve().parents[1]
@@ -178,15 +179,13 @@ class InstallTest(unittest.TestCase):
         self.settings.chmod(0o644)
         self.data = self.home / ".local/share/devdiary/cli/claude"
         self.codex_data = self.home / ".local/share/devdiary/cli/codex"
-        self.runtime = "claude-code"
-        self.requested_runtime = None
         self.received_raw = []
         self.received = []
         self.observation_status = 201
         self.orchestrators = None
         self.scope_status = 200
-        self.starts = 0
-        self.on_exchange = None
+        self.contract = pairing_server.Contract()
+        contract = self.contract
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -215,46 +214,10 @@ class InstallTest(unittest.TestCase):
                 self.reply(200, reply)
 
             def do_POST(self):
+                if contract.handle(self):
+                    return
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
                 data = json.loads(raw)
-                if self.path.endswith("/collector_pairings"):
-                    owner.starts += 1
-                    owner.installation = data["installation_id"]
-                    owner.requested_runtime = data["runtime"]
-                    return self.reply(
-                        201,
-                        {
-                            "schema_version": 1,
-                            "pairing_token": "dp_pair_" + "p" * 43,
-                            "user_code": "a" * 32,
-                            "verification_path": "/settings/collector",
-                            "interval": 5,
-                            "expires_at": time.strftime(
-                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60)
-                            ),
-                        },
-                    )
-                if self.path.endswith("/exchange"):
-                    if owner.on_exchange is not None:
-                        owner.on_exchange()
-                    return self.reply(
-                        200,
-                        {
-                            "schema_version": 1,
-                            "status": "consumed",
-                            "connection": {
-                                "collector_ref": COLLECTOR_REF,
-                                "token": "dc_live_" + "s" * 43,
-                                "installation_id": owner.installation,
-                                "runtime": owner.runtime,
-                                "endpoint_path": "/ingest/v1/observations",
-                                "scope_kind": "installation",
-                                "scope_path": "/ingest/v1/collector/scope",
-                                "repository_refs": ["https://github.com/acme/demo"],
-                                "observation_schema_versions": [1, 2],
-                            },
-                        },
-                    )
                 owner.received_raw.append(raw)
                 owner.received.append(data)
                 if owner.observation_status != 201:
@@ -322,7 +285,6 @@ class InstallTest(unittest.TestCase):
         return subprocess.CompletedProcess(args, status, out, err)
 
     def test_codex_uses_its_active_configuration_home(self):
-        self.runtime = "codex"
         custom = self.home / "control-plane-codex"
         env = {**self.env(), "CODEX_HOME": str(custom)}
         self.install("--vendor", "codex", env=env, answers=(b"y\n", b"y\n"))
@@ -330,7 +292,6 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.home / ".codex/hooks.json").exists())
 
     def test_codex_can_add_hooks_to_an_existing_owner_writable_config_directory(self):
-        self.runtime = "codex"
         directory = self.home / ".codex"
         directory.mkdir(mode=0o755)
         (directory / "config.toml").write_text('model = "fixture"\n')
@@ -339,7 +300,6 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((directory / "config.toml").read_text(), 'model = "fixture"\n')
 
     def test_codex_creation_preserves_a_file_added_during_consent(self):
-        self.runtime = "codex"
         self.settings = self.home / ".codex/hooks.json"
         self.settings.parent.mkdir(mode=0o700)
         added = b'{"hooks":{"Stop":[]},"description":"concurrent-owner-edit"}'
@@ -350,7 +310,6 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.settings.read_bytes(), added)
 
     def test_declining_codex_setup_does_not_create_hooks_file(self):
-        self.runtime = "codex"
         code, _, err = self.converse(self.install_args("--vendor", "codex"), [b"n\n"])
         self.assertEqual(code, 2, err)
         self.assertFalse((self.home / ".codex/hooks.json").exists())
@@ -361,14 +320,13 @@ class InstallTest(unittest.TestCase):
         claude_settings = self.settings.read_bytes()
         claude_service = self.scheduler.files("claude")[0]
         original_service = claude_service.read_bytes()
-        self.runtime = "codex"
         settings = self.home / ".codex/hooks.json"
         settings.parent.mkdir()
         settings.write_text(
             '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}}'
         )
         self.install("--vendor", "codex", answers=(b"y\n", b"y\n"))
-        self.assertEqual(self.requested_runtime, "codex")
+        self.assertEqual(self.contract.starts()[-1]["harnesses"], ["codex"])
         self.assertEqual(self.settings.read_bytes(), claude_settings)
         self.assertEqual(claude_service.read_bytes(), original_service)
         hooks = json.loads(settings.read_bytes())["hooks"]
@@ -536,7 +494,7 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"scheduler_unreachable", result.stderr)
         self.assertIn(b"Nothing was sent", result.stderr)
         self.assertNotIn(b"Hook entries", result.stdout)
-        self.assertEqual(self.starts, 0)
+        self.assertEqual(len(self.contract.starts()), 0)
         self.assertFalse(hasattr(self, "installation"))
         self.assertFalse(self.data.exists())
         self.assertEqual(self.settings.read_bytes(), self.original)
@@ -838,7 +796,6 @@ class InstallTest(unittest.TestCase):
     def test_sync_sends_every_installed_harness_now(self):
         self.install()
         self.spool(2)
-        self.runtime = "codex"
         self.install("--vendor", "codex", answers=(b"y\n", b"y\n"))
         claude, self.data = self.data, self.codex_data
         self.spool(1, vendor="codex")
@@ -1202,14 +1159,16 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"consent_declined", err)
         self.assertIn(str(self.settings).encode(), self.seen)
         self.assertEqual(self.seen.count(b" hook claude "), len(EVENTS))
-        self.assertEqual(self.starts, 0)
+        self.assertEqual(len(self.contract.starts()), 0)
         self.assertFalse(self.data.exists())
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertEqual(self.scheduler.changes(), [])
 
     def test_settings_edited_after_consent_give_stale_plan_and_write_nothing(self):
         edited = self.original.replace(b'"opus"', b'"sonnet"')
-        self.on_exchange = lambda: self.settings.write_bytes(edited)
+        self.contract.on_exchange = lambda request, body: self.settings.write_bytes(
+            edited
+        )
         result = self.install(code=2)
         self.assertIn(b"stale_plan", result.stderr)
         self.assertEqual(self.settings.read_bytes(), edited)
@@ -1220,11 +1179,13 @@ class InstallTest(unittest.TestCase):
 
     def test_a_run_stopped_after_pairing_reuses_the_connection_and_asks_again(self):
         edited = self.original.replace(b'"opus"', b'"sonnet"')
-        self.on_exchange = lambda: self.settings.write_bytes(edited)
+        self.contract.on_exchange = lambda request, body: self.settings.write_bytes(
+            edited
+        )
         self.install(code=2)
-        self.on_exchange = None
+        self.contract.on_exchange = None
         out = self.install().stdout
-        self.assertEqual(self.starts, 1)
+        self.assertEqual(len(self.contract.starts()), 1)
         self.assertEqual(out.count(b" hook claude "), len(EVENTS))
         self.assertEqual(
             sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
@@ -1240,7 +1201,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.settings.read_bytes(), before)
         self.assertEqual(self.settings.stat().st_mode & 0o777, 0o640)
         self.assertFalse(self.backup().exists())
-        self.assertEqual(self.starts, 0)
+        self.assertEqual(len(self.contract.starts()), 0)
 
     def test_a_left_backup_kept_on_no_stops_with_backup_kept(self):
         self.backup().write_bytes(b'{"model": "before"}')
@@ -1249,7 +1210,7 @@ class InstallTest(unittest.TestCase):
         self.assertIn(str(self.backup()).encode(), result.stdout)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertEqual(self.backup().read_bytes(), b'{"model": "before"}')
-        self.assertEqual(self.starts, 0)
+        self.assertEqual(len(self.contract.starts()), 0)
         self.assertFalse(self.data.exists())
 
     def test_consent_on_a_tty_installs_then_enables(self):

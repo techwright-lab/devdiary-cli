@@ -2,11 +2,13 @@
 #[cfg(not(unix))]
 compile_error!("This experimental collector currently requires Unix private-file semantics");
 
+mod callback;
 pub mod checkout;
 pub mod claude;
 pub mod drops;
 pub mod install;
 pub mod launchd;
+mod machine;
 pub mod orchestrators;
 mod ordered;
 pub mod outside;

@@ -9,10 +9,13 @@ import time
 PROMPT = b"[y/N]"
 
 
-def answering(args, env, answers=(b"y\n",), later=b"n\n", timeout=40, on_prompt=None):
+def answering(
+    args, env, answers=(b"y\n",), later=b"n\n", timeout=40, on_prompt=None, typing=None
+):
     """Answer each question in turn; questions past `answers` get `later`.
 
     `on_prompt(index)` runs while the command waits for that answer.
+    `typing(stdout so far)` may return bytes to type at any other moment.
 
     Returns (exit status, stdout, stderr, number of questions asked).
     """
@@ -45,6 +48,9 @@ def answering(args, env, answers=(b"y\n",), later=b"n\n", timeout=40, on_prompt=
                     on_prompt(asked)
                 os.write(master, answers[asked] if asked < len(answers) else later)
                 asked += 1
+            typed = typing(out) if typing is not None else None
+            if typed:
+                os.write(master, typed)
         if streams:
             process.kill()
         process.wait(timeout=10)
