@@ -6,7 +6,9 @@
 use crate::{
     MAX_HOOK_INPUT, Object, Result,
     checkout::{self, Checkout},
-    drops, object,
+    drops,
+    exit::Refusal,
+    object,
     orchestrators::{self, Declared},
     ordered::{self, Json},
     reflog::{self, Appended},
@@ -268,17 +270,26 @@ fn vendor(p: &Object) -> Result<Vendor> {
 fn owned_plan(doc: &Object, p: &Object) -> Result<()> {
     let vendor = vendor(p)?;
     let expected = &p["entry"];
+    let file = || Path::new(p.get("settings").and_then(Value::as_str).unwrap_or(""));
     for &event in vendor.events() {
         let hook = doc.get("hooks").and_then(|v| v.get(event));
         if hook.is_none() && vendor.added_later().contains(&event) {
             continue;
         }
-        let items = hook
-            .and_then(Value::as_array)
-            .ok_or("owned_entry_missing")?;
+        let items = hook.and_then(Value::as_array).ok_or_else(|| {
+            Refusal::with(
+                "owned_entry_missing",
+                file(),
+                format!("the {event} hooks that held the DevDiary entry are gone"),
+            )
+        })?;
         let count = items.iter().filter(|e| *e == expected).count();
         if count != 1 && !(count == 0 && vendor.added_later().contains(&event)) {
-            return Err("owned_entry_changed".into());
+            let what = match count {
+                0 => format!("the DevDiary entry for {event} was edited or removed"),
+                n => format!("the DevDiary entry for {event} appears {n} times"),
+            };
+            return Err(Refusal::with("owned_entry_changed", file(), what));
         }
     }
     Ok(())
@@ -353,7 +364,7 @@ pub fn plan_for(
     let _lock = lock(state, false)?;
     let (raw, doc) = registrable(settings_path)?;
     if agreed.is_some_and(|digest| digest != hash(&raw)) {
-        return Err("stale_plan".into());
+        return Err(Refusal::about("stale_plan", settings_path));
     }
     let store = Store::open(state, None)?;
     if !crate::installation(&store.config) {
@@ -365,7 +376,7 @@ pub fn plan_for(
     let (current, digest) = executable(exe)?;
     let vendor = Vendor::from_scope(&store.config)?;
     if vendor == Vendor::Codex && settings_path.extension().is_some_and(|e| e == "toml") {
-        return Err("codex_hooks_json_required".into());
+        return Err(Refusal::about("codex_hooks_json_required", settings_path));
     }
     let expected = entry_for(plan_path, exe.to_str().ok_or("invalid_path")?, vendor)?;
     let absent: Vec<_> = vendor
@@ -389,28 +400,38 @@ pub fn plan_for(
 }
 fn registrable(settings_path: &Path) -> Result<(Vec<u8>, Object)> {
     let (raw, doc) = settings(settings_path)?;
-    refusal(&raw)?;
+    refusal(settings_path, &raw)?;
     Ok((raw, doc))
 }
-fn refusal(raw: &[u8]) -> Result<()> {
+fn refusal(settings_path: &Path, raw: &[u8]) -> Result<()> {
     if String::from_utf8_lossy(raw).contains("observer_hook") {
-        return Err("python_observer_registered".into());
+        return Err(Refusal::about("python_observer_registered", settings_path));
     }
     let text = String::from_utf8_lossy(raw);
     // devdiary-collector wrote these; its install must be removed by its own binary.
     if text.contains(" claude-hook ") || text.contains(" codex-hook ") {
-        return Err("old_collector_registered".into());
+        return Err(Refusal::about("old_collector_registered", settings_path));
     }
     // Do not stack registrations or silently take over another adapter.
     if text.contains(" hook claude ") || text.contains(" hook codex ") {
-        return Err("already_registered".into());
+        return Err(Refusal::about("already_registered", settings_path));
     }
     Ok(())
 }
-fn preflight_code(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
-    match e.downcast_ref::<std::io::Error>() {
-        _ if e.is::<serde_json::Error>() => "invalid_settings".into(),
-        Some(io) if io.kind() == std::io::ErrorKind::NotFound => "settings_missing".into(),
+/// The refusal a person can act on for an unreadable settings file.
+fn preflight_code(
+    settings_path: &Path,
+) -> impl Fn(Box<dyn std::error::Error>) -> Box<dyn std::error::Error> + '_ {
+    move |e| match e.downcast_ref::<std::io::Error>() {
+        _ if e.is::<serde_json::Error>() => UnreadableSettings::of(settings_path, e),
+        _ if e.to_string() == "invalid_hooks" => Refusal::with(
+            "invalid_settings",
+            settings_path,
+            "its \"hooks\" value must be an object whose events each hold a list",
+        ),
+        Some(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            Refusal::about("settings_missing", settings_path)
+        }
         _ => e,
     }
 }
@@ -419,18 +440,19 @@ fn preflight_code(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
 pub fn preflight(settings_path: &Path) -> Result<String> {
     registrable(settings_path)
         .map(|(raw, _)| hash(&raw))
-        .map_err(preflight_code)
+        .map_err(preflight_code(settings_path))
 }
 
 /// The refusals a fresh plan would give once `plan_path`'s entries are gone,
 /// checked before anything is removed.
 pub fn preflight_replacing(plan_path: &Path) -> Result<()> {
     let p = load(plan_path)?;
-    let (raw, doc) = settings(Path::new(text(&p, "settings")?)).map_err(preflight_code)?;
+    let path = Path::new(text(&p, "settings")?);
+    let (raw, doc) = settings(path).map_err(preflight_code(path))?;
     if owned_plan(&doc, &p).is_err() {
-        return refusal(&raw);
+        return refusal(path, &raw);
     }
-    refusal(&without(&p, &raw)?)
+    refusal(path, &without(&p, &raw)?)
 }
 pub fn entries(plan_path: &Path) -> Result<Vec<String>> {
     let p = load(plan_path)?;
@@ -706,7 +728,7 @@ fn write_hooks(plan_path: &Path, backed_up: bool) -> Result<()> {
         return save_manifest(plan_path, &m);
     }
     if hash(&raw) != text(&p, "settings_sha256")? {
-        return Err("stale_plan".into());
+        return Err(Refusal::about("stale_plan", path));
     }
     original_presence(&p, &doc)?;
     validate(&p)?;
@@ -767,6 +789,16 @@ impl UnreadableSettings {
             column: json.column(),
             backup: fs::symlink_metadata(&copy).is_ok().then_some(copy),
         })
+    }
+    pub fn settings(&self) -> &Path {
+        &self.settings
+    }
+    pub fn backup(&self) -> Option<&Path> {
+        self.backup.as_deref()
+    }
+    /// Where the parse failed, as a person reads it.
+    pub fn position(&self) -> String {
+        format!("the error is at line {}, column {}", self.line, self.column)
     }
     pub fn report(&self) -> Value {
         json!({"registration": "settings_unreadable", "settings": self.settings,

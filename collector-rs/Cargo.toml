@@ -8,11 +8,12 @@ publish = false
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls"] }
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
-rustix = { version = "1.1.6", features = ["process", "fs", "event", "system"] }
+rustix = { version = "1.1.6", features = ["process", "fs", "event", "system", "termios"] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "v5"] }
 serde = "1"
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 
 # Cargo's default strip rewrites the Mach-O after the link; the release ships the
 # linker's own ad hoc signature, so nothing may touch the binary after linking.

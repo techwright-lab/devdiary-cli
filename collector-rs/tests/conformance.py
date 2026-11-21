@@ -174,7 +174,7 @@ class CollectorTest(unittest.TestCase):
 
     def doctor(self, code=0):
         result = subprocess.run(
-            [str(BIN), "doctor"],
+            [str(BIN), "doctor", "--json"],
             capture_output=True,
             check=False,
             timeout=10,

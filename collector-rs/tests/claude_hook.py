@@ -218,7 +218,7 @@ class InstallationFixture:
         return json.loads((self.outbox / "repository-refs.json").read_bytes())
 
     def doctor(self):
-        result = self.run_collector("doctor", env=self.setup_env)
+        result = self.run_collector("doctor", "--json", env=self.setup_env)
         return json.loads(result.stdout)
 
     def status(self):
@@ -864,7 +864,7 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
                         out += chunk
                     else:
                         err += chunk
-                while out.count(terminal.PROMPT) > asked:
+                while terminal.questions(out) > asked:
                     os.write(master, b"y\n")
                     asked += 1
                 if process.poll() is not None and not ready:
@@ -890,9 +890,9 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
         os.close(slave)
         seen = b""
         deadline = time.monotonic() + 20
-        while terminal.PROMPT not in seen and time.monotonic() < deadline:
+        while not terminal.questions(seen) and time.monotonic() < deadline:
             seen += os.read(process.stdout.fileno(), 4096)
-        self.assertIn(terminal.PROMPT, seen)
+        self.assertTrue(terminal.questions(seen), seen)
         os.write(master, b"y\n")
         time.sleep(delay)
         process.kill()

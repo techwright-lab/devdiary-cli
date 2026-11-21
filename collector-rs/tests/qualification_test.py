@@ -622,7 +622,7 @@ class SyntheticRailsStagesTest(unittest.TestCase):
             )
             try:
                 q.rails_interop(args, root, machine.env, report, session)
-                doctor = json.loads(q.run([exe, "doctor"], env=machine.env))
+                doctor = json.loads(q.run([exe, "doctor", "--json"], env=machine.env))
                 expected = json.loads((root / "expected-receipts.json").read_text())
                 self.assertEqual(doctor["pending"], 0)
                 self.assertEqual(doctor["delivered"], len(expected))

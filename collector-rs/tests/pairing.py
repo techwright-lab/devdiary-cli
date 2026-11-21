@@ -55,7 +55,11 @@ class PairingTest(unittest.TestCase):
             (bin_dir / name).chmod(0o700)
         self.opened = bin_dir / "opened"
         self.env = {
-            **{k: v for k, v in os.environ.items() if k != "CODEX_HOME"},
+            **{
+                k: v
+                for k, v in terminal.local_browser(os.environ).items()
+                if k != "CODEX_HOME"
+            },
             "HOME": str(self.home),
             "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
             "XDG_CONFIG_HOME": str(self.root / "config"),
@@ -265,6 +269,31 @@ class PairingTest(unittest.TestCase):
         self.assertEqual(len(typed), 1)
         self.assertTrue((self.connection() / "connection.json").exists())
 
+    def test_without_a_local_browser_setup_asks_for_the_code_and_offers_no_return(
+        self,
+    ):
+        env = {**self.env, "SSH_CONNECTION": "10.0.0.2 50000 10.0.0.1 22"}
+        self.contract.on_start = lambda contract, request: contract.approve(request)
+        typed = []
+        approved = b"Approved in DevDiary. Type the code the approval page shows"
+
+        def typing(out):
+            if typed or approved not in out:
+                return None
+            typed.append(display(self.contract.latest.verifier))
+            return f"{typed[0]}\n".encode()
+
+        result = self.run_setup(browser=True, env=env, typing=typing)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+        first = b"Open this link on any device, then type the code the page shows."
+        self.assertLess(out.index(first), out.index(b"Approval code"))
+        self.assertNotIn(b"browser returns here", out)
+        self.assertNotIn("callback_port", self.contract.starts()[0])
+        self.assertFalse(self.opened.exists())
+        self.assertEqual(len(typed), 1)
+        self.assertTrue((self.connection() / "connection.json").exists())
+
     def test_five_wrong_verifiers_deny_and_change_nothing_locally(self):
         self.contract.on_start = pairing_server.nobody
 
@@ -402,7 +431,10 @@ class PairingTest(unittest.TestCase):
             os.close(slave)
             assert p.stdout is not None
             seen = b""
-            for wanted, answer in ((terminal.PROMPT, b"y\n"), (b"Approval code", None)):
+            for wanted, answer in (
+                (terminal.DETAILS, b"y\n"),
+                (b"Approval code", None),
+            ):
                 while wanted not in seen:
                     chunk = os.read(p.stdout.fileno(), 4096)
                     self.assertTrue(chunk, seen)

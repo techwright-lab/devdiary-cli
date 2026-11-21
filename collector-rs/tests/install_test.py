@@ -2,17 +2,21 @@
 scheduler: systemctl on Linux, launchctl on macOS."""
 
 import calendar
+import fcntl
 import hashlib
 import json
 import os
 import plistlib
 import pty
+import re
 import select
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 import tomllib
@@ -244,7 +248,7 @@ class InstallTest(unittest.TestCase):
     def env(self):
         base = {
             k: v
-            for k, v in os.environ.items()
+            for k, v in terminal.local_browser(os.environ).items()
             if not k.startswith(("PAPERCLIP_", "XDG_", "HOME", "CODEX_HOME"))
         }
         return {
@@ -419,7 +423,7 @@ class InstallTest(unittest.TestCase):
         self.run_collector(
             "sync", self.data / "connection", exe=self.record()["executable"]
         )
-        return json.loads(self.run_collector("doctor").stdout)
+        return json.loads(self.run_collector("doctor", "--json").stdout)
 
     def test_install_yes_registers_nine_entries_beside_codegraph(self):
         out = self.install().stdout.decode()
@@ -431,9 +435,193 @@ class InstallTest(unittest.TestCase):
         for (entry,) in entries.values():
             self.assertIn(f"'{exe}' hook claude ", entry["hooks"][0]["command"])
         self.assertEqual(exe.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(out.count(" hook claude "), len(EVENTS))
+        self.assertIn("Claude Code   adds 10 hooks to ~/.claude/settings.json", out)
+        self.assertNotIn(" hook claude ", out)
         self.assertIn("Self-test passed", out)
         self.assertEqual(self.scheduler.changes(), self.scheduler.started())
+
+    def test_d_shows_the_exact_entries_then_asks_again(self):
+        out = self.install(answers=(b"d\n", b"y\n")).stdout.decode()
+        self.assertEqual(out.count("Set up Claude Code? [y/N/d]"), 2)
+        shown = out.index(
+            "Claude Code hook entries to append to ~/.claude/settings.json:"
+        )
+        self.assertLess(shown, out.rindex("[y/N/d]"))
+        self.assertEqual(out.count(" hook claude "), len(EVENTS))
+        commands = [e["hooks"][0]["command"] for (e,) in self.owned_entries().values()]
+        for command in commands:
+            self.assertIn(command, out)
+
+    def test_a_plain_setup_is_four_numbered_steps_under_the_header(self):
+        (self.home / ".codex").mkdir()
+        answers = (b"both\n", b"y\n", b"y\n", b"y\n")
+        status, out, err, _ = terminal.answering(
+            self.install_args(), self.env(), answers
+        )
+        self.assertEqual(status, 0, err)
+        self.assertNotIn(b"\x1b", out + err)
+        self.assertNotIn(str(self.home).encode(), out)
+        lines = out.decode().splitlines()
+        self.assertEqual(lines[0], f"DevDiary {VERSION} · devdiary.me")
+        self.assertEqual(
+            [line for line in lines if line.startswith("[")],
+            [
+                "[1/4] Check this machine",
+                "[2/4] Choose what DevDiary may change",
+                "[3/4] Approve this machine in DevDiary",
+                "[4/4] Wait for your first session",
+            ],
+        )
+        for line in [
+            "  ✓ Claude Code: ~/.claude/settings.json",
+            "  Claude Code   adds 10 hooks to ~/.claude/settings.json",
+            "  Approval code: "
+            + self.contract.latest.code[:4]
+            + "-"
+            + self.contract.latest.code[4:],
+            "  ✓ Connected to the DevDiary workspace acme-diary.",
+            "✓ Claude Code records to the workspace acme-diary",
+            "✓ Codex records to the workspace acme-diary",
+            "! Codex: trust the DevDiary entries in /hooks",
+            "✓ Sync runs every 2 minutes",
+            "  Changed on this machine:",
+            "  Waiting for your first session · 0:00 of 0:00",
+        ]:
+            self.assertIn(line, lines)
+        self.assertEqual(lines[-2:], ["", "Next: devdiary doctor"])
+        for jargon in ["host trust", "qualification", "verifier"]:
+            self.assertNotIn(jargon, out.decode())
+
+    def test_a_declined_setup_ends_with_what_happened_next_and_the_code(self):
+        result = self.install(code=2, answers=(b"n\n",))
+        rows = result.stderr.decode().splitlines()
+        self.assertEqual(rows[0], "✗ Nothing was registered.")
+        self.assertIn("  Changed on this machine: nothing.", rows)
+        self.assertEqual(
+            rows[-2:], ["Next: devdiary setup", "error_code: consent_declined"]
+        )
+
+    def test_on_a_terminal_setup_is_styled_and_says_the_same_words(self):
+        plain = self.install().stdout.decode()
+        self.run_collector("uninstall")
+        # Pair again, so both runs take the same steps.
+        connection = self.data / "connection"
+        connection.rename(connection.with_name("set-aside"))
+        env = {**self.env(), "TERM": "xterm-256color"}
+        env.pop("COLORTERM", None)
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 100, 0, 0))
+        process = subprocess.Popen(
+            self.install_args(),
+            stdin=slave,
+            stdout=slave,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        os.close(slave)
+        seen, answered = b"", 0
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.5)[0]:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            if terminal.questions(seen) > answered:
+                os.write(master, b"y\n")
+                answered += 1
+        process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 0)
+        styled = seen.decode()
+        self.assertIn("\x1b[38;5;36m", styled)
+        self.assertIn("╭", styled)
+
+        def words(text):
+            text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", text)
+            return re.sub(r"\b[A-Z]{4}-[A-Z]{4}\b|127\.0\.0\.1:\d+", "X", text)
+
+        self.assertIn("Records your coding-agent sessions", words(styled))
+        for line in words(plain).splitlines()[1:]:
+            if line and "[y/N" not in line:
+                self.assertIn(line.strip(), words(styled))
+
+    def test_version_answers_to_the_flag_and_the_command(self):
+        for args in (["--version"], ["-V"], ["version"]):
+            out = self.run_collector(*args).stdout
+            self.assertEqual(out, f"devdiary {VERSION}\n".encode(), args)
+
+    def test_doctor_reads_as_one_line_per_harness(self):
+        self.install()
+        out = self.run_collector("doctor").stdout.decode()
+        lines = out.splitlines()
+        self.assertEqual(lines[0], f"DevDiary {VERSION} · devdiary.me")
+        self.assertIn(
+            "✓ Claude Code records to DevDiary: 0 waiting to send, 0 sent, last sync not yet.",
+            lines,
+        )
+        self.assertIn("Codex: not found on this machine.", out)
+        self.assertNotIn("{", out)
+        self.assertNotIn("Next:", out)
+
+    def test_doctor_names_the_unreadable_file_where_and_what_next(self):
+        self.install()
+        self.settings.write_bytes(b'{\n  "model": "opus",\n  oops\n}\n')
+        out = self.run_collector("doctor", code=1).stdout.decode()
+        self.assertIn(
+            "✗ Claude Code: ~/.claude/settings.json is not valid JSON: the error is at line 3,",
+            out,
+        )
+        self.assertEqual(
+            out.splitlines()[-1],
+            "Next: devdiary doctor, after you fix the JSON in ~/.claude/settings.json",
+        )
+
+    def test_setup_refusals_name_the_file_and_what_to_fix(self):
+        observer = {"hooks": [{"type": "command", "command": "python observer_hook"}]}
+        cases = [
+            (
+                json.dumps({"hooks": {"Stop": [observer]}}).encode(),
+                "python_observer_registered",
+                "~/.claude/settings.json registers the Python observer hook",
+                "Next: devdiary setup, after you remove the Python observer hook from "
+                + "~/.claude/settings.json",
+            ),
+            (
+                b'{\n  "model": "opus",\n  oops\n}\n',
+                "invalid_settings",
+                "~/.claude/settings.json is not valid JSON: the error is at line 3, column 3.",
+                "Next: devdiary setup, after you fix the JSON in ~/.claude/settings.json",
+            ),
+        ]
+        for raw, code, why, next_line in cases:
+            with self.subTest(code=code):
+                self.settings.write_bytes(raw)
+                err = self.install(code=2).stderr.decode()
+                self.assertIn(why, err)
+                self.assertEqual(
+                    err.splitlines()[-2:], [next_line, f"error_code: {code}"]
+                )
+        self.settings.write_bytes(self.original)
+        self.settings.chmod(0o666)
+        err = self.install(code=2).stderr.decode()
+        self.assertIn(
+            "~/.claude/settings.json can be written by group or others (mode 666)", err
+        )
+        self.assertEqual(err.splitlines()[-1], "error_code: unsafe_settings")
+
+    def test_help_shows_the_overview_and_each_command_its_own(self):
+        for args in (["--help"], ["help"], []):
+            out = self.run_collector(*args).stdout
+            self.assertTrue(
+                out.startswith(f"DevDiary {VERSION} · records".encode()), (args, out)
+            )
+        setup = self.run_collector("setup", "--help").stdout
+        self.assertIn(b"Usage:  devdiary setup [options]", setup)
+        self.assertIn(b"Examples:", setup)
 
     @unittest.skipIf(DARWIN, "systemd units are Linux only")
     def test_unit_files_snapshot(self):
@@ -511,7 +699,7 @@ class InstallTest(unittest.TestCase):
     def test_doctor_reports_the_last_sync_run_time(self):
         self.install()
         self.assertIsNone(
-            json.loads(self.run_collector("doctor").stdout)["last_sync_at"]
+            json.loads(self.run_collector("doctor", "--json").stdout)["last_sync_at"]
         )
         before = time.time()
         at = self.timer_sync()["last_sync_at"]
@@ -552,7 +740,7 @@ class InstallTest(unittest.TestCase):
 
     def test_doctor_reports_registration_timer_and_drops(self):
         self.install()
-        doctor = json.loads(self.run_collector("doctor").stdout)
+        doctor = json.loads(self.run_collector("doctor", "--json").stdout)
         self.assertEqual(doctor["registration"]["registration"], "installed")
         self.assertEqual(doctor["timer"], self.scheduler.running())
         self.assertEqual(doctor["drops"], {})
@@ -565,7 +753,7 @@ class InstallTest(unittest.TestCase):
         # The comma after "opus" is missing; "hooks" starts at line 3, column 3.
         broken = b'{\n  "model": "opus"\n  "hooks": {}\n}\n'
         self.settings.write_bytes(broken)
-        result = self.run_collector("doctor", code=1)
+        result = self.run_collector("doctor", "--json", code=1)
         doctor = json.loads(result.stdout)
         self.assertEqual(
             doctor["registration"],
@@ -588,7 +776,7 @@ class InstallTest(unittest.TestCase):
         self.install()
         self.settings.write_bytes(b"{")
         self.backup().write_bytes(self.original)
-        result = self.run_collector("doctor", code=1)
+        result = self.run_collector("doctor", "--json", code=1)
         doctor = json.loads(result.stdout)
         self.assertEqual(doctor["registration"]["backup"], str(self.backup()))
         self.assertIn(str(self.backup()).encode(), result.stderr)
@@ -648,7 +836,7 @@ class InstallTest(unittest.TestCase):
         self.install()
         self.older_registration()
         self.assertEqual(
-            json.loads(self.run_collector("doctor").stdout)["registration"][
+            json.loads(self.run_collector("doctor", "--json").stdout)["registration"][
                 "registration"
             ],
             "installed",
@@ -669,7 +857,7 @@ class InstallTest(unittest.TestCase):
         doc["hooks"]["PermissionRequest"] = [foreign]
         self.settings.write_text(json.dumps(doc))
         self.assertEqual(
-            json.loads(self.run_collector("doctor").stdout)["registration"][
+            json.loads(self.run_collector("doctor", "--json").stdout)["registration"][
                 "registration"
             ],
             "installed",
@@ -710,7 +898,7 @@ class InstallTest(unittest.TestCase):
         self.install()
         self.older_registration("Stop")
         self.assertEqual(
-            json.loads(self.run_collector("doctor").stdout)["registration"][
+            json.loads(self.run_collector("doctor", "--json").stdout)["registration"][
                 "registration"
             ],
             "changed",
@@ -734,7 +922,9 @@ class InstallTest(unittest.TestCase):
         (self.data / "connection/connection.json").write_bytes(b"{}")
         self.run_collector("upgrade", "--yes", code=2)
         self.assertEqual(sum(len(v) for v in self.owned_entries().values()), 0)
-        self.assertTrue(json.loads(self.run_collector("doctor").stdout)["installed"])
+        self.assertTrue(
+            json.loads(self.run_collector("doctor", "--json").stdout)["installed"]
+        )
         self.run_collector("uninstall")
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertIn(self.scheduler.stopped()[0], self.scheduler.changes())
@@ -848,8 +1038,7 @@ class InstallTest(unittest.TestCase):
             self.assertNotIn(word, help)
         for word in [b"setup-plan", b"connection-sync", b"--new-pair"]:
             self.assertNotIn(word, help)
-        (setup,) = [line for line in help.splitlines() if line.startswith(b"setup ")]
-        self.assertNotIn(b"--yes", setup)
+        self.assertNotIn(b"--yes", self.run_collector("setup", "--help").stdout)
 
     def test_sync_with_nothing_installed_sends_nothing(self):
         out = self.run_collector("sync").stdout
@@ -892,7 +1081,9 @@ class InstallTest(unittest.TestCase):
         self.timer_sync()
         self.assertEqual(len(self.received), 1)
         self.assertEqual(
-            json.loads(self.run_collector("doctor").stdout)["last_sync_error"],
+            json.loads(self.run_collector("doctor", "--json").stdout)[
+                "last_sync_error"
+            ],
             "revoked",
         )
 
@@ -939,11 +1130,11 @@ class InstallTest(unittest.TestCase):
         os.close(slave)
         seen = b""
         deadline = time.monotonic() + 30
-        while b"[y/N]" not in seen and time.monotonic() < deadline:
+        while not terminal.questions(seen) and time.monotonic() < deadline:
             ready, _, _ = select.select([process.stdout], [], [], 0.5)
             if ready:
                 seen += os.read(process.stdout.fileno(), 4096)
-        self.assertIn(b"[y/N]", seen)
+        self.assertTrue(terminal.questions(seen), seen)
         self.seen = seen
         self.assertEqual(self.scheduler.changes(), log)
         self.assertEqual(
@@ -969,11 +1160,11 @@ class InstallTest(unittest.TestCase):
         seen = b""
         deadline = time.monotonic() + 30
         for prompt, answer in enumerate(answers, start=1):
-            while seen.count(b"[y/N]") < prompt and time.monotonic() < deadline:
+            while terminal.questions(seen) < prompt and time.monotonic() < deadline:
                 ready, _, _ = select.select([process.stdout], [], [], 0.5)
                 if ready:
                     seen += os.read(process.stdout.fileno(), 4096)
-            self.assertEqual(seen.count(b"[y/N]"), prompt, seen)
+            self.assertEqual(terminal.questions(seen), prompt, seen)
             os.write(master, answer)
         out, err = process.communicate(timeout=30)
         return process.returncode, seen + out, err
@@ -983,7 +1174,9 @@ class InstallTest(unittest.TestCase):
         return json.loads(path.read_text()) if path.exists() else None
 
     def waiting(self):
-        return json.loads(self.run_collector("doctor").stdout)["orchestrators"]
+        return json.loads(self.run_collector("doctor", "--json").stdout)[
+            "orchestrators"
+        ]
 
     def test_scope_compatibility_upgrade_reports_refresh_refusal(self):
         self.install()
@@ -1000,7 +1193,9 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(offer.read_bytes() if offer.exists() else None, before_offer)
         self.assertIsNone(self.approved())
         self.assertEqual(
-            json.loads(self.run_collector("doctor").stdout)["last_scope_refresh_error"],
+            json.loads(self.run_collector("doctor", "--json").stdout)[
+                "last_scope_refresh_error"
+            ],
             "scope_refresh_http_failure",
         )
 
@@ -1110,13 +1305,13 @@ class InstallTest(unittest.TestCase):
     def test_doctor_warns_that_unapproved_runs_may_look_interactive(self):
         self.orchestrators = [PAPERCLIP]
         self.install()
-        result = self.run_collector("doctor")
+        result = self.run_collector("doctor", "--json")
         self.assertIn(b"stay unknown until approved", result.stderr)
         self.assertIn("paperclip", json.loads(result.stdout)["orchestrators"]["notice"])
 
     def test_doctor_says_nothing_when_no_name_is_offered(self):
         self.install()
-        result = self.run_collector("doctor")
+        result = self.run_collector("doctor", "--json")
         self.assertNotIn(b"until approved", result.stderr)
         self.assertIsNone(json.loads(result.stdout)["orchestrators"]["notice"])
 
@@ -1164,8 +1359,7 @@ class InstallTest(unittest.TestCase):
         code, err = self.interactive(b"n\n")
         self.assertEqual(code, 2)
         self.assertIn(b"consent_declined", err)
-        self.assertIn(str(self.settings).encode(), self.seen)
-        self.assertEqual(self.seen.count(b" hook claude "), len(EVENTS))
+        self.assertIn(b"adds 10 hooks to ~/.claude/settings.json", self.seen)
         self.assertEqual(len(self.contract.starts()), 0)
         self.assertFalse(self.data.exists())
         self.assertEqual(self.settings.read_bytes(), self.original)
@@ -1191,7 +1385,7 @@ class InstallTest(unittest.TestCase):
         )
         self.install(code=2)
         self.contract.on_exchange = None
-        out = self.install().stdout
+        out = self.install(answers=(b"d\n", b"y\n")).stdout
         self.assertEqual(len(self.contract.starts()), 1)
         self.assertEqual(out.count(b" hook claude "), len(EVENTS))
         self.assertEqual(
@@ -1214,7 +1408,7 @@ class InstallTest(unittest.TestCase):
         self.backup().write_bytes(b'{"model": "before"}')
         result = self.install(code=2, answers=(b"n\n",))
         self.assertIn(b"backup_kept", result.stderr)
-        self.assertIn(str(self.backup()).encode(), result.stdout)
+        self.assertIn(b"~/.claude/settings.json.devdiary-backup", result.stdout)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertEqual(self.backup().read_bytes(), b'{"model": "before"}')
         self.assertEqual(len(self.contract.starts()), 0)
@@ -1229,14 +1423,18 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.scheduler.changes(), self.scheduler.started())
         self.assertFalse(self.backup().exists())
 
-    def test_upgrade_shows_the_new_entries_before_asking(self):
+    def test_upgrade_summarises_the_change_and_shows_the_new_entries_on_d(self):
         self.install()
         before = self.settings.read_bytes()
         log = self.scheduler.changes()
-        code, err = self.interactive(b"n\n", args=[str(BIN), "upgrade"])
+        code, out, err = self.converse([str(BIN), "upgrade"], [b"d\n", b"n\n"])
         self.assertEqual(code, 2)
         self.assertIn(b"consent_declined", err)
-        self.assertEqual(self.seen.count(b" hook claude "), len(EVENTS))
+        self.assertIn(f"replaces its hooks of version {VERSION}".encode(), out)
+        self.assertLess(
+            out.index(b"Upgrade Claude Code? [y/N/d]"), out.index(b" hook claude ")
+        )
+        self.assertEqual(out.count(b" hook claude "), len(EVENTS))
         self.assertEqual(self.settings.read_bytes(), before)
         self.assertEqual(self.scheduler.changes(), log)
 
@@ -1248,7 +1446,9 @@ class InstallTest(unittest.TestCase):
         self.assertIn(b"consent_declined", err)
         self.assertEqual(self.pinned(), BIN.read_bytes())
         self.spool(1)
-        self.assertEqual(json.loads(self.run_collector("doctor").stdout)["drops"], {})
+        self.assertEqual(
+            json.loads(self.run_collector("doctor", "--json").stdout)["drops"], {}
+        )
 
     def test_upgrade_from_a_rebuild_pins_and_registers_the_new_build(self):
         self.install()
@@ -1276,7 +1476,7 @@ class InstallTest(unittest.TestCase):
         connection = self.data / "connection"
         connection.rename(self.data / "connection-revoked")
         self.install()
-        doctor = json.loads(self.run_collector("doctor").stdout)
+        doctor = json.loads(self.run_collector("doctor", "--json").stdout)
         self.assertFalse(doctor["revoked"])
         self.assertEqual(doctor["registration"]["registration"], "installed")
         self.assertTrue((self.data / "connection-revoked/revoked").exists())
@@ -1364,10 +1564,10 @@ class InstallTest(unittest.TestCase):
         codex = self.find_codex()
         out = self.install(answers=self.BOTH).stdout.decode()
         steps = [
-            "1. Check this machine",
-            "2. Choose what DevDiary may change",
-            "3. Approve this machine in DevDiary",
-            "4. Wait for your first session",
+            "[1/4] Check this machine",
+            "[2/4] Choose what DevDiary may change",
+            "[3/4] Approve this machine in DevDiary",
+            "[4/4] Wait for your first session",
         ]
         self.assertEqual(
             [out.index(step) for step in steps],
@@ -1454,8 +1654,8 @@ class InstallTest(unittest.TestCase):
         result = self.install(code=2)
         self.assert_failed_exit(result.stderr, "no_harness_found")
         shown = result.stdout + result.stderr
-        self.assertIn(str(self.settings).encode(), shown)
-        self.assertIn(str(self.home / ".codex").encode(), shown)
+        self.assertIn(b"checked ~/.claude/settings.json", shown)
+        self.assertIn(b"checked ~/.codex", shown)
         self.assertEqual(self.contract.starts(), [])
         self.assertFalse(self.data.exists())
 
@@ -1471,7 +1671,7 @@ class InstallTest(unittest.TestCase):
         result = self.install(code=2, answers=self.BOTH)
         self.assert_failed_exit(result.stderr, "self_test_failed")
         self.assertIn(b"Claude Code", result.stderr)
-        codex = self.run_collector("doctor", "--vendor", "codex").stdout
+        codex = self.run_collector("doctor", "--json", "--vendor", "codex").stdout
         self.assertEqual(json.loads(codex)["registration"]["registration"], "installed")
         self.assertIn(self.scheduler.started("codex")[-1], self.scheduler.changes())
 
@@ -1488,7 +1688,7 @@ class InstallTest(unittest.TestCase):
         started = []
 
         def start_a_codex_session(out):
-            if b"4. Wait for your first session" in out and not started:
+            if b"[4/4] Wait for your first session" in out and not started:
                 started.append(True)
                 self.hook_event("codex")
 

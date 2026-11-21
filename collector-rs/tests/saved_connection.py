@@ -5,6 +5,8 @@ import os
 import uuid
 from pathlib import Path
 
+import terminal
+
 COLLECTOR_REF = "urn:devdiary:collector:11111111-1111-4111-8111-111111111111"
 TOKEN = "dc_live_" + "s" * 43
 FAKE_SYSTEMCTL = """#!/bin/sh
@@ -60,7 +62,7 @@ def environment(root, home, base=None):
     systemctl.parent.mkdir(exist_ok=True)
     systemctl.write_text(FAKE_SYSTEMCTL)
     systemctl.chmod(0o700)
-    base = os.environ if base is None else base
+    base = terminal.local_browser(os.environ if base is None else base)
     return {
         **{k: v for k, v in base.items() if k != "CODEX_HOME"},
         "HOME": str(home),

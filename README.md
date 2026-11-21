@@ -132,6 +132,12 @@ The approval code is not a secret: it only finds the request.
   `127.0.0.1:<port>`, and answers "Connected. Return to the terminal." once the
   connections are saved. If setup cannot listen, the request names no port, and
   the approval page shows the verifier behind "Terminal didn't connect?".
+- On a machine without a local browser (Linux without `DISPLAY` or
+  `WAYLAND_DISPLAY`, or any session with `SSH_CONNECTION` set), setup does not
+  listen and does not open a browser. It says first: "Open this link on any device,
+  then type the code the page shows." The request names no port, so the approval
+  page shows the verifier at once. Setup's messages call the verifier "the code
+  the approval page shows".
 - The terminal also accepts the verifier typed in at any point while it waits.
   Case, hyphens and spaces do not matter. Presenting the verifier is the only way
   to receive connections: one per harness, each with its own credential, outbox
@@ -215,7 +221,8 @@ devdiary upgrade [--yes]
 devdiary uninstall
 ```
 
-`setup` prints four numbered steps as plain text that stays in scrollback. It
+`setup` starts with the DevDiary header and prints four numbered steps
+(`[1/4] Check this machine` and so on) as text that stays in scrollback. It
 stops at the first failure, except that one harness failing after the pairing
 does not stop the others:
 
@@ -251,7 +258,8 @@ does not stop the others:
    files and stops with `backup_kept`.
 2. **Choose what DevDiary may change.** With both harnesses found it asks which to
    set up (`both`, `claude` or `codex`); `--vendor` skips the question. For each one
-   it prints the 10 hook entries and the settings file they go in, and asks `[y/N]`.
+   it summarises the change (how many hook entries, the settings file they go in and
+   the sync job) and asks `[y/N/d]`. `d` prints the exact entries, then asks again.
    For Codex without a hooks file it first asks to create an empty `hooks.json`.
    A declined harness is left as it was. Declining every harness stops with
    `consent_declined`: nothing is sent and nothing changes.
@@ -300,10 +308,34 @@ does not stop the others:
    to the server. Debug builds read `DEVDIARY_DEBUG_FIRST_SESSION_WAIT` (seconds) so
    the install harness can shorten the wait; release builds do not.
 
-Every setup exit prints what happened, what changed on this machine and what was
-sent to DevDiary, and one `Next:` command. A failed exit of any command then prints
-`error_code: <code>` and exits with status 2. An error without a stable code prints
-`error_code: unexpected_error`, so no path or server text reaches the terminal.
+Before the wait, setup prints a short checklist: each harness and the workspace it
+records to (when this run paired it), the Codex `/hooks` reminder, and the sync job,
+then what changed on this machine and what was sent to DevDiary. It ends with one
+`Next:` command.
+
+A failed command prints `✗` and what happened, why, the lists of what changed and
+what was sent (for `setup`), and one `Next:` command. A refusal about a file names
+the file and what in it to fix, such as the line and column of a JSON error or the
+mode that lets others write it. Its last line is
+`error_code: <code>`, unstyled, and it exits with status 2. An error without a
+stable code prints `error_code: unexpected_error`, so no path or server text
+reaches the terminal.
+
+### Help and output style
+
+`devdiary --help`, `devdiary help` and a bare `devdiary` print the command overview;
+`devdiary <command> --help` explains one command with examples. The hook commands
+and the sync job's `sync CONNECTION_DIR` entry point are left out of help.
+
+Output is styled (colour, the boxed header, marks and a live wait line) when stdout
+is a terminal, `NO_COLOR` is unset and `TERM` is not `dumb`. Otherwise it is plain:
+the same words with no escape codes and no redraws, so logs and tests read the same
+text. Truecolor is used when `COLORTERM` is `truecolor` or `24bit`. Results carry
+`✓`, `!` or `✗`, paths under the home folder print from `~`, and lines wrap at the
+terminal width, at most 100 columns. `doctor --json` prints no header, so its
+stdout stays a JSON report.
+
+`devdiary --version`, `devdiary -V` and `devdiary version` print `devdiary <version>`.
 
 `sync CONNECTION_DIR` sends batches of 100 at most 10 times and stops at the first
 batch that a 401/403, 429, 5xx or network failure stops, when no full batch is
@@ -325,14 +357,23 @@ refresh clears it. Revocation and a
 server-requested wait still stop the run. `setup` and `upgrade` fail on any
 refresh error.
 
-`doctor` prints the registration state, `systemctl --user is-enabled/is-active` for
+`doctor` prints a readable report: the header, then one line for each harness (or
+for the one `--vendor` names) with `✓`, `!` or `✗`, a dimmed reason under each
+problem, and `Next:` with the command that fixes the first problem. A harness that
+records reads like `✓ Claude Code records to DevDiary: 0 waiting to send, 12 sent,
+last sync 2026-11-22T00:10:00Z.` It checks the hooks, the sync job, a revoked
+connection, the last sync and scope refresh, and orchestrator names that wait.
+
+`doctor --json` prints the report of one harness (Claude unless `--vendor codex`) as
+JSON, for scripts: the registration state, `systemctl --user is-enabled/is-active` for
 the timer (on macOS, `loaded` from the exit status of
 `launchctl print gui/UID/LABEL`, whose output it never reads), pending and
 delivered counts, drops, the last receipt, `last_sync_error`, `last_sync_at` (the
 last sync run, from the sync status file) and `last_scope_refresh_error`. When the harness settings file
 is not valid JSON, the registration reads `settings_unreadable` with the file's
 path, the error's line and column, and any backup setup left beside it. `doctor`
-still runs the other checks, names the fix on stderr, writes nothing and exits 1.
+still runs the other checks, names the file and the fix (on stderr with `--json`),
+writes nothing and exits 1.
 `upgrade` first checks that the settings would accept a fresh
 plan once the old entries are gone and that the connection was not revoked, prints
 the 10 new entries and asks once; only then does it remove the old registration, copy
@@ -684,7 +725,7 @@ Behind the gate, a live run does these steps in order:
    rows with `sync CONNECTION_DIR` and loses the first answer after commit.
    Stored rows must equal the outbox rows, and the lost answer must replay the
    same bytes.
-6. The harness reads the receipts from `devdiary doctor`. It always runs
+6. The harness reads the receipts from `devdiary doctor --json`. It always runs
    `devdiary uninstall`, checks that the settings are restored, and drops the
    owned database. Your own `~/.claude/settings.json`, `settings.local.json` and
    `~/.claude.json` must be unchanged.

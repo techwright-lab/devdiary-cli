@@ -5,6 +5,7 @@ compile_error!("This experimental collector currently requires Unix private-file
 mod callback;
 pub mod checkout;
 pub mod claude;
+pub mod cli;
 pub mod drops;
 pub mod exit;
 pub mod install;
@@ -19,6 +20,7 @@ pub mod reflog;
 pub mod scheduler;
 pub mod store;
 pub mod systemd;
+pub mod ui;
 pub mod vendor;
 use chrono::{DateTime, Datelike, Utc};
 use serde::de::{MapAccess, Visitor};

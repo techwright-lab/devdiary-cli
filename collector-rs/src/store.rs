@@ -1,5 +1,6 @@
 use crate::{
-    MAX_WIRE, Object, Result, drops, endpoint, freeze, orchestrators, receipt, reflog::Mark, scope,
+    MAX_WIRE, Object, Result, drops, endpoint, exit::Refusal, freeze, orchestrators, receipt,
+    reflog::Mark, scope,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -7,7 +8,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 const DB: &str = "collector-rust-v1.sqlite3";
@@ -42,22 +43,30 @@ const MARK_TTL_NANOS: i64 = 6 * 3_600_000_000_000;
 const MAX_MARKS: i64 = 256;
 
 fn trusted_ancestors(path: &Path) -> Result<()> {
+    match untrusted_ancestor(path)? {
+        Some((code, _)) => Err(code.into()),
+        None => Ok(()),
+    }
+}
+/// The first path on the way to `path` that is a symlink, or a folder that
+/// another user owns or can write to, with its code.
+fn untrusted_ancestor(path: &Path) -> Result<Option<(&'static str, PathBuf)>> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("absolute_private_path_required".into());
     }
     for p in path.ancestors() {
         let metadata = fs::symlink_metadata(p)?;
         if metadata.file_type().is_symlink() {
-            return Err("symlink_path".into());
+            return Ok(Some(("symlink_path", p.to_path_buf())));
         }
         if p != path
             && ((metadata.uid() != 0 && metadata.uid() != rustix::process::geteuid().as_raw())
                 || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0))
         {
-            return Err("unsafe_ancestor".into());
+            return Ok(Some(("unsafe_ancestor", p.to_path_buf())));
         }
     }
-    Ok(())
+    Ok(None)
 }
 fn owned_by_us(path: &Path, directory: bool, forbidden_mode: u32) -> std::io::Result<bool> {
     let m = fs::metadata(path)?;
@@ -84,11 +93,48 @@ pub fn private(path: &Path, directory: bool) -> Result<()> {
 // Customer settings stay readable by others (0644 under 0755); only writes by
 // anyone but the owner, hardlinks and symlinks are refused.
 pub fn owner_writable(path: &Path, directory: bool) -> Result<()> {
-    trusted_ancestors(path)?;
+    let refuse = |why: String| Err(Refusal::with("unsafe_settings", path, why));
+    match untrusted_ancestor(path)? {
+        Some((_, at)) if at == path => return refuse("is a symbolic link".into()),
+        Some(("symlink_path", at)) => {
+            return refuse(format!(
+                "is reached through the symbolic link {}",
+                crate::ui::path(&at)
+            ));
+        }
+        Some((_, at)) => {
+            return refuse(format!(
+                "is inside {}, which another user owns or can write to",
+                crate::ui::path(&at)
+            ));
+        }
+        None => {}
+    }
     if !owned_by_us(path, directory, 0o022).unwrap_or(false) {
-        return Err("unsafe_settings".into());
+        return refuse(unsafe_reason(path, directory));
     }
     Ok(())
+}
+/// Why `path` fails `owner_writable`'s own check, as a person can fix it.
+fn unsafe_reason(path: &Path, directory: bool) -> String {
+    let Ok(m) = fs::metadata(path) else {
+        return "cannot be read".into();
+    };
+    let mode = m.mode() & 0o7777;
+    if m.uid() != rustix::process::geteuid().as_raw() {
+        "is owned by another user".into()
+    } else if mode & 0o022 != 0 {
+        format!(
+            "can be written by group or others (mode {mode:o}); `chmod go-w {}` fixes it",
+            crate::ui::path(path)
+        )
+    } else if directory && !m.is_dir() {
+        "is not a folder".into()
+    } else if !directory && !m.is_file() {
+        "is not a regular file".into()
+    } else {
+        "has another hard link to it".into()
+    }
 }
 pub(crate) fn create_private(path: &Path) -> Result<File> {
     match OpenOptions::new()

@@ -84,7 +84,7 @@ command = lambda do |args, expected = 0|
   raise "secret output" if (out + err).match?(secret)
   out
 end
-doctor = -> { JSON.parse(command.call(["doctor"])) }
+doctor = -> { JSON.parse(command.call(["doctor", "--json"])) }
 setup = lambda do |expected, answers|
   verifier = connected = nil
   status, output = RailsSetup.terminal([exe, "setup", "--origin", origin, "--trust-origin", "--no-browser"], answers:) do |code|

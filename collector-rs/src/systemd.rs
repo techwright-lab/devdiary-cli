@@ -64,9 +64,15 @@ pub fn unit_dir() -> Result<PathBuf> {
 
 // systemd expands %, $ and backslash escapes even inside quotes.
 fn quoted(path: &Path) -> Result<String> {
-    let s = path.to_str().ok_or("unsupported_path")?;
-    if !path.is_absolute() || s.chars().any(|c| c.is_control() || "\"\\%$".contains(c)) {
-        return Err("unsupported_path".into());
+    let refuse = |why: &str| crate::exit::Refusal::with("unsupported_path", path, why);
+    let s = path.to_str().ok_or_else(|| refuse("is not valid UTF-8"))?;
+    if !path.is_absolute() {
+        return Err(refuse("is not an absolute path"));
+    }
+    if s.chars().any(|c| c.is_control() || "\"\\%$".contains(c)) {
+        return Err(refuse(
+            "holds a control character or one of \" \\ % $, which systemd would reinterpret",
+        ));
     }
     Ok(format!("\"{s}\""))
 }

@@ -68,7 +68,7 @@ Then open Settings, Collector in DevDiary. The Paperclip row warns when it is on
 
 - **Agents work in a folder outside any repository:** install with `--record-orchestrated-outside-repos`.
 - **Rows stay `unknown`:** run `devdiary orchestrators approve`.
-- **Drops rise:** run `devdiary doctor` and read `drops`.
+- **Drops rise:** run `devdiary doctor --json` and read `drops`.
 
 ## Not covered
 
