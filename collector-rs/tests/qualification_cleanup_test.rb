@@ -13,7 +13,7 @@ class Time
 end
 
 class QualificationCleanupTest < Minitest::Test
-  STAGES = %w[revoke key_delete proxy_close server_stop thread_join thread_kill report_write].freeze
+  STAGES = %w[revoke server_stop report_write].freeze
 
   # Execute the actual runner's ensure block, not a copied cleanup algorithm.
   def exercise(failures)
@@ -26,18 +26,9 @@ class QualificationCleanupTest < Minitest::Test
     collector = Object.new
     collector.define_singleton_method(:update!) { |**| action.call("revoke") }
     collector.define_singleton_method(:reload) { OpenStruct.new(revoked_at: true) }
-    key = "fixture"
-    key_path = Object.new
-    key_path.define_singleton_method(:exist?) { true }
-    key_path.define_singleton_method(:delete) { action.call("key_delete") }
-    proxy = Object.new
-    proxy.define_singleton_method(:close) { action.call("proxy_close") }
+    token = "fixture"
     server = Object.new
     server.define_singleton_method(:stop) { |*| action.call("server_stop") }
-    proxy_thread = Object.new
-    proxy_thread.define_singleton_method(:join) { |*| action.call("thread_join") }
-    proxy_thread.define_singleton_method(:alive?) { true }
-    proxy_thread.define_singleton_method(:kill) { action.call("thread_kill") }
     writer = Object.new
     writer.define_singleton_method(:write) do |text|
       action.call("report_write")
@@ -76,9 +67,9 @@ class QualificationCleanupTest < Minitest::Test
   end
 
   def test_multiple_failures_are_aggregated
-    calls, report, written, raised, = exercise(STAGES.take(6))
+    calls, report, written, raised, = exercise(STAGES.take(2))
     assert_equal STAGES, calls
-    assert_equal STAGES.take(6), report["cleanup_failures"]
+    assert_equal STAGES.take(2), report["cleanup_failures"]
     refute written["passed"]
     refute_nil raised
   end

@@ -50,6 +50,23 @@ class QualificationDatabase
     end)
   end
 
+  # The checkout's schema, into the owned database over the verified connection.
+  # An app whose schema_format is :sql keeps it in db/structure.sql; the
+  # checked-in db/schema.rb may then be a stale snapshot.
+  def load_schema!(dir, format)
+    if format == :sql
+      sql = File.read(File.join(dir, "db/structure.sql"))
+      raise "psql command in db/structure.sql" if sql.match?(/^\s*\\/)
+
+      ActiveRecord::Base.with_connection { |connection| connection.execute(sql) }
+      # The dump changes session settings, search_path among them.
+      ActiveRecord::Base.connection_pool.disconnect!
+    else
+      ActiveRecord::Migration.suppress_messages { load File.join(dir, "db/schema.rb") }
+    end
+    verify_application!
+  end
+
   def verify_application!
     verify_configurations!(ActiveRecord::Base.configurations)
     ActiveRecord::Base.connection_handler.connection_pool_list(:all).each do |pool|

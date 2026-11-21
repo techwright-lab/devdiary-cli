@@ -27,8 +27,6 @@ class PairingCleanupTest(unittest.TestCase):
     def exercise(self, fault):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            binary = root / "collector"
-            binary.write_bytes(b"fixture")
             calls = []
             queries = 0
 
@@ -52,13 +50,7 @@ class PairingCleanupTest(unittest.TestCase):
                 patch.object(p.signal, "signal"),
                 patch(
                     "sys.argv",
-                    [
-                        "pairing_rails.py",
-                        "--rails-checkout",
-                        str(root),
-                        "--collector",
-                        str(binary),
-                    ],
+                    ["pairing_rails.py", "--rails-checkout", str(root)],
                 ),
                 contextlib.redirect_stdout(output),
                 self.assertRaises((Exception, KeyboardInterrupt)),
@@ -432,17 +424,15 @@ class InstallationPairingTest(unittest.TestCase):
     "set DEVDIARY_RAILS_CHECKOUT to a reviewed DevDiary checkout and run on its Ruby PATH",
 )
 class LocalRailsInteropTest(unittest.TestCase):
-    """Repository scope sends v1 and installation scope v2 to a real local server."""
+    """`devdiary setup` pairs installation scope against a real local server."""
 
-    def test_schema_version_follows_what_the_server_advertises(self):
+    def test_setup_pairs_delivers_and_uninstalls_against_rails(self):
         result = subprocess.run(
             [
                 sys.executable,
                 str(Path(__file__).with_name("pairing_rails.py")),
                 "--rails-checkout",
                 os.environ["DEVDIARY_RAILS_CHECKOUT"],
-                "--collector",
-                str(BIN),
             ],
             capture_output=True,
             check=False,
@@ -450,8 +440,9 @@ class LocalRailsInteropTest(unittest.TestCase):
         )
         report = json.loads(result.stdout.splitlines()[-1])
         self.assertEqual(result.returncode, 0, report)
-        self.assertTrue(report["repository_scope_v1"])
         self.assertTrue(report["installation_scope_v2"])
+        self.assertTrue(report["exact_rails_receipt"])
+        self.assertTrue(report["fake_scheduler_only"])
         self.assertTrue(report["database_dropped"])
 
 

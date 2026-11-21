@@ -65,13 +65,31 @@ class QualificationDatabaseTest < Minitest::Test
       marker = File.join(root, "schema-ran")
       File.write(File.join(root, "db/schema.rb"), "File.write(#{marker.inspect}, 'unsafe')")
       runner = File.join(__dir__, "qualify_rails.rb")
-      code = 'file = ARGV.fetch(0); eval(File.read(file).split(%q{require "factory_bot_rails"}).first, TOPLEVEL_BINDING, file)'
-      out, err, status = Open3.capture3({"DATABASE_URL" => OWNED, "RAILS_ENV" => "test", "QUALIFICATION_ROOT" => root},
-        RbConfig.ruby, "-e", code, runner, chdir: root)
+      code = 'file = ARGV.shift; eval(File.read(file).split(%q{require "factory_bot_rails"}).first, TOPLEVEL_BINDING, file)'
+      isolated = {"HOME" => "#{root}/home", "XDG_CONFIG_HOME" => "#{root}/config",
+                  "DEVDIARY_COLLECTOR_SYSTEMCTL" => "#{root}/bin/systemctl", "QUALIFICATION_PORT" => "1"}
+      out, err, status = Open3.capture3({"DATABASE_URL" => OWNED, "RAILS_ENV" => "test", "QUALIFICATION_ROOT" => root, **isolated},
+        RbConfig.ruby, "-e", code, runner, "pair", chdir: root)
       refute status.success?
       assert_includes err, "unowned database target"
       refute_includes out + err, "FOREIGN NETWORK ATTEMPT"
       refute File.exist?(marker)
+    end
+  end
+
+  def test_structure_with_a_psql_command_is_refused_before_any_connection
+    Dir.mktmpdir("qualification-structure-") do |root|
+      Dir.mkdir(File.join(root, "db"))
+      File.write(File.join(root, "db/structure.sql"), "SET lock_timeout = 0;\n\\! touch #{root}/ran\n")
+      calls = []
+      original = PG.method(:connect)
+      PG.define_singleton_method(:connect) { |*| calls << :connect; raise "network forbidden" }
+      error = assert_raises(RuntimeError) { @guard.load_schema!(root, :sql) }
+      assert_equal "psql command in db/structure.sql", error.message
+      assert_empty calls
+      refute File.exist?(File.join(root, "ran"))
+    ensure
+      PG.define_singleton_method(:connect, original) if original
     end
   end
 

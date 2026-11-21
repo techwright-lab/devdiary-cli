@@ -32,8 +32,10 @@ jobs:
         run: |
           ruby collector-rs/tests/qualification_safety_test.rb
           ruby collector-rs/tests/qualification_cleanup_test.rb
+          ruby collector-rs/tests/rails_setup_test.rb
           ruby -c collector-rs/tests/qualify_rails.rb
           ruby -c collector-rs/tests/pairing_rails.rb
+          ruby -c collector-rs/tests/rails_setup.rb
 
   rust-collector:
     name: Rust collector (Linux experimental)

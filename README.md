@@ -78,10 +78,9 @@ cargo audit --file collector-rs/Cargo.lock
 bin/test
 ```
 
-The Rails/Puma/PostgreSQL interoperability harnesses (`rails_interop.rb`,
-`pairing_rails.py`) still use the removed repository-scope commands and do not run
-until they are requalified on installation scope:
-[#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
+The opt-in Rails/Puma/PostgreSQL harness `pairing_rails.py` runs `devdiary setup`
+on a terminal against a local DevDiary checkout. It is described below, with the
+stock-Claude qualification.
 
 ### Releases
 
@@ -589,16 +588,58 @@ Additional Linux fixture gate:
 PYTHONPATH=src python3 collector-rs/tests/claude_hook.py -v
 ```
 
-## Repeatable stock-Claude qualification (live mode currently blocked)
+## Rails interoperability and stock-Claude qualification
 
-**The collector stages are removed until they are requalified on installation
-scope ([#57](https://github.com/techwright-lab/devdiary-cli/issues/57)).** After its
-preflight checks the harness stops at `installation_scope_requalification_required`,
-before any collector command or model run. The registration, spool and Rails
-descriptions below record the repository-scope design that #57 replaces.
+Each harness here gives `devdiary setup` a temporary HOME and a fake `systemctl`
+or `launchctl`. Setup writes the hooks, the connection and the job definition in
+that HOME. It never starts a timer or launch agent in your session. Only a debug
+build reads the fake scheduler, so each harness runs `collector-rs/target/debug/devdiary`
+and refuses any other build. Build it first with `cargo build`.
 
-**Live qualification also fails closed before any vendor execution.** Local
-managed files (including Linux `/etc/claude-code/managed-settings.d/`) are refused.
+Each harness creates one loopback PostgreSQL database with a random
+`devdiary_qualification_<hex>` name. It checks that the name is absent before it
+creates the database, and drops it at the end. It never uses the development
+database or a `DATABASE_URL` that you set.
+
+### Rails pairing interoperability (no vendor or model)
+
+`pairing_rails.py` runs `devdiary setup` on a terminal against real Rails, Puma
+and PostgreSQL. Hook input is synthetic. The harness checks these behaviours:
+
+- Setup refuses a lost exchange answer with `setup_incomplete` and writes no hooks.
+  The consumed request cannot be exchanged again.
+- After the unused connection is revoked and the folder is moved aside, a new
+  setup pairs installation scope. The approval uses the real page, and a POST
+  without its CSRF token is refused first.
+- Hooks read only the environment names in an approved orchestrator list, and
+  never send the Paperclip API key.
+- `sync CONNECTION_DIR` sends v2 rows. When an answer is lost after commit, the
+  next sync sends the same bytes and the server keeps one record.
+- The credential refuses a changed installation or runtime (403). The server
+  refuses an invented actor or an untracked repository (422).
+- After revocation, a captured row stays pending and is never stored.
+- `uninstall` restores the settings file exactly.
+
+```sh
+cargo build --locked --manifest-path collector-rs/Cargo.toml
+python3 collector-rs/tests/pairing_rails.py --rails-checkout "$DISPOSABLE_RAILS_CHECKOUT"
+# The same run as an opt-in unit test:
+DEVDIARY_RAILS_CHECKOUT="$DISPOSABLE_RAILS_CHECKOUT" python3 collector-rs/tests/pairing_rails_test.py LocalRailsInteropTest -v
+# qualify_rails.rb's pair and deliver stages, with six synthetic hook events:
+DEVDIARY_RAILS_CHECKOUT="$DISPOSABLE_RAILS_CHECKOUT" python3 collector-rs/tests/qualification_test.py SyntheticRailsStagesTest -v
+```
+
+The checkout must have no dotenv or credential key files. It must have an
+installed test bundle and its built front-end assets. Run the
+harness with that checkout's Ruby and `bundle` first on `PATH`. The harness does
+not read `GEM_HOME`. A version manager that uses it needs a `ruby` and `bundle`
+wrapper on `PATH`. The schema comes from `db/structure.sql` when the app's
+`schema_format` is `:sql`, and from `db/schema.rb` otherwise.
+
+### Stock-Claude qualification (live mode currently blocked)
+
+**Live qualification fails closed before any vendor execution.** Local managed
+files (including Linux `/etc/claude-code/managed-settings.d/`) are refused.
 Even their absence cannot establish absence of cached or freshly delivered
 server policy. There is no supported pre-launch remote-policy proof implemented
 here, and no bypass flag. The opt-in command below documents the intended interface,
@@ -609,7 +650,7 @@ head; no new provider run is claimed.
 Official references: [managed settings](https://code.claude.com/docs/en/managed-settings)
 and [server delivery/caching](https://code.claude.com/docs/en/server-managed-settings).
 Remote settings can contain hooks, apply from cache at startup, and refresh later;
-`--setting-sources ''`, an auth-method projection, and init tools/MCP/plugin lists
+`--setting-sources`, an auth-method projection, and init tools/MCP/plugin lists
 are not proof that hooks or policy are isolated. Supporting live qualification
 again requires a reviewed, vendor-supported policy-proof design, not cache removal
 or disabling organizational policy.
@@ -620,38 +661,47 @@ python3 collector-rs/tests/qualify_claude.py
 # Ordinary CI runs only these fake-vendor control-flow tests, NOT qualification:
 python3 collector-rs/tests/qualification_test.py -v
 # After explicit approval for ONE subscription-backed print session:
-cargo build --release --locked --manifest-path collector-rs/Cargo.toml
+cargo build --locked --manifest-path collector-rs/Cargo.toml
 python3 collector-rs/tests/qualify_claude.py \
   --consent-provider-use --max-model-runs 1 --claude-version 2.1.280 \
-  --collector "$PWD/collector-rs/target/release/devdiary" \
+  --auth-file "$HOME/.claude/.credentials.json" \
   --rails-checkout "$DISPOSABLE_RAILS_CHECKOUT" --pg-user "$USER"
 ```
 
-Linux prerequisites: already installed mise-selected native Claude and Ruby,
-installed Rails test bundle, and loopback PostgreSQL with a local test role allowed
-CREATE/DROP DATABASE (no password discovery/fallback; optional `--pg-port`). Use a
-reviewed Rails checkout without dotenv/credential key files. No installation or
-update is attempted. CI refuses live mode. Each invocation has one non-retried host
-launch, two turns maximum and a 100-second deadline; rerunning needs fresh consent.
-This bounds host sessions/turns, not vendor-internal HTTP retries or a dollar tariff.
+Behind the gate, a live run does these steps in order:
 
-The harness pins source SHAs, native executable SHA-256/version and the collector
-hash; verifies subscription auth using only boolean/method/provider projection;
-uses normal HOME solely for vendor-owned auth with empty setting sources, private
-explicit settings, strict empty MCP and only synthetic Read permission. It refuses
-managed-policy files rather than bypassing them. No live hooks are installed.
-It verifies committed lifecycle/tool IDs and metadata privacy, then sends those
-exact rows through actual Rails/Puma and a newly owned PostgreSQL database. A lost
-response must replay identical bytes; persisted receipts must match remote IDs.
-Cleanup removes registration, verifies live settings hashes, revokes the disposable
-collector, deletes its key, stops owned processes, drops and checks the exact DB.
-SIGINT/SIGTERM use cleanup; SIGKILL/power loss cannot run finally blocks. On cleanup
-failure the sanitized report identifies the owned DB for manual investigation.
+1. It pins the source SHAs, the native Claude executable's SHA-256 and version,
+   and the collector hash. It checks subscription auth, using only the
+   logged-in flag, the method and the provider.
+2. `qualify_rails.rb pair` boots Rails on a fixed loopback port. `devdiary setup`
+   then pairs against it on a terminal and writes the hooks in the temporary HOME.
+3. Stock Claude runs one print session in a `bwrap` sandbox. Only the run's
+   folder is writable. HOME is the temporary HOME, and the vendor login file is
+   bound in read-only. Claude reads setup's hooks from its user settings.
+4. The harness checks the outbox: each of the six events once, one session, one
+   tool call, unknown authorship, and no private text or local path.
+5. `qualify_rails.rb deliver` boots Rails again on the same port. It sends the
+   rows with `sync CONNECTION_DIR` and loses the first answer after commit.
+   Stored rows must equal the outbox rows, and the lost answer must replay the
+   same bytes.
+6. The harness reads the receipts from `devdiary doctor`. It always runs
+   `devdiary uninstall`, checks that the settings are restored, and drops the
+   owned database. Your own `~/.claude/settings.json`, `settings.local.json` and
+   `~/.claude.json` must be unchanged.
+
+Linux prerequisites: an installed mise-selected native Claude and Ruby, `bwrap`,
+a fresh Claude login (the sandbox cannot refresh its token), an installed Rails
+test bundle, and loopback PostgreSQL with a local test role allowed to create
+and drop databases (no password discovery or fallback; optional `--pg-port`).
+No installation or update is attempted. CI refuses live mode. Each invocation has
+one non-retried host launch, two turns maximum and a 100-second deadline.
+Rerunning needs fresh consent. This bounds host sessions and turns, not
+vendor-internal HTTP retries or a dollar tariff.
 
 Database safety does not rely on `DATABASE_URL` precedence: the Ruby process
 installs a PostgreSQL connection-target guard before application boot, rejects
 additional/hidden test configurations and routing overrides, verifies every
-application pool plus the actual server database, loads `db/schema.rb` in that
+application pool plus the actual server database, loads the schema in that
 same process, and rechecks before fixtures. Only the exact owned loopback
 host/port/database/user is accepted. The random name stays below PostgreSQL's
 63-byte identifier limit. This is protection against configuration mistakes in a
@@ -664,6 +714,7 @@ Standalone safety regressions (Ruby 3.4, ActiveRecord 8.1.3.1, pg, minitest):
 ```sh
 ruby collector-rs/tests/qualification_safety_test.rb
 ruby collector-rs/tests/qualification_cleanup_test.rb
+ruby collector-rs/tests/rails_setup_test.rb
 # Optional loopback-only real PG target/schema/drop proof; no vendor calls:
 QUALIFICATION_PG_TEST=1 QUALIFICATION_RUBY="$(mise which ruby)" \
   python3 collector-rs/tests/qualification_postgres_test.py -v
@@ -673,8 +724,8 @@ The optional proof uses synthetic application/schema files, not captured vendor
 rows or product HTTP ingestion; it does not renew the historical runtime evidence.
 
 Only a sanitized stage/result JSON goes to stdout; raw host output stays bounded
-in memory, scratch settings/spool are deleted, and provider transcripts are never
-read/copied. Exit zero requires all gates. Fixture failure/child/resume/repeated-start
+in memory, the temporary HOME and outbox are deleted, and provider transcripts are
+never read/copied. Exit zero requires all gates. Fixture failure/child/resume/repeated-start
 regressions do **not** qualify real interactive/resume/child behavior. No Codex,
 named actor, original-work reconciliation, human-minute, platform or release claim.
 Canonical design and dated runtime evidence remain in the
