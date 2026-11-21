@@ -1,6 +1,7 @@
-"""Opt-in Rust pairing -> real Rails fixture. No vendor/model/live hooks.
-Run under the Rails checkout's Ruby/bundle PATH:
- python3 pairing_rails.py --rails-checkout /reviewed/server --collector /built/binary
+"""Opt-in `devdiary setup` -> real Rails fixture. No vendor/model/live hooks.
+Run under the Rails checkout's Ruby/bundle PATH, after `cargo build`:
+ python3 pairing_rails.py --rails-checkout /reviewed/server
+Setup runs the debug build with a temporary HOME and a fake scheduler.
 Only an unpredictable, verified-absent loopback database is created/dropped.
 """
 
@@ -15,7 +16,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from qualify_claude import clean_env, require, run
+from qualify_claude import Machine, clean_env, debug_collector, require, run
 
 HERE = Path(__file__).resolve().parent
 
@@ -23,7 +24,6 @@ HERE = Path(__file__).resolve().parent
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--rails-checkout", type=Path, required=True)
-    p.add_argument("--collector", type=Path, required=True)
     p.add_argument("--pg-user", default=os.environ.get("USER", ""))
     p.add_argument("--pg-port", type=int, default=5432)
     a = p.parse_args()
@@ -35,6 +35,7 @@ def main():
         and not list((rails / "config/credentials").glob("*.key")),
         "rails_checkout_contains_credentials",
     )
+    collector = debug_collector()
 
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
@@ -46,21 +47,12 @@ def main():
         "live_hooks": False,
     }
     with tempfile.TemporaryDirectory(prefix="pairing-rails-") as tmp:
-        root = Path(tmp)
-        shutil.copyfile(a.collector.resolve(), root / "collector")
-        (root / "collector").chmod(0o700)
-        run(["git", "init", "-q", root / "repo"])
-        run(
-            [
-                "git",
-                "-C",
-                root / "repo",
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:fixture/pairing.git",
-            ]
+        root = Path(tmp).resolve()
+        machine = Machine(
+            root, clean_env(), repository="git@github.com:fixture/pairing.git"
         )
+        shutil.copyfile(collector, root / "collector")
+        (root / "collector").chmod(0o700)
         name = "devdiary_qualification_" + uuid.uuid4().hex
         report["database_name"] = name
         report["rails_sha"] = (
@@ -68,11 +60,7 @@ def main():
         )
         pg = ["-h", "127.0.0.1", "-p", str(a.pg_port), "-U", a.pg_user]
         env = {
-            **clean_env(),
-            "HOME": str(root),
-            "XDG_CONFIG_HOME": str(root / "config"),
-            "XDG_DATA_HOME": str(root / "data"),
-            "XDG_CACHE_HOME": str(root / "cache"),
+            **machine.env,
             "PGPASSFILE": str(root / "no-pgpass"),
             "RAILS_ENV": "test",
             "CI": "true",
@@ -95,29 +83,32 @@ def main():
             run(["createdb", *pg, name], env=env)
             run(
                 ["bundle", "exec", "ruby", HERE / "pairing_rails.rb"],
-                cwd=a.rails_checkout.resolve(),
+                cwd=rails,
                 env=env,
-                timeout=120,
+                timeout=240,
             )
             report.update(json.loads((root / "pairing-result.json").read_text()))
             require(report["passed"] and report["collector_revoked"], "rails_cleanup")
-            with contextlib.closing(
-                sqlite3.connect(root / "connection/outbox/collector-rust-v1.sqlite3")
-            ) as db:
+            # Uninstall keeps the connection and its outbox; doctor no longer reports it.
+            outbox = machine.connection / "outbox/collector-rust-v1.sqlite3"
+            with contextlib.closing(sqlite3.connect(outbox)) as db:
                 (raw,) = db.execute("SELECT last_receipt FROM scope").fetchone()
-                receipt = json.loads(raw)
-            config = json.loads((root / "connection/connection.json").read_text())
+            saved = json.loads((machine.connection / "connection.json").read_text())
+            receipt = json.loads(raw)
             require(
-                receipt
-                == {
-                    "record_id": report["record_id"],
-                    "collector_ref": config["scope"]["collector_ref"],
-                    "installation_id": config["scope"]["installation_id"],
-                    "observation_id": report["observation_id"],
-                },
+                receipt in report["receipts"]
+                and receipt["collector_ref"] == saved["scope"]["collector_ref"]
+                and receipt["installation_id"] == saved["scope"]["installation_id"],
                 "exact_rails_receipt",
             )
             report["exact_rails_receipt"] = True
+            calls = machine.scheduler.log()
+            require(
+                all(c in calls for c in machine.scheduler.started())
+                and all(c in calls for c in machine.scheduler.stopped()),
+                "fake_scheduler_unused",
+            )
+            report["fake_scheduler_only"] = True
         except BaseException:
             report["passed"] = False
             raise

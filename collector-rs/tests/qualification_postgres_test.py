@@ -34,7 +34,7 @@ class OwnedPostgresTest(unittest.TestCase):
                 "ActiveRecord::Base.connection.execute(\"INSERT INTO qualification_probe(value) VALUES ('owned')\")\n"
             )
             code = (
-                "file = ARGV.fetch(0); "
+                "file = ARGV.shift; "
                 'eval(File.read(file).split(%q{require "factory_bot_rails"}).first, TOPLEVEL_BINDING, file); '
                 'raise "schema proof failed" unless ActiveRecord::Base.connection.select_value("SELECT value FROM qualification_probe") == "owned"; '
                 'puts "owned-target-verified"'
@@ -52,6 +52,7 @@ class OwnedPostgresTest(unittest.TestCase):
                             + code
                             + "; rescue => e; puts e.full_message; end",
                             q.HERE / "qualify_rails.rb",
+                            "pair",
                         ],
                         **kwargs,
                     )
@@ -70,7 +71,10 @@ class OwnedPostgresTest(unittest.TestCase):
                 patch.object(q, "run", side_effect=run),
                 self.assertRaisesRegex(RuntimeError, "injected_after_real_schema"),
             ):
-                q.rails_interop(args, root, q.clean_env(), report)
+                machine = q.Machine(root / "run", q.clean_env())
+                q.rails_interop(
+                    args, machine.root, machine.env, report, session=lambda: None
+                )
             self.assertEqual(ran_schema, [True])
             self.assertTrue(report["database_dropped"])
             print("owned schema/application target verified; parent DROP verified")

@@ -4,14 +4,17 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import install_test
 import qualify_claude as q
 
 
@@ -117,7 +120,7 @@ class QualificationTest(unittest.TestCase):
                         "1",
                         "--claude-version",
                         "fixture",
-                        "--collector",
+                        "--auth-file",
                         "x",
                         "--rails-checkout",
                         "x",
@@ -213,9 +216,11 @@ class QualificationTest(unittest.TestCase):
                 Path("/synthetic"),
                 {},
                 {},
+                session=lambda: self.fail("no session before pairing"),
             )
         self.assertEqual(
-            calls, [["bundle", "exec", "ruby", str(q.HERE / "qualify_rails.rb")]]
+            calls,
+            [["bundle", "exec", "ruby", str(q.HERE / "qualify_rails.rb"), "pair"]],
         )
 
     def test_database_cleanup_on_schema_failure_or_interrupt(self):
@@ -237,13 +242,60 @@ class QualificationTest(unittest.TestCase):
                 patch.object(q, "run", side_effect=fixture_run),
                 self.assertRaises(type(failure)),
             ):
-                q.rails_interop(args, Path("/synthetic"), {}, report)
+                q.rails_interop(args, Path("/synthetic"), {}, report, lambda: None)
             self.assertEqual(
                 [c[0] for c in calls], ["psql", "createdb", "bundle", "dropdb", "psql"]
             )
             self.assertTrue(report["database_dropped"])
             self.assertEqual(calls[1][-1], calls[3][-1])
             self.assertLessEqual(len(calls[1][-1].encode()), 63)
+
+    def test_a_failed_session_skips_delivery_and_still_drops_the_database(self):
+        calls = []
+
+        def fixture_run(argv, **kwargs):
+            calls.append([str(a) for a in argv])
+            return b"0\n"
+
+        def session():
+            raise q.GateError("host_result")
+
+        report = {}
+        args = SimpleNamespace(pg_user="fixture", pg_port=5432, rails_checkout=q.CLI)
+        with (
+            patch.object(q, "run", side_effect=fixture_run),
+            self.assertRaisesRegex(q.GateError, "host_result"),
+        ):
+            q.rails_interop(args, Path("/synthetic"), {}, report, session)
+        self.assertEqual(
+            [c[0] for c in calls], ["psql", "createdb", "bundle", "dropdb", "psql"]
+        )
+        self.assertEqual(calls[2][-1], "pair")
+        self.assertTrue(report["database_dropped"])
+
+    def test_pairing_and_delivery_boot_rails_on_one_fixed_port(self):
+        calls, ports = [], []
+
+        def fixture_run(argv, env=None, **kwargs):
+            calls.append([str(a) for a in argv])
+            if argv[0] == "bundle":
+                ports.append(env["QUALIFICATION_PORT"])
+                raise_after = argv[-1] == "deliver"
+                if raise_after:
+                    raise RuntimeError("stop after delivery")
+            return b"0\n"
+
+        args = SimpleNamespace(pg_user="fixture", pg_port=5432, rails_checkout=q.CLI)
+        with (
+            patch.object(q, "run", side_effect=fixture_run),
+            self.assertRaises(RuntimeError),
+        ):
+            q.rails_interop(args, Path("/synthetic"), {}, {}, lambda: None)
+        self.assertEqual(
+            [c[-1] for c in calls if c[0] == "bundle"], ["pair", "deliver"]
+        )
+        self.assertEqual(len(set(ports)), 1)
+        self.assertTrue(1024 < int(ports[0]) < 65536)
 
     def test_partial_rails_report_cannot_prevent_database_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -265,7 +317,7 @@ class QualificationTest(unittest.TestCase):
                 patch.object(q, "run", side_effect=fixture_run),
                 self.assertRaises(KeyboardInterrupt),
             ):
-                q.rails_interop(args, root, {}, report)
+                q.rails_interop(args, root, {}, report, lambda: None)
             self.assertEqual(calls, ["psql", "createdb", "bundle", "dropdb", "psql"])
             self.assertTrue(report["database_dropped"])
             self.assertTrue(report["rails_report_unreadable"])
@@ -285,7 +337,7 @@ class QualificationTest(unittest.TestCase):
             patch.object(q, "run", side_effect=fixture_run),
             self.assertRaises(KeyboardInterrupt),
         ):
-            q.rails_interop(args, Path("/synthetic"), {}, report)
+            q.rails_interop(args, Path("/synthetic"), {}, report, lambda: None)
         self.assertEqual(calls, ["psql", "createdb", "dropdb", "psql"])
         self.assertTrue(report["database_dropped"])
 
@@ -299,6 +351,7 @@ class QualificationTest(unittest.TestCase):
                 Path("/synthetic"),
                 {},
                 {},
+                lambda: None,
             )
         self.assertEqual(run.call_count, 1)
 
@@ -312,8 +365,279 @@ class QualificationTest(unittest.TestCase):
                 Path("/synthetic"),
                 {},
                 {},
+                lambda: None,
             )
         self.assertEqual(run.call_count, 1)
+
+
+class IsolationTest(unittest.TestCase):
+    """What a live run would give setup and stock Claude, built without running either."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="claude-isolation-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.real_home = self.root / "real-home"
+        self.real_home.mkdir()
+        base = {"HOME": str(self.real_home), "PATH": os.environ["PATH"]}
+        with (
+            patch.dict(os.environ, {"XDG_DATA_HOME": str(self.real_home / "data")}),
+            patch.object(q, "run", return_value=b""),
+        ):
+            self.machine = q.Machine(self.root / "run", {**base, **q.clean_env()})
+
+    def test_setup_gets_a_temporary_home_and_a_fake_scheduler(self):
+        env, run = self.machine.env, self.root / "run"
+        self.assertEqual(env["HOME"], str(run / "home"))
+        self.assertEqual(env["XDG_CONFIG_HOME"], str(run / "config"))
+        self.assertNotIn("XDG_DATA_HOME", env)
+        self.assertEqual(env["DEVDIARY_DEBUG_FIRST_SESSION_WAIT"], "0")
+        (name,) = [k for k in env if k.startswith("DEVDIARY_COLLECTOR_")]
+        self.assertIn(
+            name, ("DEVDIARY_COLLECTOR_SYSTEMCTL", "DEVDIARY_COLLECTOR_LAUNCHCTL")
+        )
+        self.assertTrue(Path(env[name]).is_relative_to(run))
+        self.assertTrue(
+            Path(
+                env["DBUS_SESSION_BUS_ADDRESS"].removeprefix("unix:path=")
+            ).is_relative_to(run)
+        )
+        self.assertEqual(
+            json.loads(self.machine.settings.read_text()), q.ORIGINAL_SETTINGS
+        )
+        self.assertTrue(self.machine.settings.is_relative_to(run / "home/.claude"))
+
+    def test_stock_claude_can_write_only_inside_the_run(self):
+        auth = self.real_home / ".claude/.credentials.json"
+        claude = self.root / "claude"
+        command = q.claude_command(self.machine, claude, auth, ["--version"])
+        pairs = [command[i : i + 3] for i in range(len(command) - 2)]
+        root = str(self.machine.root)
+        self.assertEqual(
+            [p for p in pairs if p[0] == "--bind"], [["--bind", root, root]]
+        )
+        self.assertIn(
+            [
+                "--ro-bind",
+                str(auth),
+                str(self.machine.home / ".claude/.credentials.json"),
+            ],
+            pairs,
+        )
+        mentions = [a for a in command if str(self.real_home) in a]
+        self.assertEqual(mentions, [str(auth)])
+        self.assertEqual(
+            command[-2:], [str(self.machine.root / "stock/claude"), "--version"]
+        )
+        env = q.claude_env(self.machine)
+        self.assertEqual(env["HOME"], str(self.machine.home))
+        self.assertFalse(any(str(self.real_home) in v for v in env.values()))
+
+    def test_only_the_debug_build_may_run_setup(self):
+        with self.assertRaisesRegex(q.GateError, "debug_build_required"):
+            q.debug_collector(self.root / "target/release/devdiary")
+        self.assertEqual(q.debug_collector(), install_test.BIN)
+
+
+class OutboxInspectionTest(unittest.TestCase):
+    """Real hook rows in a real outbox, from synthetic hook input: no Claude run."""
+
+    def setUp(self):
+        self.fixture = install_test.InstallTest()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.install()
+        self.connection = self.fixture.data / "connection"
+        self.session = str(uuid.uuid4())
+
+    def hook(self, event, **extra):
+        f = self.fixture
+        record = f.record()
+        data = {
+            "hook_event_name": event,
+            "session_id": self.session,
+            "cwd": str(f.demo()),
+        }
+        subprocess.run(
+            [record["executable"], "hook", "claude", record["plan"]],
+            input=json.dumps({**data, **extra}).encode(),
+            env=f.env(),
+            timeout=10,
+            check=True,
+        )
+
+    def test_one_session_with_every_event_once_passes(self):
+        self.hook("SessionStart")
+        self.hook("UserPromptSubmit")
+        for event in ("PreToolUse", "PostToolUse"):
+            self.hook(event, tool_use_id="toolu_fixture", tool_name="Read")
+        self.hook("Stop")
+        with self.assertRaisesRegex(q.GateError, "runtime_event_coverage"):
+            q.inspect_outbox(self.connection, self.fixture.root)
+        self.hook("SessionEnd")
+        rows, counts = q.inspect_outbox(self.connection, self.fixture.root)
+        self.assertEqual(counts, dict.fromkeys(q.EVENTS, 1))
+        self.assertEqual({r["session_id"] for r in rows}, {self.session})
+        (self.connection / "outbox/stray").write_bytes(q.SENTINELS[0].encode())
+        with self.assertRaisesRegex(q.GateError, "outbox_privacy"):
+            q.inspect_outbox(self.connection, self.fixture.root)
+
+    def test_two_tool_calls_fail_correlation(self):
+        for event in ("SessionStart", "UserPromptSubmit"):
+            self.hook(event)
+        self.hook("PreToolUse", tool_use_id="toolu_a", tool_name="Read")
+        self.hook("PostToolUse", tool_use_id="toolu_b", tool_name="Read")
+        for event in ("Stop", "SessionEnd"):
+            self.hook(event)
+        with self.assertRaisesRegex(q.GateError, "runtime_tool_correlation"):
+            q.inspect_outbox(self.connection, self.fixture.root)
+
+
+class LiveOrderTest(unittest.TestCase):
+    """execute() with every subprocess faked, past the managed-policy gate."""
+
+    def test_a_failed_model_run_still_uninstalls_and_drops_the_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp).resolve()
+            home, rails = tmp / "real-home", tmp / "rails"
+            home.mkdir()
+            rails.mkdir()
+            claude = tmp / "claude"
+            claude.write_bytes(b"\x7fELFfixture")
+            auth = tmp / "credentials.json"
+            auth.write_text("{}")
+            auth.chmod(0o600)
+            calls = []
+
+            def fake_run(argv, env=None, **kwargs):
+                argv = [str(a) for a in argv]
+                calls.append((argv, env or {}))
+                if argv[:2] == ["mise", "which"]:
+                    return (
+                        sys.executable if argv[2] == "ruby" else str(claude)
+                    ).encode()
+                if argv[0] == "bwrap" and argv[-1] == "--version":
+                    return b"2.1.280 (Claude Code)\n"
+                if argv[0] == "bwrap" and argv[-2:] == ["auth", "status"]:
+                    return json.dumps(
+                        {
+                            "loggedIn": True,
+                            "authMethod": "claude.ai",
+                            "apiProvider": "firstParty",
+                        }
+                    ).encode()
+                if argv[0] == "bwrap" and "--print" in argv:
+                    raise q.GateError("subprocess_exit")
+                if argv[0] == "psql":
+                    return b"0\n"
+                return b""
+
+            args = SimpleNamespace(
+                rails_checkout=rails,
+                auth_file=auth,
+                claude_version="2.1.280",
+                pg_user="fixture",
+                pg_port=5432,
+            )
+            report = {"model_runs_started": 0}
+            with (
+                patch.object(q, "check_managed_policy"),
+                patch.object(
+                    q,
+                    "clean_env",
+                    return_value={"HOME": str(home), "PATH": os.environ["PATH"]},
+                ),
+                patch.object(q, "run", side_effect=fake_run),
+                self.assertRaisesRegex(q.GateError, "subprocess_exit"),
+            ):
+                q.execute(args, report)
+
+        def step(argv):
+            if argv[0] == "bwrap" and "--print" in argv:
+                return "model"
+            if argv[:3] == ["bundle", "exec", "ruby"]:
+                return argv[-1]
+            if argv[0] == "dropdb" or argv[-1] == "uninstall":
+                return argv[-1] if argv[-1] == "uninstall" else "dropdb"
+            return None
+
+        steps = [step(argv) for argv, _ in calls if step(argv)]
+        self.assertEqual(steps, ["pair", "model", "dropdb", "uninstall"])
+        self.assertEqual(report["model_runs_started"], 1)
+        self.assertTrue(report["registration_removed"])
+        isolated = [
+            env["HOME"]
+            for argv, env in calls
+            if argv[0] == "bwrap" or argv[-1] in ("pair", "uninstall")
+        ]
+        self.assertEqual(len(isolated), 5)
+        self.assertEqual(len(set(isolated)), 1)
+        self.assertEqual(Path(isolated[0]).name, "home")
+        self.assertIn("claude-qualification-", isolated[0])
+
+
+@unittest.skipUnless(
+    os.environ.get("DEVDIARY_RAILS_CHECKOUT"),
+    "set DEVDIARY_RAILS_CHECKOUT to a reviewed DevDiary checkout and run on its Ruby PATH",
+)
+class SyntheticRailsStagesTest(unittest.TestCase):
+    """qualify_rails.rb's pair and deliver stages against real Rails, with six
+    synthetic hook events in place of the stock session. No vendor or model."""
+
+    def test_setup_pairs_against_rails_and_the_rows_are_delivered(self):
+        with tempfile.TemporaryDirectory(prefix="claude-qualification-") as tmp:
+            root = Path(tmp).resolve()
+            machine = q.Machine(root, q.clean_env())
+            exe = root / "collector"
+            exe.write_bytes(q.debug_collector().read_bytes())
+            exe.chmod(0o700)
+            report = {}
+
+            def session():
+                record = json.loads(
+                    (machine.connection.parent / "install.json").read_text()
+                )
+                for event in q.EVENTS:
+                    data = {
+                        "hook_event_name": event,
+                        "session_id": "synthetic-session",
+                        "cwd": str(machine.repo),
+                        "tool_use_id": "toolu_synthetic",
+                        "tool_name": "Read",
+                    }
+                    subprocess.run(
+                        [record["executable"], "hook", "claude", record["plan"]],
+                        input=json.dumps(data).encode(),
+                        env=machine.env,
+                        timeout=10,
+                        check=True,
+                    )
+                rows, _ = q.inspect_outbox(machine.connection, root)
+                q.save(root / "observations.json", rows)
+
+            args = SimpleNamespace(
+                rails_checkout=Path(os.environ["DEVDIARY_RAILS_CHECKOUT"]),
+                pg_user=os.environ.get("USER", ""),
+                pg_port=5432,
+            )
+            try:
+                q.rails_interop(args, root, machine.env, report, session)
+                doctor = json.loads(q.run([exe, "doctor"], env=machine.env))
+                expected = json.loads((root / "expected-receipts.json").read_text())
+                self.assertEqual(doctor["pending"], 0)
+                self.assertEqual(doctor["delivered"], len(expected))
+                self.assertIn(doctor["last_receipt"], expected)
+            finally:
+                q.run([exe, "uninstall"], env=machine.env)
+            self.assertEqual(
+                json.loads(machine.settings.read_text()), q.ORIGINAL_SETTINGS
+            )
+            self.assertTrue(report["rails"]["passed"], report)
+            self.assertTrue(report["rails"]["collector_revoked"], report)
+            self.assertTrue(report["database_dropped"])
+            log = machine.scheduler.log()
+            for call in machine.scheduler.started() + machine.scheduler.stopped():
+                self.assertIn(call, log)
 
 
 if __name__ == "__main__":
