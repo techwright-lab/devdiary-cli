@@ -1,4 +1,5 @@
-"""Runs a collector command with a terminal on stdin and answers its [y/N] questions."""
+"""Runs a collector command with a terminal on stdin and answers its questions:
+the [y/N] questions and setup's choice of harnesses."""
 
 import os
 import pty
@@ -7,6 +8,11 @@ import subprocess
 import time
 
 PROMPT = b"[y/N]"
+CHOICE = b"[both/claude/codex]"
+
+
+def questions(out):
+    return out.count(PROMPT) + out.count(CHOICE)
 
 
 def answering(
@@ -43,7 +49,7 @@ def answering(
                     out += chunk
                 else:
                     err += chunk
-            while out.count(PROMPT) > asked:
+            while questions(out) > asked:
                 if on_prompt is not None:
                     on_prompt(asked)
                 os.write(master, answers[asked] if asked < len(answers) else later)

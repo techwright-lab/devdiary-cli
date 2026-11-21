@@ -27,7 +27,7 @@ change Git identity, declare named work, or affect human minute derivation.
 
 `collector-rs` builds one `devdiary` binary: `devdiary setup` pairs this machine
 with DevDiary for every tracked repository (installation scope), registers the
-Claude Code or Codex hooks after you agree in the terminal, and a per-user
+Claude Code and Codex hooks you agree to in the terminal, and a per-user
 scheduler delivers what they record: a systemd user timer on Linux, a launchd
 agent on macOS. Release one builds for Linux on x86_64 and macOS on Apple silicon;
 both stay experimental. It is not a Python replacement. The commands that
@@ -181,9 +181,9 @@ waits for [#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
 
 ## One-command setup (systemd user timer on Linux, launchd agent on macOS)
 
-The Rust binary is `devdiary`. It accepts `--vendor codex` on `setup`, `doctor`,
-`upgrade`, `uninstall`, `outside-repos` and `orchestrators approve`. Claude remains
-the default. Codex uses its active `CODEX_HOME/hooks.json` (otherwise
+The Rust binary is `devdiary`. It accepts `--vendor claude|codex` on `setup`, `doctor`,
+`upgrade`, `uninstall`, `outside-repos` and `orchestrators approve`. Without it,
+`setup` sets up every harness it finds and the other commands act on Claude. Codex uses its active `CODEX_HOME/hooks.json` (otherwise
 `~/.codex/hooks.json`), a separate connection/spool under `cli/codex`, and a
 separate `devdiary-codex-sync.timer` (`me.devdiary.codex-sync` on macOS). Review changed definitions in
 Codex's ordinary `/hooks` screen after setup or upgrade. Registration and
@@ -200,10 +200,10 @@ SHA, preserves the resolver symlink target in its isolated filesystem, and uses
 the ordinary hook-trust UI. CI runs only its network-inert control tests. Passing
 capture gates does not establish server minute correctness.
 
-`setup` runs the browser pairing above, then plans the hook entries, asks in the
-terminal and applies them, for an installation-scope connection, and delivers the
-spool from the scheduler. The hook contract does not change: it stays silent, exits 0
-and never performs HTTP.
+`setup` asks in the terminal for each harness, runs the browser pairing above once
+for every harness you accepted, then applies each harness's hook entries for an
+installation-scope connection and delivers the spool from the scheduler. The hook
+contract does not change: it stays silent, exits 0 and never performs HTTP.
 
 ```sh
 cargo build --release --locked --manifest-path collector-rs/Cargo.toml
@@ -216,16 +216,27 @@ devdiary upgrade [--yes]
 devdiary uninstall
 ```
 
-`setup` does these steps in order, and stops at the first failure:
+`setup` prints four numbered steps as plain text that stays in scrollback. It
+stops at the first failure, except that one harness failing after the pairing
+does not stop the others:
 
-1. Refuses at once (`consent_required`) when stdin is not a terminal; release one
-   has no unattended setup. It then checks the machine before it sends anything:
+1. **Check this machine.** Refuses at once (`no_terminal`) when stdin is not a
+   terminal; release one has no unattended setup. It then checks the machine before
+   it sends anything:
    it refuses an OS or CPU that release one does not target
    (`platform_unsupported`), a scheduler it cannot reach
    (`scheduler_unreachable`: no `systemctl --user` session on Linux, no GUI login
    session on macOS, for example SSH only), and a running binary that is not this
    build's executable format (`executable_format_unsupported`: ELF on Linux, a
-   64-bit thin or universal Mach-O on macOS). `upgrade` runs the same check. It refuses a relative `--settings` path (`unsupported_path`), a
+   64-bit thin or universal Mach-O on macOS). `upgrade` runs the same check. It
+   looks for Claude Code by `~/.claude/settings.json` and for Codex by its home
+   folder (`CODEX_HOME`, otherwise `~/.codex`), and prints one row for each. A
+   harness that `devdiary` already set up is shown as set up and not offered again;
+   when every harness found is set up, setup says so and names `devdiary doctor`.
+   With neither found it names the paths it checked and stops with
+   `no_harness_found`. `--vendor` or `--settings` names one harness instead, and
+   `--settings` alone names Claude Code. For each harness it refuses a relative
+   `--settings` path (`unsupported_path`), a
    missing settings file (`settings_missing`), settings that are not valid JSON
    (`invalid_settings`), already hold a `devdiary` hook (`already_registered`) or a
    hook of the older `devdiary-collector` (`old_collector_registered`: run
@@ -239,13 +250,22 @@ devdiary uninstall
    install record, it left a copy named `<settings file>.devdiary-backup`. Setup
    offers to restore that copy before it reads the settings. Declining keeps both
    files and stops with `backup_kept`.
-2. Prints the 10 hook entries and the settings file they go in, and asks `[y/N]` on
-   the terminal. Declining sends nothing and changes nothing.
-3. Pairs installation scope into `~/.local/share/devdiary/cli/claude/connection`
-   (`cli/codex` for Codex). It never reads the old `devdiary/collector` folder.
+2. **Choose what DevDiary may change.** With both harnesses found it asks which to
+   set up (`both`, `claude` or `codex`); `--vendor` skips the question. For each one
+   it prints the 10 hook entries and the settings file they go in, and asks `[y/N]`.
+   For Codex without a hooks file it first asks to create an empty `hooks.json`.
+   A declined harness is left as it was. Declining every harness stops with
+   `consent_declined`: nothing is sent and nothing changes.
+3. **Approve this machine in DevDiary.** One pairing request covers every accepted
+   harness. It pairs installation scope into
+   `~/.local/share/devdiary/cli/claude/connection` (`cli/codex` for Codex). It never
+   reads the old `devdiary/collector` folder.
    This path is fixed under `$HOME`; `$XDG_DATA_HOME` is not used, so every shell
    finds the same install. If setup stops after this step, the next run reuses the
-   saved connection, asks again and does not pair again.
+   saved connections, asks again and does not pair again. Then, for each accepted
+   harness in turn, setup does steps 4 to 7 below. A harness that fails one of them
+   is reported with its code (for example `self_test_failed`), and the next harness
+   still goes on. Setup then exits with the first such code and does not wait.
 4. Copies the running binary to `~/.local/share/devdiary/cli/HARNESS/VERSION/` (0700),
    so the registered hook survives rebuilds and `cargo clean`.
 5. Plans the hook entries for that copy and applies the plan. Entries that differ
@@ -271,8 +291,20 @@ devdiary uninstall
 7. A local self-test: the installed hook receives a `SessionStart` whose session id
    starts with `devdiary-selftest-`. The hook records it only in a local
    `self_test` table, which sync never reads; the outbox refuses such ids.
-8. Reads the scope endpoint once. If the server offers orchestrator names, prints
-   them and asks `[y/N]`. Declining keeps the hooks.
+8. Reads the scope endpoint once for each harness. If the server offers
+   orchestrator names, prints them and asks `[y/N]`. Declining keeps the hooks.
+9. **Wait for your first session.** Setup reads each new connection's outbox and
+   sends its pending rows itself, at most every 30 seconds. When the first receipt
+   arrives it names the harness and the time. After 15 minutes it ends with exit
+   status 0, says recording is on, and names `devdiary doctor`. Ctrl+C stops only
+   the wait: the hooks, connections and scheduler stay. Setup reports no progress
+   to the server. Debug builds read `DEVDIARY_DEBUG_FIRST_SESSION_WAIT` (seconds) so
+   the install harness can shorten the wait; release builds do not.
+
+Every setup exit prints what happened, what changed on this machine and what was
+sent to DevDiary, and one `Next:` command. A failed exit of any command then prints
+`error_code: <code>` and exits with status 2. An error without a stable code prints
+`error_code: unexpected_error`, so no path or server text reaches the terminal.
 
 `sync CONNECTION_DIR` sends batches of 100 at most 10 times and stops at the first
 batch that a 401/403, 429, 5xx or network failure stops, when no full batch is

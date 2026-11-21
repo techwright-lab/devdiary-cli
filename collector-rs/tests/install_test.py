@@ -8,6 +8,7 @@ import os
 import plistlib
 import pty
 import select
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -244,12 +245,14 @@ class InstallTest(unittest.TestCase):
         base = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith(("PAPERCLIP_", "XDG_", "HOME"))
+            if not k.startswith(("PAPERCLIP_", "XDG_", "HOME", "CODEX_HOME"))
         }
         return {
             **base,
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.config),
+            # Setup's wait for the first session ends at once unless a test sets it.
+            "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
             **self.scheduler.env(),
         }
 
@@ -347,7 +350,8 @@ class InstallTest(unittest.TestCase):
     def record(self):
         return json.loads((self.data / "install.json").read_text())
 
-    def spool(self, count, vendor="claude"):
+    def demo(self):
+        """A repository whose remote is the tracked one."""
         repo = self.root / "demo"
         if not repo.exists():
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -363,6 +367,10 @@ class InstallTest(unittest.TestCase):
                 ],
                 check=True,
             )
+        return repo
+
+    def spool(self, count, vendor="claude"):
+        repo = self.demo()
         record = self.record()
 
         def hook(_):
@@ -571,7 +579,7 @@ class InstallTest(unittest.TestCase):
         )
         self.assertEqual(doctor["timer"], self.scheduler.running())
         self.assertEqual(doctor["pending"], 1)
-        self.assertNotIn(b"collector_error", result.stderr)
+        self.assertNotIn(b"error_code", result.stderr)
         self.assertIn(f"{self.settings} is not valid JSON".encode(), result.stderr)
         self.assertIn(b"line 3, column 3", result.stderr)
         self.assertEqual(self.settings.read_bytes(), broken)
@@ -589,7 +597,6 @@ class InstallTest(unittest.TestCase):
     def test_upgrade_replaces_the_registration_with_a_fresh_plan(self):
         self.install()
         before = self.owned_entries()["Stop"][0]["hooks"][0]["command"]
-        self.install(code=2)
         out = self.run_collector("upgrade", "--yes").stdout.decode()
         self.assertIn("Self-test passed", out)
         entries = self.owned_entries()
@@ -606,7 +613,7 @@ class InstallTest(unittest.TestCase):
 
     def test_without_a_terminal_setup_refuses_before_pairing(self):
         result = self.run_collector(*self.install_args()[1:], code=2)
-        self.assertIn(b"consent_required", result.stderr)
+        self.assertIn(b"error_code: no_terminal", result.stderr)
         self.assertNotIn(b"--yes", result.stderr)
         self.assertEqual(self.settings.read_bytes(), self.original)
         self.assertFalse(self.data.exists())
@@ -740,9 +747,9 @@ class InstallTest(unittest.TestCase):
         self.assertIn(self.scheduler.stopped()[0], self.scheduler.changes())
         self.assertFalse(self.scheduler.defined())
 
-    def test_install_without_a_settings_file_says_so(self):
+    def test_a_named_harness_without_a_settings_file_says_so(self):
         self.settings.unlink()
-        result = self.install(code=2)
+        result = self.install("--vendor", "claude", code=2)
         self.assertIn(b"settings_missing", result.stderr)
         self.assertNotIn(b"Setup incomplete", result.stderr)
         self.assertFalse(self.data.exists())
@@ -831,7 +838,7 @@ class InstallTest(unittest.TestCase):
             with self.subTest(args=args[:2]):
                 result = self.run_collector(*args, code=2)
                 self.assertEqual(result.stdout, b"")
-                self.assertIn(b"collector_error: invalid_command", result.stderr)
+                self.assertIn(b"error_code: invalid_command", result.stderr)
                 self.assertEqual(list(state.iterdir()), [])
         self.assertFalse(hasattr(self, "installation"))
         self.assertFalse(self.data.exists())
@@ -1316,6 +1323,219 @@ class InstallTest(unittest.TestCase):
         self.install()
         self.spool(1)
         self.assertIsNotNone(self.timer_sync()["last_receipt"])
+
+    # Guided setup: every harness found, one approval, then the first session.
+
+    BOTH = (b"both\n", b"y\n", b"y\n")
+
+    def find_codex(self, raw=b'{"hooks":{}}'):
+        settings = self.home / ".codex/hooks.json"
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_bytes(raw)
+        settings.chmod(0o600)
+        return settings
+
+    def waiting_for(self, seconds):
+        return {**self.env(), "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": str(seconds)}
+
+    def hook_event(self, vendor):
+        """One event from a session in the tracked repository, as the harness sends it."""
+        data = self.codex_data if vendor == "codex" else self.data
+        record = json.loads((data / "install.json").read_text())
+        event = {
+            "hook_event_name": "SessionStart",
+            "session_id": str(uuid.uuid4()),
+            "cwd": str(self.demo()),
+        }
+        subprocess.run(
+            [record["executable"], "hook", vendor, record["plan"]],
+            input=json.dumps(event).encode(),
+            env=self.env(),
+            timeout=10,
+            check=True,
+        )
+
+    def assert_failed_exit(self, err, code):
+        lines = err.decode().splitlines()
+        self.assertEqual(lines[-1], f"error_code: {code}")
+        self.assertTrue(lines[-2].startswith("Next: "), lines)
+
+    def test_both_harnesses_found_are_set_up_after_one_approval(self):
+        codex = self.find_codex()
+        out = self.install(answers=self.BOTH).stdout.decode()
+        steps = [
+            "1. Check this machine",
+            "2. Choose what DevDiary may change",
+            "3. Approve this machine in DevDiary",
+            "4. Wait for your first session",
+        ]
+        self.assertEqual(
+            [out.index(step) for step in steps],
+            sorted(out.index(step) for step in steps),
+        )
+        (start,) = self.contract.starts()
+        self.assertEqual(start["harnesses"], ["claude-code", "codex"])
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
+        self.assertIn(" hook codex ", codex.read_text())
+        self.assertTrue((self.data / "install.json").is_file())
+        self.assertTrue((self.codex_data / "install.json").is_file())
+        self.assertEqual(
+            self.scheduler.changes(),
+            [*self.scheduler.started("claude"), *self.scheduler.started("codex")],
+        )
+        self.assertIn("/hooks", out)
+        self.assertEqual(out.splitlines()[-1], "Next: devdiary doctor")
+        # Setup reports no progress: no request reached the server beyond pairing and scope reads.
+        self.assertEqual(self.received, [])
+
+    def test_choosing_one_harness_asks_only_about_that_one(self):
+        self.find_codex()
+        status, _, err, asked = terminal.answering(
+            self.install_args(), self.env(), (b"codex\n", b"y\n")
+        )
+        self.assertEqual(status, 0, err)
+        self.assertEqual(asked, 2)
+        self.assertEqual(self.contract.starts()[0]["harnesses"], ["codex"])
+        self.assertEqual(self.settings.read_bytes(), self.original)
+
+    def test_vendor_skips_the_choice_of_harnesses(self):
+        self.find_codex()
+        result = self.install("--vendor", "codex")
+        self.assertNotIn(terminal.CHOICE, result.stdout)
+        self.assertEqual(self.contract.starts()[0]["harnesses"], ["codex"])
+
+    def test_a_declined_harness_is_left_as_it_was_and_the_other_is_set_up(self):
+        codex = self.find_codex()
+        self.install(answers=(b"both\n", b"y\n", b"n\n"))
+        (start,) = self.contract.starts()
+        self.assertEqual(start["harnesses"], ["claude-code"])
+        self.assertTrue((self.data / "install.json").is_file())
+        self.assertEqual(codex.read_bytes(), b'{"hooks":{}}')
+        self.assertFalse(self.codex_data.exists())
+        self.assertFalse(self.scheduler.defined("codex"))
+
+    def test_declining_every_harness_sends_and_changes_nothing(self):
+        codex = self.find_codex()
+        result = self.install(code=2, answers=(b"both\n", b"n\n", b"n\n"))
+        self.assert_failed_exit(result.stderr, "consent_declined")
+        self.assertIn(b"Changed on this machine: nothing", result.stderr)
+        self.assertIn(b"Sent to DevDiary: nothing", result.stderr)
+        self.assertEqual(self.contract.starts(), [])
+        self.assertEqual(self.settings.read_bytes(), self.original)
+        self.assertEqual(codex.read_bytes(), b'{"hooks":{}}')
+        self.assertFalse(self.data.exists())
+        self.assertFalse(self.codex_data.exists())
+        self.assertEqual(self.scheduler.changes(), [])
+
+    def test_an_installed_harness_is_shown_and_not_offered_again(self):
+        self.install()
+        self.find_codex()
+        status, out, err, asked = terminal.answering(
+            self.install_args(), self.env(), (b"y\n",)
+        )
+        self.assertEqual(status, 0, err)
+        self.assertEqual(asked, 1)
+        self.assertIn(b"Claude Code: already set up", out)
+        self.assertEqual(self.contract.starts()[-1]["harnesses"], ["codex"])
+
+    def test_with_every_harness_set_up_setup_says_so_and_names_doctor(self):
+        self.install()
+        log = self.scheduler.changes()
+        out = self.install(answers=()).stdout
+        self.assertIn(b"already set up", out)
+        self.assertEqual(out.splitlines()[-1], b"Next: devdiary doctor")
+        self.assertEqual(len(self.contract.starts()), 1)
+        self.assertEqual(self.scheduler.changes(), log)
+
+    def test_with_no_harness_found_setup_names_the_paths_it_checked(self):
+        self.settings.unlink()
+        result = self.install(code=2)
+        self.assert_failed_exit(result.stderr, "no_harness_found")
+        shown = result.stdout + result.stderr
+        self.assertIn(str(self.settings).encode(), shown)
+        self.assertIn(str(self.home / ".codex").encode(), shown)
+        self.assertEqual(self.contract.starts(), [])
+        self.assertFalse(self.data.exists())
+
+    def test_a_self_test_failure_in_one_harness_lets_the_other_finish(self):
+        self.find_codex()
+        # Claude goes first. Its pinned copy changes as its job starts, just
+        # before its self-test, so the hook refuses to run it.
+        pinned = self.data / VERSION / "devdiary"
+        self.scheduler.write(
+            (FAKE_LAUNCHCTL if DARWIN else FAKE_SYSTEMCTL)
+            + f"case \"$*\" in *enable*claude-sync*|bootstrap*claude-sync*) printf x >> '{pinned}' ;; esac\n"
+        )
+        result = self.install(code=2, answers=self.BOTH)
+        self.assert_failed_exit(result.stderr, "self_test_failed")
+        self.assertIn(b"Claude Code", result.stderr)
+        codex = self.run_collector("doctor", "--vendor", "codex").stdout
+        self.assertEqual(json.loads(codex)["registration"]["registration"], "installed")
+        self.assertIn(self.scheduler.started("codex")[-1], self.scheduler.changes())
+
+    def test_the_wait_ends_at_its_limit_with_recording_on(self):
+        began = time.monotonic()
+        out = self.install(env=self.waiting_for(2)).stdout
+        self.assertGreaterEqual(time.monotonic() - began, 2)
+        self.assertIn(b"Recording is on", out)
+        self.assertEqual(out.splitlines()[-1], b"Next: devdiary doctor")
+        self.assertTrue((self.data / "install.json").is_file())
+
+    def test_the_first_receipt_ends_the_wait_and_names_the_harness_and_time(self):
+        self.find_codex()
+        started = []
+
+        def start_a_codex_session(out):
+            if b"4. Wait for your first session" in out and not started:
+                started.append(True)
+                self.hook_event("codex")
+
+        began = time.monotonic()
+        status, out, err, _ = terminal.answering(
+            self.install_args(),
+            self.waiting_for(60),
+            self.BOTH,
+            typing=start_a_codex_session,
+        )
+        self.assertEqual(status, 0, err)
+        self.assertLess(time.monotonic() - began, 40)
+        self.assertEqual(len(self.received), 1)
+        self.assertRegex(
+            out.decode(), r"first session from Codex at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+        )
+        self.assertEqual(out.splitlines()[-1], b"Next: devdiary doctor")
+
+    def test_ctrl_c_stops_only_the_wait(self):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        process = subprocess.Popen(
+            self.install_args(),
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.waiting_for(60),
+        )
+        os.close(slave)
+        seen, answered = b"", 0
+        deadline = time.monotonic() + 30
+        while b"Ctrl+C" not in seen and time.monotonic() < deadline:
+            ready, _, _ = select.select([process.stdout], [], [], 0.5)
+            if ready:
+                seen += os.read(process.stdout.fileno(), 4096)
+            if terminal.questions(seen) > answered:
+                os.write(master, b"y\n")
+                answered += 1
+        self.assertIn(b"Ctrl+C", seen)
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=10)
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
+        self.assertTrue((self.data / "install.json").is_file())
+        self.assertTrue((self.data / "connection/connection.json").is_file())
+        self.assertEqual(self.scheduler.changes(), self.scheduler.started())
 
 
 if __name__ == "__main__":

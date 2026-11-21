@@ -55,14 +55,16 @@ def save(
 
 
 def environment(root, home, base=None):
-    """HOME, a unit folder and a fake systemctl under `root`."""
+    """HOME, a unit folder and a fake systemctl under `root`, and no wait for a first session."""
     systemctl = Path(root) / "bin/systemctl"
     systemctl.parent.mkdir(exist_ok=True)
     systemctl.write_text(FAKE_SYSTEMCTL)
     systemctl.chmod(0o700)
+    base = os.environ if base is None else base
     return {
-        **(os.environ if base is None else base),
+        **{k: v for k, v in base.items() if k != "CODEX_HOME"},
         "HOME": str(home),
+        "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
         "XDG_CONFIG_HOME": str(Path(root) / "config"),
         "DEVDIARY_COLLECTOR_SYSTEMCTL": str(systemctl),
     }
