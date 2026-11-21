@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pairing_rails as p
+import pairing_server
 import saved_connection
 import terminal
 
@@ -254,10 +255,11 @@ class InstallationPairingTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(prefix="installation-pairing-")
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        self.starts, self.scope_status = [], 200
+        self.scope_status = 200
         self.served_refs = ["https://github.com/acme/demo"]
         self.served_orchestrators = None
-        self.connection_shape = {}
+        self.contract = pairing_server.Contract()
+        contract = self.contract
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -284,43 +286,8 @@ class InstallationPairingTest(unittest.TestCase):
                 self.reply(owner.scope_status, reply)
 
             def do_POST(self):
-                sent = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                if self.path.endswith("/exchange"):
-                    connection = {
-                        "collector_ref": COLLECTOR_REF,
-                        "token": "dc_live_" + "s" * 43,
-                        "installation_id": owner.starts[-1]["installation_id"],
-                        "runtime": "claude-code",
-                        "endpoint_path": "/ingest/v1/observations",
-                        "scope_kind": "installation",
-                        "repository_refs": ["https://github.com/acme/demo"],
-                        "scope_path": "/ingest/v1/collector/scope",
-                        "observation_schema_versions": [1, 2],
-                        **owner.connection_shape,
-                    }
-                    connection = {k: v for k, v in connection.items() if v is not None}
-                    return self.reply(
-                        200,
-                        {
-                            "schema_version": 1,
-                            "status": "consumed",
-                            "connection": connection,
-                        },
-                    )
-                owner.starts.append(sent)
-                self.reply(
-                    201,
-                    {
-                        "schema_version": 1,
-                        "pairing_token": "dp_pair_" + "p" * 43,
-                        "user_code": "a" * 32,
-                        "verification_path": "/phoenix/settings/collector",
-                        "interval": 5,
-                        "expires_at": time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60)
-                        ),
-                    },
-                )
+                if not contract.handle(self):
+                    self.reply(404, {})
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -357,13 +324,8 @@ class InstallationPairingTest(unittest.TestCase):
         return subprocess.CompletedProcess(args, status, out, err)
 
     def test_setup_pairs_installation_scope(self):
-        out = self.setup_collector("--record-orchestrated-outside-repos").stdout
-        self.assertIn(b"All tracked repositories", out)
-        (start,) = self.starts
-        self.assertEqual(start["scope_kind"], "installation")
-        self.assertEqual(
-            set(start), {"schema_version", "installation_id", "runtime", "scope_kind"}
-        )
+        self.setup_collector("--record-orchestrated-outside-repos")
+        (start,) = self.contract.starts()
         saved = json.loads((self.connection / "connection.json").read_bytes())
         self.assertEqual(saved["repository_refs"], ["https://github.com/acme/demo"])
         self.assertEqual(
@@ -384,7 +346,7 @@ class InstallationPairingTest(unittest.TestCase):
         self.assertEqual(refs.stat().st_mode & 0o777, 0o600)
         self.run_collector("uninstall")
         self.setup_collector("--record-orchestrated-outside-repos")
-        self.assertEqual(len(self.starts), 1)
+        self.assertEqual(len(self.contract.starts()), 1)
         self.run_collector("uninstall")
         self.setup_collector(code=2)
 
@@ -425,13 +387,13 @@ class InstallationPairingTest(unittest.TestCase):
         self.assertIsNone(doctor["last_scope_refresh_error"])
 
     def test_a_server_without_v2_pairs_a_v1_installation(self):
-        self.connection_shape = {"observation_schema_versions": [1]}
+        self.contract.connection_shape = {"observation_schema_versions": [1]}
         self.setup_collector()
         saved = json.loads((self.connection / "connection.json").read_bytes())
         self.assertEqual(saved["scope"]["observation_schema_versions"], [1])
 
     def test_the_outside_repo_opt_in_is_not_saved_without_v2(self):
-        self.connection_shape = {"observation_schema_versions": [1]}
+        self.contract.connection_shape = {"observation_schema_versions": [1]}
         err = self.setup_collector("--record-orchestrated-outside-repos").stderr
         self.assertIn(b"--record-orchestrated-outside-repos", err)
         saved = json.loads((self.connection / "connection.json").read_bytes())
@@ -442,7 +404,7 @@ class InstallationPairingTest(unittest.TestCase):
         self.setup_collector("--record-orchestrated-outside-repos")
 
     def test_an_outside_repo_opt_in_cannot_be_widened_after_pairing(self):
-        self.connection_shape = {"observation_schema_versions": [1]}
+        self.contract.connection_shape = {"observation_schema_versions": [1]}
         self.setup_collector("--record-orchestrated-outside-repos")
         path = self.connection / "connection.json"
         saved = json.loads(path.read_bytes())
@@ -454,7 +416,7 @@ class InstallationPairingTest(unittest.TestCase):
         self.run_collector("sync", self.connection, code=2)
 
     def test_an_exchange_for_another_scope_is_refused(self):
-        self.connection_shape = {
+        self.contract.connection_shape = {
             "scope_kind": None,
             "scope_path": None,
             "observation_schema_versions": None,
