@@ -113,32 +113,51 @@ release and no attestation.
 
 ## Customer browser pairing (experimental client)
 
-Requires the backend contract in [DevDiary PR #571](https://github.com/techwright-lab/DevDiary/pull/571)
-**merged and deployed separately**. This client PR does not deploy/enable it. The
-ordinary origin is `https://devdiary.me`; no manual collector ref, ingest endpoint,
-installation UUID or credential file contents are needed. This is DevDiary-specific
-browser approval, not OAuth/device authorization.
+The ordinary origin is `https://devdiary.me`; no manual collector ref, ingest
+endpoint, installation UUID or credential file contents are needed. This is
+DevDiary-specific browser approval, not OAuth/device authorization.
 
 `devdiary setup` runs the pairing described here, then the registration steps
-under one-command setup. Paste the displayed one-time code into the browser and
-approve metadata collection for this machine's installation.
+under one-command setup. One pairing request covers every harness setup was
+asked to connect. It names the harnesses, installation scope, a new installation
+ID, the hostname, the OS name and version, the CPU architecture and the CLI
+version. It names no local username, hardware ID or serial number. The terminal
+prints an approval code such as `KBRT-WMPH` and the link
+`<origin>/collector/approve?code=KBRT-WMPH`, and opens that link in the browser.
+The approval code is not a secret: it only finds the request.
 
+- Setup listens on `127.0.0.1` only, on a port the operating system picks, and
+  names that port in the request. After approval, the browser returns to
+  `http://127.0.0.1:<port>/callback` with a verifier. Setup takes it only from a
+  request that names its own approval code, with the `Host` header
+  `127.0.0.1:<port>`, and answers "Connected. Return to the terminal." once the
+  connections are saved. If setup cannot listen, the request names no port, and
+  the approval page shows the verifier behind "Terminal didn't connect?".
+- The terminal also accepts the verifier typed in at any point while it waits.
+  Case, hyphens and spaces do not matter. Presenting the verifier is the only way
+  to receive connections: one per harness, each with its own credential, outbox
+  and revocation. Setup then prints the name of the workspace it connected to.
+- A denied request stops setup with `pairing_denied`. Five wrong verifiers deny
+  the request too. Nothing local changes, and the next `setup` starts afresh.
+- An expired request starts a fresh one and prints its new code and link. The
+  start rate limit still applies, and its `Retry-After` cooldown survives a
+  process restart. Status polls wait the advertised interval (at least five
+  seconds) and honour an integer `Retry-After`.
+- The client never falls back to the older pairing contract.
 - Verified TLS, no redirect following, no ambient proxy use, bounded responses and
   five-second request deadlines. Alternate origins require both `--origin ORIGIN`
   and `--trust-origin`; HTTP is accepted only for numeric loopback development.
-  `--no-browser` prints the same constant browser URL instead of opening it.
-  Neither approval code nor pairing/collector bearer is ever put in a URL, child
-  argument, environment variable, vendor settings or diagnostic. Only the user
-  code is displayed for pasting; do not capture/share terminal logs containing it.
-- Polling waits the advertised interval (at least five seconds), honors integer
-  `Retry-After`, and stops at expiry. Start-rate cooldowns survive process restart.
-  Ctrl-C leaves no hooks and no persisted pairing bearer. If exchange might have
-  consumed the credential (network loss, interruption, terminal response, failed
-  persistence), setup refuses to pair again in that folder. Revoke unused
-  connections in the browser, move the connection folder aside, and run `setup`
-  again; it then pairs a new installation. There is no secret replay/recovery
-  endpoint. If `connection.json` was committed, ordinary `setup` resumes local
-  initialization without issuing another credential.
+  `--no-browser` prints the link without opening it. No pairing or collector
+  bearer is ever put in a URL, child argument, environment variable, vendor
+  settings or diagnostic.
+- Ctrl-C while setup waits leaves nothing behind. Only presenting a verifier can
+  issue connections, so setup marks the folder before it does. If the answer to a
+  presented verifier is lost, or a saved connection fails to write, setup refuses
+  to pair again in that folder. Revoke unused connections in the browser, move the
+  connection folder aside, and run `setup` again; it then pairs a new
+  installation. There is no secret replay or recovery endpoint. If
+  `connection.json` was committed, ordinary `setup` resumes local initialization
+  without issuing another credential.
 - `connection.json` atomically commits the token and frozen scope together (0600,
   fsync, no overwrite); credentials stay outside `outbox/`. Do not print or commit
   it. A killed writer can leave a private `.pairing-*.tmp`; these are not adopted
@@ -153,9 +172,12 @@ approve metadata collection for this machine's installation.
 - Sync treats 401/403 as revocation: it writes `connection/revoked`, stops, and
   refuses later syncs. The hook then stops spooling and counts a `revoked` drop.
 
-Verification: `python3 collector-rs/tests/pairing.py -v` (mock transport and
-subprocess fixtures through `devdiary setup`). The real Rails pairing harness waits
-for [#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
+Verification: `python3 collector-rs/tests/pairing.py -v` runs `devdiary setup`
+against `collector-rs/tests/pairing_server.py`, a local server that applies the
+pairing contract's rules. Debug builds also honour `DEVDIARY_DEBUG_OPENER` (the
+program that opens the link) and `DEVDIARY_DEBUG_CALLBACK_PORT` (the port setup
+tries to listen on); release builds read neither. The real Rails pairing harness
+waits for [#57](https://github.com/techwright-lab/devdiary-cli/issues/57).
 
 ## One-command setup (systemd user timer on Linux, launchd agent on macOS)
 

@@ -6,8 +6,9 @@ use devdiary::{
 use std::{io::Read, path::Path, sync::mpsc, time::Duration};
 
 // Static refusal codes only; other errors can carry input or paths.
-const REPORTED: [&str; 30] = [
+const REPORTED: [&str; 31] = [
     "invalid_command",
+    "pairing_denied",
     "backup_kept",
     "platform_unsupported",
     "scheduler_unreachable",
@@ -114,7 +115,7 @@ fn fixed_hint(code: &str) -> &'static str {
         "owned_entry_changed" | "owned_entry_missing" => {
             "The collector's hook entries in the settings were edited, so the settings were left as they are. Restore or delete those entries, then run uninstall again."
         }
-        _ => "",
+        _ => devdiary::pairing::guidance(code).unwrap_or(""),
     }
 }
 fn setup_options(
