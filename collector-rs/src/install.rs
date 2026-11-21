@@ -1,8 +1,9 @@
-//! One-command install: check the machine, pair, pin a versioned binary,
-//! register the hooks only after consent, then deliver the spool from the
-//! scheduler: a systemd user timer on Linux, a launchd agent on macOS.
+//! One-command install: check the machine, ask for each harness, pair them all
+//! with one approval, pin a versioned binary and register each harness's hooks,
+//! then deliver the spool from the scheduler: a systemd user timer on Linux, a
+//! launchd agent on macOS.
 use crate::{
-    Object, Result, claude, drops, object, orchestrators, pairing, platform,
+    Object, Result, claude, drops, exit, object, orchestrators, pairing, platform,
     scheduler::{Os, Scheduler},
     store::{Report, Store, private},
     text,
@@ -10,6 +11,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    cell::Cell,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{BufRead, IsTerminal, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
@@ -30,7 +32,8 @@ const OUTSIDE_ON: &str = "Your sessions outside repositories are now recorded: e
 const BATCHES: usize = 10;
 
 pub struct Options<'a> {
-    pub vendor: Vendor,
+    /// The harness `--vendor` named, or None to set up every harness found.
+    pub vendor: Option<Vendor>,
     pub origin: Option<&'a str>,
     pub trust_origin: bool,
     pub settings: Option<&'a Path>,
@@ -151,7 +154,7 @@ fn pin_binary(data: &Path) -> Result<PathBuf> {
 
 fn require_consent_channel(yes: bool) -> Result<()> {
     if !yes && !std::io::stdin().is_terminal() {
-        return Err("consent_required".into());
+        return Err("no_terminal".into());
     }
     Ok(())
 }
@@ -192,77 +195,470 @@ fn warn_other_on_path() {
         );
     }
 }
+/// The guided setup: check this machine, ask for each harness found, pair every
+/// accepted harness with one approval, set each up, then wait for a first session.
 pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
+    let mut journal = Journal::default();
+    let Err(error) = guided(&o, scheduler, &mut journal) else {
+        return Ok(());
+    };
+    let harness = error.downcast_ref::<Stopped>().map(|s| s.vendor);
+    let code = exit::code(error.as_ref());
+    let guidance = exit::guidance(&code);
+    match harness {
+        Some(vendor) => eprintln!("{}: {guidance}", vendor.name()),
+        None if !guidance.is_empty() => eprintln!("{guidance}"),
+        None => {}
+    }
+    for line in journal.lines() {
+        eprintln!("{line}");
+    }
+    if let Some(next) = next(&code, harness) {
+        eprintln!("Next: {next}");
+    }
+    Err(Box::new(exit::Shown(code)))
+}
+
+/// What setup changed on this machine and sent to DevDiary, for its exit.
+#[derive(Default)]
+struct Journal {
+    changed: Vec<String>,
+    sent: Vec<String>,
+}
+impl Journal {
+    fn lines(&self) -> [String; 2] {
+        let list = |title: &str, items: &[String]| {
+            if items.is_empty() {
+                format!("{title}: nothing.")
+            } else {
+                format!("{title}:\n  {}", items.join("\n  "))
+            }
+        };
+        [
+            list("Changed on this machine", &self.changed),
+            list("Sent to DevDiary", &self.sent),
+        ]
+    }
+}
+
+/// A harness that stopped in step 3 while the others went on.
+#[derive(Debug)]
+struct Stopped {
+    vendor: Vendor,
+    code: String,
+}
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.code)
+    }
+}
+impl std::error::Error for Stopped {}
+
+/// The one command a failed setup names.
+fn next(code: &str, harness: Option<Vendor>) -> Option<String> {
+    let doctor = match harness {
+        Some(Vendor::Codex) => "devdiary doctor --vendor codex",
+        _ => "devdiary doctor",
+    };
+    Some(
+        match code {
+            "platform_unsupported" => return None,
+            "no_terminal" => "devdiary setup, in a terminal",
+            "executable_format_unsupported" => "curl -fsSL https://devdiary.me/cli/install.sh | sh",
+            "old_collector_registered" => "devdiary-collector uninstall",
+            "backup_kept" => "devdiary setup, after you remove one of the two files",
+            "no_harness_found" => "devdiary setup, after you start Claude Code or Codex once",
+            "invalid_settings"
+            | "unsafe_settings"
+            | "python_observer_registered"
+            | "already_registered" => "devdiary setup, after you fix the settings file",
+            "connection_revoked"
+            | "setup_incomplete"
+            | "approved_scope_mismatch"
+            | "frozen_scope_conflict"
+            | "repair_required" => "devdiary setup, after you move the connection folder aside",
+            "start_rate_limited" => "devdiary setup, once the wait has passed",
+            "self_test_failed" | "timer_unavailable" | "unexpected_error" => doctor,
+            refresh if refresh.starts_with("scope_refresh_") => doctor,
+            _ => "devdiary setup",
+        }
+        .into(),
+    )
+}
+
+/// A harness found in step 1 and not set up yet.
+struct Found {
+    vendor: Vendor,
+    data: PathBuf,
+    settings: PathBuf,
+    /// The settings as checked, or None for a Codex hooks file that does not exist yet.
+    agreed: Option<String>,
+}
+/// A harness the person agreed to, with the entries they were shown.
+struct Accepted {
+    registration: Registration,
+    shown: Vec<String>,
+    agreed: String,
+}
+
+fn guided(o: &Options<'_>, scheduler: &Scheduler<'_>, journal: &mut Journal) -> Result<()> {
     warn_other_on_path();
     require_consent_channel(false)?;
+    println!("1. Check this machine");
     platform::preflight(scheduler)?;
-    let data = data_dir(o.vendor)?;
-    let settings = match o.settings {
-        Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(_) => return Err("unsupported_path".into()),
-        None if o.vendor == Vendor::Codex => match std::env::var_os("CODEX_HOME") {
-            Some(root) if Path::new(&root).is_absolute() => PathBuf::from(root).join("hooks.json"),
-            Some(_) => return Err("unsupported_path".into()),
-            None => home()?.join(".codex/hooks.json"),
-        },
-        None => home()?.join(".claude/settings.json"),
-    };
-    if record(&data)?.is_some() {
-        return Err("already_installed".into());
-    }
+    println!(
+        "  This machine: {}",
+        match scheduler.os {
+            Os::Linux => "Linux, with a systemd user session",
+            Os::Macos => "macOS, with a GUI login session for launchd",
+        }
+    );
     let origin = o.origin.unwrap_or(pairing::DEFAULT_ORIGIN);
     pairing::origin(origin, o.trust_origin)?;
-    if o.vendor == Vendor::Codex && settings.extension().is_some_and(|e| e == "toml") {
-        return Err("codex_hooks_json_required".into());
-    }
-    offer_restore(&data, &settings)?;
-    // Codex need not have a hooks file yet. Never initialize or rewrite config.toml.
-    if o.vendor == Vendor::Codex && !settings.exists() {
-        consent(
-            false,
-            &format!(
-                "Create an empty Codex hooks file at {}?",
-                settings.display()
-            ),
-        )?;
-        let parent = settings.parent().ok_or("invalid_path")?;
-        if !parent.exists() {
-            private_dir(parent)?;
+    let found = check(o, journal)?;
+    if found.is_empty() {
+        println!(
+            "Every harness setup found is already set up, so nothing changed. To move its hooks to this build, run `devdiary upgrade`."
+        );
+        for line in journal.lines() {
+            println!("{line}");
         }
-        crate::store::owner_writable(parent, true)?;
-        save_using(&settings, &json!({}), false)?;
+        println!("Next: devdiary doctor");
+        return Ok(());
     }
-    let agreed = claude::preflight(&settings)?;
-    if revoked(&data) {
-        return Err("connection_revoked".into());
+
+    println!("\n2. Choose what DevDiary may change");
+    let accepted = choose(found, scheduler.os, journal)?;
+    if accepted.is_empty() {
+        return Err("consent_declined".into());
     }
-    // The entries depend only on the pinned path, the plan path and the harness,
-    // so the person agrees to them before a connection exists.
-    let exe = pinned(&data);
-    let registration = Registration::new(&data, &settings, &exe, o.vendor)?;
-    let shown = registration.show()?;
-    consent(false, &start_question(scheduler.os, o.vendor))?;
-    private_dir(&data)?;
-    let root = connection(&data);
-    pairing::setup(pairing::Options {
-        harnesses: &[pairing::Harness {
-            vendor: o.vendor,
-            root: &root,
-        }],
+
+    println!("\n3. Approve this machine in DevDiary");
+    pair(o, origin, &accepted, journal)?;
+    let mut stopped = Vec::new();
+    let mut ready = Vec::new();
+    for a in &accepted {
+        let vendor = a.registration.vendor;
+        match set_up(a, scheduler, journal) {
+            Ok(()) => ready.push(a),
+            Err(error) => {
+                let code = exit::code(error.as_ref());
+                println!("  {}: stopped with {code}.", vendor.name());
+                stopped.push(Stopped { vendor, code });
+            }
+        }
+    }
+    for a in &ready {
+        let vendor = a.registration.vendor;
+        if let Err(error) = offer_orchestrators(&a.registration.data, vendor) {
+            let code = exit::code(error.as_ref());
+            stopped.push(Stopped { vendor, code });
+        }
+    }
+    if let Some(first) = stopped.into_iter().next() {
+        return Err(Box::new(first));
+    }
+
+    let names = |or: &str| {
+        let names: Vec<_> = ready.iter().map(|a| a.registration.vendor.name()).collect();
+        names.join(or)
+    };
+    println!("Recording is on for {}.", names(" and "));
+    for line in journal.lines() {
+        println!("{line}");
+    }
+    println!("\n4. Wait for your first session");
+    println!(
+        "Start a session in {} in a repository DevDiary tracks. Setup waits up to 15 minutes for DevDiary to receive it. Ctrl+C stops only this wait: recording stays on, and `devdiary doctor` shows its state.",
+        names(" or ")
+    );
+    std::io::stdout().flush()?;
+    let roots: Vec<_> = ready
+        .iter()
+        .map(|a| (a.registration.vendor, connection(&a.registration.data)))
+        .collect();
+    match first_session(&roots, first_session_wait())? {
+        Some((vendor, at)) => println!(
+            "DevDiary received the first session from {} at {at}.",
+            vendor.name()
+        ),
+        None => println!(
+            "No session reached DevDiary while setup waited. Recording is on: the {} sends sessions every 2 minutes.",
+            match scheduler.os {
+                Os::Linux => "timer",
+                Os::Macos => "launch agent",
+            }
+        ),
+    }
+    println!("Next: devdiary doctor");
+    Ok(())
+}
+
+fn settings_path(vendor: Vendor, given: Option<&Path>) -> Result<PathBuf> {
+    match given {
+        Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
+        Some(_) => Err("unsupported_path".into()),
+        None if vendor == Vendor::Codex => match std::env::var_os("CODEX_HOME") {
+            Some(root) if Path::new(&root).is_absolute() => {
+                Ok(PathBuf::from(root).join("hooks.json"))
+            }
+            Some(_) => Err("unsupported_path".into()),
+            None => Ok(home()?.join(".codex/hooks.json")),
+        },
+        None => Ok(home()?.join(".claude/settings.json")),
+    }
+}
+// Claude Code is found by its settings file. Codex by its home folder, because
+// its hooks file need not exist yet.
+fn searched(vendor: Vendor, settings: &Path) -> &Path {
+    match vendor {
+        Vendor::Claude => settings,
+        Vendor::Codex => settings.parent().unwrap_or(settings),
+    }
+}
+fn on_this_machine(vendor: Vendor, settings: &Path) -> bool {
+    searched(vendor, settings).exists() || fs::symlink_metadata(claude::backup(settings)).is_ok()
+}
+
+/// Step 1 for each harness: find it, skip it if installed, and stop on any
+/// refusal before anything is asked or sent.
+fn check(o: &Options<'_>, journal: &mut Journal) -> Result<Vec<Found>> {
+    // `--settings` names a Claude Code file unless `--vendor` says otherwise.
+    let named = o.vendor.or(o.settings.map(|_| Vendor::Claude));
+    let vendors = named.map_or(vec![Vendor::Claude, Vendor::Codex], |v| vec![v]);
+    let (mut found, mut installed) = (Vec::new(), false);
+    for vendor in vendors {
+        let settings = settings_path(vendor, o.settings)?;
+        let data = data_dir(vendor)?;
+        if named.is_none() && !on_this_machine(vendor, &settings) {
+            println!(
+                "  {}: not found (checked {})",
+                vendor.name(),
+                searched(vendor, &settings).display()
+            );
+            continue;
+        }
+        if record(&data)?.is_some() {
+            println!(
+                "  {}: already set up ({})",
+                vendor.name(),
+                settings.display()
+            );
+            installed = true;
+            continue;
+        }
+        println!("  {}: {}", vendor.name(), settings.display());
+        if vendor == Vendor::Codex && settings.extension().is_some_and(|e| e == "toml") {
+            return Err("codex_hooks_json_required".into());
+        }
+        offer_restore(&data, &settings, journal)?;
+        let agreed = if vendor == Vendor::Codex && !settings.exists() {
+            None
+        } else {
+            Some(claude::preflight(&settings)?)
+        };
+        if revoked(&data) {
+            return Err("connection_revoked".into());
+        }
+        found.push(Found {
+            vendor,
+            data,
+            settings,
+            agreed,
+        });
+    }
+    if found.is_empty() && !installed {
+        return Err("no_harness_found".into());
+    }
+    Ok(found)
+}
+
+/// Step 2: which harnesses, then a separate yes or no for each one's entries.
+fn choose(found: Vec<Found>, os: Os, journal: &mut Journal) -> Result<Vec<Accepted>> {
+    let chosen = if found.len() > 1 {
+        which(found)?
+    } else {
+        found
+    };
+    let mut accepted = Vec::new();
+    for h in chosen {
+        let name = h.vendor.name();
+        let agreed = match h.agreed {
+            Some(agreed) => agreed,
+            None => {
+                let question = format!(
+                    "Create an empty Codex hooks file at {}?",
+                    h.settings.display()
+                );
+                if !agrees(&question)? {
+                    println!("  {name}: not set up.");
+                    continue;
+                }
+                create_codex_hooks(&h.settings)?;
+                journal.changed.push(format!(
+                    "{name}: created an empty hooks file at {}.",
+                    h.settings.display()
+                ));
+                claude::preflight(&h.settings)?
+            }
+        };
+        let exe = pinned(&h.data);
+        let registration = Registration::new(&h.data, &h.settings, &exe, h.vendor)?;
+        let shown = registration.show()?;
+        if !agrees(&start_question(os, h.vendor))? {
+            println!("  {name}: not set up.");
+            continue;
+        }
+        accepted.push(Accepted {
+            registration,
+            shown,
+            agreed,
+        });
+    }
+    Ok(accepted)
+}
+fn agrees(question: &str) -> Result<bool> {
+    match consent(false, question) {
+        Ok(()) => Ok(true),
+        Err(error) if error.to_string() == "consent_declined" => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+fn which(found: Vec<Found>) -> Result<Vec<Found>> {
+    println!("Found Claude Code and Codex.");
+    loop {
+        print!("Set up which? Type both, claude or codex. [both/claude/codex] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().lock().take(64).read_line(&mut line)? == 0 {
+            return Err("consent_declined".into());
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "both" => return Ok(found),
+            answer => {
+                if let Ok(vendor) = Vendor::parse(answer) {
+                    return Ok(found.into_iter().filter(|h| h.vendor == vendor).collect());
+                }
+            }
+        }
+    }
+}
+// Codex need not have a hooks file yet. Never initialize or rewrite config.toml.
+fn create_codex_hooks(settings: &Path) -> Result<()> {
+    let parent = settings.parent().ok_or("invalid_path")?;
+    if !parent.exists() {
+        private_dir(parent)?;
+    }
+    crate::store::owner_writable(parent, true)?;
+    save_using(settings, &json!({}), false)
+}
+
+/// Step 3's one pairing request, for every accepted harness without a saved connection.
+fn pair(o: &Options<'_>, origin: &str, accepted: &[Accepted], journal: &mut Journal) -> Result<()> {
+    let roots: Vec<_> = accepted
+        .iter()
+        .map(|a| connection(&a.registration.data))
+        .collect();
+    let mut unpaired = Vec::new();
+    for (a, root) in accepted.iter().zip(&roots) {
+        private_dir(&a.registration.data)?;
+        if !root.join("connection.json").exists() {
+            unpaired.push((a.registration.vendor, root));
+        }
+    }
+    let harnesses: Vec<_> = accepted
+        .iter()
+        .zip(&roots)
+        .map(|(a, root)| pairing::Harness {
+            vendor: a.registration.vendor,
+            root,
+        })
+        .collect();
+    let sent = Cell::new(false);
+    let paired = pairing::setup(pairing::Options {
+        harnesses: &harnesses,
         origin,
         trust_origin: o.trust_origin,
         browser: o.browser,
         record_orchestrated_outside_repos: o.record_orchestrated_outside_repos,
+        sent: &sent,
+    });
+    if sent.get() {
+        let names: Vec<_> = unpaired.iter().map(|(v, _)| v.name()).collect();
+        journal.sent.push(format!(
+            "A pairing request for {}, with this machine's hostname, OS name and version, CPU and CLI version.",
+            names.join(" and ")
+        ));
+    }
+    for (vendor, root) in &unpaired {
+        if root.join("connection.json").exists() {
+            journal.changed.push(format!(
+                "{}: saved its connection in {}.",
+                vendor.name(),
+                root.display()
+            ));
+        }
+    }
+    paired.map_err(setup_failure)
+}
+/// Step 3 for one harness, after the exchange.
+fn set_up(a: &Accepted, scheduler: &Scheduler<'_>, journal: &mut Journal) -> Result<()> {
+    let r = &a.registration;
+    pin_binary(&r.data)?;
+    r.plan(&a.shown, Some(&a.agreed))?;
+    let name = r.vendor.name();
+    r.finish(scheduler, true, &mut |done| {
+        journal.changed.push(format!("{name}: {done}."))
     })
-    .map_err(setup_failure)?;
-    pin_binary(&data)?;
-    registration.plan(&shown, Some(&agreed))?;
-    registration.finish(scheduler, true)?;
-    offer_orchestrators(&data)
+}
+
+const FIRST_SESSION_WAIT: Duration = Duration::from_secs(15 * 60);
+// The scheduler sends too. Setup's own sync only shortens the wait, so a failed
+// one is tried again later rather than at every check.
+const RESYNC: Duration = Duration::from_secs(30);
+// Debug builds let the install harness shorten the wait. Release builds never read it.
+fn first_session_wait() -> Duration {
+    cfg!(debug_assertions)
+        .then(|| std::env::var("DEVDIARY_DEBUG_FIRST_SESSION_WAIT").ok())
+        .flatten()
+        .and_then(|seconds| seconds.parse().ok())
+        .map_or(FIRST_SESSION_WAIT, Duration::from_secs)
+}
+fn counts(root: &Path) -> Result<(i64, i64)> {
+    Store::open(&root.join("outbox"), None)?.counts()
+}
+/// Step 4: the first receipt any harness's outbox records, and when, read
+/// locally. Setup sends a harness's pending rows itself and reports nothing.
+fn first_session(roots: &[(Vendor, PathBuf)], limit: Duration) -> Result<Option<(Vendor, String)>> {
+    let before = roots
+        .iter()
+        .map(|(_, root)| counts(root).map(|(_, delivered)| delivered))
+        .collect::<Result<Vec<_>>>()?;
+    let deadline = Instant::now() + limit;
+    let mut sync_at = vec![Instant::now(); roots.len()];
+    loop {
+        for (i, (vendor, root)) in roots.iter().enumerate() {
+            if counts(root).is_ok_and(|(pending, _)| pending > 0) && Instant::now() >= sync_at[i] {
+                let _ = timer_sync(root);
+                sync_at[i] = Instant::now() + RESYNC;
+            }
+            if counts(root).is_ok_and(|(_, delivered)| delivered > before[i]) {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                let at = chrono::DateTime::from_timestamp(now as i64, 0).ok_or("invalid_time")?;
+                let at = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                return Ok(Some((*vendor, at)));
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(left.min(Duration::from_secs(1)));
+    }
 }
 // Asked before the settings are read: the copy holds them as they were before
 // an interrupted write.
-fn offer_restore(data: &Path, settings: &Path) -> Result<()> {
+fn offer_restore(data: &Path, settings: &Path, journal: &mut Journal) -> Result<()> {
     let backup = claude::backup(settings);
     if fs::symlink_metadata(&backup).is_err() {
         return Ok(());
@@ -283,6 +679,10 @@ fn offer_restore(data: &Path, settings: &Path) -> Result<()> {
                 claude::remove(&plan)?;
             }
             println!("Restored {}.", settings.display());
+            journal.changed.push(format!(
+                "Restored {} from the copy an earlier setup left.",
+                settings.display()
+            ));
             Ok(())
         }
         Err(error) if error.to_string() == "consent_declined" => Err("backup_kept".into()),
@@ -322,36 +722,40 @@ fn revoked(data: &Path) -> bool {
     pairing::revoked(&connection(data).join("outbox"))
 }
 fn setup_failure(error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
-    if pairing::known_diagnostic(error.as_ref()).is_some() {
+    if pairing::guidance(&error.to_string()).is_some() {
         error
     } else {
         "setup_incomplete".into()
     }
 }
 
-struct Registration<'a> {
+struct Registration {
     vendor: Vendor,
-    data: &'a Path,
-    settings: &'a Path,
-    exe: &'a Path,
+    data: PathBuf,
+    settings: PathBuf,
+    exe: PathBuf,
     plan: PathBuf,
 }
-impl<'a> Registration<'a> {
-    fn new(data: &'a Path, settings: &'a Path, exe: &'a Path, vendor: Vendor) -> Result<Self> {
+impl Registration {
+    fn new(data: &Path, settings: &Path, exe: &Path, vendor: Vendor) -> Result<Self> {
         let plans = data.join("plans");
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let plan = plans.join(format!("{}-{nanos}.json", vendor.slug()));
         Ok(Self {
             vendor,
-            data,
-            settings,
-            exe,
+            data: data.into(),
+            settings: settings.into(),
+            exe: exe.into(),
             plan,
         })
     }
     fn show(&self) -> Result<Vec<String>> {
-        println!("Hook entries to append to {}:", self.settings.display());
-        let lines = claude::entry_lines_for(&self.plan, self.exe, self.vendor)?;
+        println!(
+            "{} hook entries to append to {}:",
+            self.vendor.name(),
+            self.settings.display()
+        );
+        let lines = claude::entry_lines_for(&self.plan, &self.exe, self.vendor)?;
         for line in &lines {
             println!("  {line}");
         }
@@ -362,10 +766,10 @@ impl<'a> Registration<'a> {
     fn plan(&self, shown: &[String], agreed: Option<&str>) -> Result<()> {
         private_dir(self.plan.parent().ok_or("invalid_path")?)?;
         pairing::plan_with(
-            &connection(self.data),
-            self.settings,
+            &connection(&self.data),
+            &self.settings,
             &self.plan,
-            self.exe,
+            &self.exe,
             agreed,
         )?;
         if claude::entries(&self.plan)? != shown {
@@ -376,13 +780,23 @@ impl<'a> Registration<'a> {
     }
     // With a backup, setup keeps the copy until the install record names the
     // write: a run killed in between leaves the copy, and the next setup offers it.
-    fn finish(&self, scheduler: &Scheduler<'_>, backup: bool) -> Result<()> {
-        let (data, exe, plan) = (self.data, self.exe, &self.plan);
+    // `done` hears each change as it lands.
+    fn finish(
+        &self,
+        scheduler: &Scheduler<'_>,
+        backup: bool,
+        done: &mut dyn FnMut(String),
+    ) -> Result<()> {
+        let (data, exe, plan) = (&self.data, &self.exe, &self.plan);
         if backup {
             claude::apply_with_backup(plan)?;
         } else {
             claude::apply(plan)?;
         }
+        done(format!(
+            "wrote its hook entries to {}",
+            self.settings.display()
+        ));
         pause("hooks_written");
         if self.vendor == Vendor::Codex {
             println!(
@@ -394,16 +808,18 @@ impl<'a> Registration<'a> {
             &json!({"version": VERSION, "executable": exe, "plan": plan, "settings": self.settings}),
         )?;
         if backup {
-            claude::discard_backup(self.settings)?;
+            claude::discard_backup(&self.settings)?;
         }
         scheduler.enable(exe, &connection(data), self.vendor)?;
-        self_test(exe, plan, &connection(data).join("outbox"), self.vendor)?;
         let job = match scheduler.os {
-            Os::Linux => "The timer",
-            Os::Macos => "The launch agent",
+            Os::Linux => self.vendor.timer(),
+            Os::Macos => self.vendor.label(),
         };
+        done(format!("started {job}"));
+        self_test(exe, plan, &connection(data).join("outbox"), self.vendor)?;
         println!(
-            "Self-test passed: the installed hook recorded a local test event that is never uploaded.\n{job} syncs every 2 minutes. Run `devdiary doctor` (add `--vendor codex` for Codex) to check it."
+            "Self-test passed for {}: the installed hook recorded a local test event that is never uploaded. {job} syncs every 2 minutes.",
+            self.vendor.name()
         );
         Ok(())
     }
@@ -476,13 +892,16 @@ pub fn upgrade(yes: bool, scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<(
     claude::remove(&old.plan)?;
     pin_binary(&data)?;
     registration.plan(&shown, None)?;
-    registration.finish(scheduler, false)?;
-    offer_orchestrators(&data)
+    registration.finish(scheduler, false, &mut |_| {})?;
+    offer_orchestrators(&data, vendor)
 }
 
-fn ask_orchestrators(outbox: &Path) -> Result<()> {
+fn ask_orchestrators(outbox: &Path, vendor: Vendor) -> Result<()> {
     let (entries, refused) = orchestrators::pending(outbox)?;
-    println!("Environment names the hook would read to recognise orchestrated runs:");
+    println!(
+        "Environment names the {} hook would read to recognise orchestrated runs:",
+        vendor.name()
+    );
     for line in orchestrators::describe(&entries) {
         println!("  {line}");
     }
@@ -521,7 +940,7 @@ fn show_changes(outbox: &Path, entries: &[Value]) {
 }
 // `--yes` covers the hook entries the person chose to skip reviewing. It cannot
 // cover names the server picks later, so only a terminal answer approves them.
-fn offer_orchestrators(data: &Path) -> Result<()> {
+fn offer_orchestrators(data: &Path, vendor: Vendor) -> Result<()> {
     let root = connection(data);
     let outbox = root.join("outbox");
     pairing::refresh_scope(&root)?;
@@ -538,7 +957,7 @@ fn offer_orchestrators(data: &Path) -> Result<()> {
         );
         return Ok(());
     }
-    match ask_orchestrators(&outbox) {
+    match ask_orchestrators(&outbox, vendor) {
         Err(error) if error.to_string() == "consent_declined" => {
             println!(
                 "No names approved. Hooks stay registered. Run `devdiary orchestrators approve` to answer again."
@@ -577,7 +996,7 @@ pub fn approve_orchestrators(root: Option<&Path>, vendor: Vendor) -> Result<()> 
         println!("No orchestrator change waits for approval.");
         return Ok(());
     }
-    ask_orchestrators(&outbox)
+    ask_orchestrators(&outbox, vendor)
 }
 
 pub fn uninstall(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<()> {

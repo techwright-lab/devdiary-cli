@@ -32,6 +32,13 @@ impl Vendor {
             _ => Err("unsupported_vendor".into()),
         }
     }
+    /// The harness's name as a person knows it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
     pub fn slug(self) -> &'static str {
         match self {
             Self::Claude => "claude",

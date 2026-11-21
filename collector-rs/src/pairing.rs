@@ -16,6 +16,7 @@ use crate::{
 use rustix::event::{PollFd, PollFlags, Timespec};
 use serde_json::{Value, json};
 use std::{
+    cell::Cell,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -219,6 +220,8 @@ pub struct Options<'a> {
     pub trust_origin: bool,
     pub browser: bool,
     pub record_orchestrated_outside_repos: bool,
+    /// Set once a pairing request has been sent, so setup can say what left this machine.
+    pub sent: &'a Cell<bool>,
 }
 /// What this machine asks to pair: its installation, covering every tracked repository.
 struct Target {
@@ -359,7 +362,10 @@ pub fn setup(o: Options<'_>) -> Result<()> {
                 return Err("frozen_scope_conflict".into());
             }
             initialize(harness.root, &connection(harness.root)?)?;
-            println!("Connection already saved; this machine is not paired again.");
+            println!(
+                "{}: connection already saved, so it is not paired again.",
+                harness.vendor.name()
+            );
         } else {
             unused(harness.root)?;
             unpaired.push(harness);
@@ -382,6 +388,7 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         harnesses: &unpaired,
         listener: Listener::bind(),
         typed: Typed::default(),
+        sent: o.sent,
     }
     .run(o.browser)
 }
@@ -489,6 +496,7 @@ struct Pairing<'a> {
     harnesses: &'a [&'a Harness<'a>],
     listener: Option<Listener>,
     typed: Typed,
+    sent: &'a Cell<bool>,
 }
 impl Pairing<'_> {
     fn run(mut self, browser: bool) -> Result<()> {
@@ -532,6 +540,7 @@ impl Pairing<'_> {
             &machine::this(),
             self.listener.as_ref().map(Listener::port),
         );
+        self.sent.set(true);
         let r = self
             .client
             .post(format!("{}{START}", self.origin))
@@ -870,12 +879,6 @@ fn opener(os: Os) -> &'static str {
     }
 }
 pub const SETUP_INCOMPLETE: &str = "Setup incomplete. No secret is recoverable from a consumed exchange. Revoke unused connections in the browser, then move the connection folder aside and run setup again. The folder is ~/.local/share/devdiary/cli/claude/connection, or codex/connection for Codex.";
-pub fn diagnostic(error: &dyn std::error::Error) -> &'static str {
-    known_diagnostic(error).unwrap_or(SETUP_INCOMPLETE)
-}
-pub fn known_diagnostic(error: &dyn std::error::Error) -> Option<&'static str> {
-    guidance(&error.to_string())
-}
 pub fn guidance(code: &str) -> Option<&'static str> {
     Some(match code {
         "trust_origin_required" | "invalid_origin" => {

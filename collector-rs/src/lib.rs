@@ -6,6 +6,7 @@ mod callback;
 pub mod checkout;
 pub mod claude;
 pub mod drops;
+pub mod exit;
 pub mod install;
 pub mod launchd;
 mod machine;

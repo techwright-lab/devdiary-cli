@@ -55,8 +55,9 @@ class PairingTest(unittest.TestCase):
             (bin_dir / name).chmod(0o700)
         self.opened = bin_dir / "opened"
         self.env = {
-            **os.environ,
+            **{k: v for k, v in os.environ.items() if k != "CODEX_HOME"},
             "HOME": str(self.home),
+            "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
             "XDG_CONFIG_HOME": str(self.root / "config"),
             "DEVDIARY_COLLECTOR_SYSTEMCTL": str(bin_dir / "systemctl"),
             "DEVDIARY_DEBUG_OPENER": str(bin_dir / "opener"),
@@ -318,6 +319,9 @@ class PairingTest(unittest.TestCase):
         result = self.run_setup()
         self.assertEqual(result.returncode, 2)
         self.assertIn(b"rate limited", result.stderr)
+        self.assertEqual(
+            result.stderr.splitlines()[-1], b"error_code: start_rate_limited"
+        )
         self.assertEqual(len(self.contract.starts()), 2)
         self.assertTrue((self.connection() / "start-retry-after").exists())
 
