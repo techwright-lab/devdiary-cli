@@ -1183,7 +1183,15 @@ pub fn doctor(scheduler: &Scheduler<'_>, named: Option<Vendor>, json: bool) -> R
                 None => settings_path(vendor, None)?,
             };
             let found = on_this_machine(vendor, &settings);
-            Ok(assess(scheduler.os, vendor, &settings, found, &h.report))
+            let workspace = workspace(&data_dir(vendor)?);
+            Ok(assess(
+                scheduler.os,
+                vendor,
+                &settings,
+                found,
+                workspace.as_deref(),
+                &h.report,
+            ))
         }) {
             Ok(rows) => rows,
             Err(error) => vec![Finding {
@@ -1238,6 +1246,29 @@ fn doctor_json(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Doctor> {
         None => Doctor::Reported,
     })
 }
+/// The workspace a harness's connection joined, when pairing kept its name.
+fn workspace(data: &Path) -> Option<String> {
+    let saved = load(&connection(data).join(pairing::WORKSPACE)).ok()??;
+    saved.get("name")?.as_str().map(crate::machine::shown)
+}
+/// What a drop reason means, as the end of "N came …".
+fn dropped(reason: &str) -> String {
+    match reason {
+        "unknown_repository" => "from sessions in a repository this workspace doesn't track".into(),
+        "outside_scope" => "from sessions outside the recording scope, such as a folder that is not a git repository".into(),
+        "spool_full" => "while the outbox on this machine was full".into(),
+        "revoked" => "after the server revoked the connection".into(),
+        "stale_plan" => "while the hook entries did not match this install".into(),
+        other => format!("for the reason {other}"),
+    }
+}
+fn events_dropped(total: u64) -> String {
+    match total {
+        1 => "1 event was dropped".into(),
+        n => format!("{n} events were dropped"),
+    }
+}
+
 /// What doctor finds for one harness: the JSON report, and the settings file
 /// it could not read, if any.
 struct Health {
@@ -1302,7 +1333,14 @@ struct Finding {
 }
 /// Doctor's findings for one harness from its JSON report: one line when it
 /// records, otherwise one line for each problem, the worst first.
-fn assess(os: Os, vendor: Vendor, settings: &Path, found: bool, report: &Value) -> Vec<Finding> {
+fn assess(
+    os: Os,
+    vendor: Vendor,
+    settings: &Path,
+    found: bool,
+    workspace: Option<&str>,
+    report: &Value,
+) -> Vec<Finding> {
     let name = vendor.name();
     let flag = if vendor == Vendor::Codex {
         " --vendor codex"
@@ -1466,18 +1504,62 @@ fn assess(os: Os, vendor: Vendor, settings: &Path, found: bool, report: &Value) 
             Some(format!("devdiary orchestrators approve{flag}")),
         ));
     }
+    let target = workspace.map_or("DevDiary".into(), |w| format!("the workspace {w}"));
+    let mut drops: Vec<(&str, u64)> = report["drops"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(reason, n)| Some((reason.as_str(), n.as_u64().filter(|n| *n > 0)?)))
+        .collect();
+    drops.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let total: u64 = drops.iter().map(|(_, n)| n).sum();
+    let delivered = report["delivered"].as_u64().unwrap_or(0);
+    let has = |reason| drops.iter().any(|(r, _)| *r == reason);
+    if total > 0 && delivered == 0 {
+        let why: Vec<_> = drops
+            .iter()
+            .map(|(reason, n)| format!("{n} came {}.", dropped(reason)))
+            .collect();
+        let mut todo = Vec::new();
+        if has("unknown_repository") {
+            todo.push("track the repository in DevDiary".to_owned());
+        }
+        if has("outside_scope") && report["outside_repos"] != json!(true) {
+            todo.push(format!("run devdiary outside-repos on{flag}"));
+        }
+        rows.push(finding(
+            Mark::Attention,
+            format!(
+                "{name} records to {target}, but nothing was sent: {}.",
+                events_dropped(total)
+            ),
+            Some(why.join(" ")),
+            (!todo.is_empty()).then(|| todo.join(", or ")),
+        ));
+    }
     if rows.is_empty() {
         rows.push(finding(
             Mark::Done,
             format!(
-                "{name} records to DevDiary: {} waiting to send, {} sent, last sync {}.",
+                "{name} records to {target}: {} waiting to send, {delivered} sent, last sync {}.",
                 report["pending"],
-                report["delivered"],
                 report["last_sync_at"].as_str().unwrap_or("not yet")
             ),
             None,
             None,
         ));
+    }
+    if total > 0 && delivered > 0 {
+        let reasons: Vec<_> = drops
+            .iter()
+            .map(|(reason, n)| format!("{n} {}", dropped(reason)))
+            .collect();
+        rows.push(Finding {
+            mark: None,
+            text: format!("{}: {}.", events_dropped(total), reasons.join("; ")),
+            why: None,
+            next: None,
+        });
     }
     // The worst first: failures, then what needs attention.
     rows.sort_by_key(|r| r.mark != Some(Mark::Failed));
@@ -1685,6 +1767,7 @@ mod tests {
             Vendor::Claude,
             Path::new("/s.json"),
             true,
+            None,
             &report,
         )
     }
@@ -1701,6 +1784,81 @@ mod tests {
         assert_eq!(rows[0].next, None);
     }
 
+    fn with_drops(delivered: u64, outside_repos: bool) -> Vec<Finding> {
+        let mut report = healthy();
+        report["delivered"] = json!(delivered);
+        report["outside_repos"] = json!(outside_repos);
+        report["drops"] = json!({"outside_scope": 2, "unknown_repository": 4});
+        assess(
+            Os::Linux,
+            Vendor::Claude,
+            Path::new("/s.json"),
+            true,
+            Some("TWL"),
+            &report,
+        )
+    }
+
+    #[test]
+    fn a_working_harness_names_the_workspace_it_sends_to() {
+        let rows = assess(
+            Os::Linux,
+            Vendor::Claude,
+            Path::new("/s.json"),
+            true,
+            Some("TWL"),
+            &healthy(),
+        );
+        assert_eq!(
+            rows[0].text,
+            "Claude Code records to the workspace TWL: 2 waiting to send, 12 sent, last sync 2026-11-22T00:10:00Z."
+        );
+    }
+
+    #[test]
+    fn drops_with_nothing_sent_need_attention_and_say_what_each_reason_means() {
+        let rows = with_drops(0, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mark, Some(Mark::Attention));
+        assert_eq!(
+            rows[0].text,
+            "Claude Code records to the workspace TWL, but nothing was sent: 6 events were dropped."
+        );
+        let why = rows[0].why.as_deref().unwrap();
+        assert!(
+            why.contains("4 came from sessions in a repository this workspace doesn't track."),
+            "{why}"
+        );
+        assert!(
+            why.contains("2 came from sessions outside the recording scope"),
+            "{why}"
+        );
+        assert_eq!(
+            rows[0].next.as_deref(),
+            Some("track the repository in DevDiary, or run devdiary outside-repos on")
+        );
+        let on = with_drops(0, true);
+        assert_eq!(
+            on[0].next.as_deref(),
+            Some("track the repository in DevDiary")
+        );
+    }
+
+    #[test]
+    fn drops_beside_deliveries_are_a_dim_line_under_the_working_harness() {
+        let rows = with_drops(12, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].mark, Some(Mark::Done));
+        assert_eq!(rows[1].mark, None);
+        assert_eq!(rows[1].next, None);
+        assert!(
+            rows[1].text.starts_with("6 events were dropped:"),
+            "{}",
+            rows[1].text
+        );
+        assert!(rows[1].text.contains("doesn't track"), "{}", rows[1].text);
+    }
+
     #[test]
     fn a_harness_not_set_up_names_setup_when_it_is_on_this_machine() {
         let missing = json!({"installed": false, "timer": {}});
@@ -1709,6 +1867,7 @@ mod tests {
             Vendor::Codex,
             Path::new("/h.json"),
             true,
+            None,
             &missing,
         );
         assert_eq!(rows[0].mark, Some(Mark::Attention));
@@ -1722,6 +1881,7 @@ mod tests {
             Vendor::Codex,
             Path::new("/h.json"),
             false,
+            None,
             &missing,
         );
         assert_eq!((absent[0].mark, absent[0].next.as_deref()), (None, None));

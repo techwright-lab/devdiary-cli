@@ -363,6 +363,15 @@ problem, and `Next:` with the command that fixes the first problem. A harness th
 records reads like `✓ Claude Code records to DevDiary: 0 waiting to send, 12 sent,
 last sync 2026-11-22T00:10:00Z.` It checks the hooks, the sync job, a revoked
 connection, the last sync and scope refresh, and orchestrator names that wait.
+It names the workspace a harness records to when pairing saved the name in
+`workspace.json` in the connection folder; connections paired before 0.5.0 read
+"records to DevDiary". When the hooks dropped events and nothing was sent, the
+line reads `!` and says what each reason means: `unknown_repository` is a session
+in a repository the workspace does not track, and `outside_scope` a session
+outside the recording scope, such as a folder that is not a git repository.
+`Next:` then says to track the repository in DevDiary, or to run
+`devdiary outside-repos on` while that is off. Drops beside deliveries show as a
+dimmed line under the harness.
 
 `doctor --json` prints the report of one harness (Claude unless `--vendor codex`) as
 JSON, for scripts: the registration state, `systemctl --user is-enabled/is-active` for
