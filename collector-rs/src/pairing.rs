@@ -35,6 +35,8 @@ const ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
 const LONGEST_WAIT: Duration = Duration::from_secs(660);
 const ATTEMPT: &str = "pairing-attempted";
 const COOLDOWN: &str = "start-retry-after";
+/// The name of the workspace a connection joined, kept so `doctor` can name it.
+pub(crate) const WORKSPACE: &str = "workspace.json";
 const CONNECTED: &str = "Connected. Return to the terminal.";
 const NOT_CONNECTED: &str = "The terminal did not connect. Return to the terminal to see why.";
 
@@ -811,6 +813,11 @@ impl Pairing<'_> {
             })
             .collect::<Vec<_>>();
         commit(self.harnesses, &records, &saved)?;
+        // Only shown to the person, so a failed write costs nothing but the name.
+        for harness in self.harnesses {
+            let name = serde_json::to_vec(&json!({ "name": workspace }))?;
+            let _ = save_new(&harness.root.join(WORKSPACE), &name);
+        }
         let workspace = machine::shown(&workspace);
         let out = Out::stdout();
         out.done(&format!("Connected to the DevDiary workspace {workspace}."));

@@ -560,11 +560,91 @@ class InstallTest(unittest.TestCase):
         lines = out.splitlines()
         self.assertEqual(lines[0], f"DevDiary {VERSION} · devdiary.me")
         self.assertIn(
-            "✓ Claude Code records to DevDiary: 0 waiting to send, 0 sent, last sync not yet.",
+            "✓ Claude Code records to the workspace acme-diary: 0 waiting to send, 0 sent,"
+            + " last sync not yet.",
             lines,
         )
         self.assertIn("Codex: not found on this machine.", out)
         self.assertNotIn("{", out)
+        self.assertNotIn("Next:", out)
+
+    def event_from(self, cwd):
+        """One SessionStart from a session in `cwd`, as Claude Code sends it."""
+        record = self.record()
+        event = {
+            "hook_event_name": "SessionStart",
+            "session_id": str(uuid.uuid4()),
+            "cwd": str(cwd),
+        }
+        subprocess.run(
+            [record["executable"], "hook", "claude", record["plan"]],
+            input=json.dumps(event).encode(),
+            env=self.env(),
+            timeout=10,
+            check=True,
+        )
+
+    def untracked_repository(self):
+        repo = self.root / "other"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        remote = "https://github.com/acme/other.git"
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", remote], check=True
+        )
+        return repo
+
+    def outside_any_repository(self):
+        folder = self.root / "notes"
+        folder.mkdir()
+        return folder
+
+    def test_doctor_explains_drops_when_nothing_was_sent(self):
+        self.install()
+        self.event_from(self.outside_any_repository())
+        repo = self.untracked_repository()
+        self.event_from(repo)
+        self.event_from(repo)
+        report = json.loads(self.run_collector("doctor", "--json").stdout)
+        self.assertEqual(report["drops"], {"outside_scope": 1, "unknown_repository": 2})
+        self.assertNotIn("workspace", report)
+        out = self.run_collector("doctor").stdout.decode()
+        flat = " ".join(out.split())
+        self.assertIn(
+            "! Claude Code records to the workspace acme-diary, but nothing was sent:"
+            + " 3 events were dropped.",
+            flat,
+        )
+        self.assertIn(
+            "2 came from sessions in a repository this workspace doesn't track.", flat
+        )
+        self.assertIn("1 came from sessions outside the recording scope", flat)
+        self.assertNotIn("✓ Claude Code", out)
+        self.assertEqual(
+            out.splitlines()[-1],
+            "Next: track the repository in DevDiary, or run devdiary outside-repos on",
+        )
+
+    def test_doctor_shows_drops_beside_deliveries_as_a_dim_line(self):
+        self.install()
+        self.spool(1)
+        self.assertEqual(self.timer_sync()["delivered"], 1)
+        self.event_from(self.outside_any_repository())
+        out = self.run_collector("doctor").stdout.decode()
+        lines = out.splitlines()
+        (row,) = [i for i, line in enumerate(lines) if line.startswith("✓ Claude Code")]
+        self.assertTrue(
+            lines[row].startswith(
+                "✓ Claude Code records to the workspace acme-diary: 0 waiting to send, 1 sent,"
+            ),
+            lines[row],
+        )
+        (dim,) = [i for i, line in enumerate(lines) if "1 event was dropped: " in line]
+        (codex,) = [i for i, line in enumerate(lines) if line.startswith("Codex:")]
+        self.assertTrue(row < dim < codex, lines)
+        self.assertTrue(lines[dim].startswith("  1 event was dropped: "), lines)
+        self.assertIn(
+            "1 from sessions outside the recording scope", " ".join(out.split())
+        )
         self.assertNotIn("Next:", out)
 
     def test_doctor_names_the_unreadable_file_where_and_what_next(self):
