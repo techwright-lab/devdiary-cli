@@ -366,12 +366,15 @@ connection, the last sync and scope refresh, and orchestrator names that wait.
 It names the workspace a harness records to when pairing saved the name in
 `workspace.json` in the connection folder; connections paired before 0.5.0 read
 "records to DevDiary". When the hooks dropped events and nothing was sent, the
-line reads `!` and says what each reason means: `unknown_repository` is a session
-in a repository the workspace does not track, and `outside_scope` a session
-outside the recording scope, such as a folder that is not a git repository.
-`Next:` then says to track the repository in DevDiary, or to run
+line reads `!` and says in plain words what each reason means, for every reason
+the drop log counts: `unknown_repository` is a session in a repository the
+workspace does not track, `outside_scope` a session outside the recording scope,
+such as a folder that is not a git repository, and so on. Where the hook recorded
+the event, the words name it: "2 Stop events repeated for a turn already
+recorded". `Next:` then says to track the repository in DevDiary, or to run
 `devdiary outside-repos on` while that is off. Drops beside deliveries show as a
-dimmed line under the harness.
+dimmed line under the harness. A `reflog_rotated` count is not a dropped event:
+the event was kept without its commits, and doctor says so on its own line.
 
 `doctor --json` prints the report of one harness (Claude unless `--vendor codex`) as
 JSON, for scripts: the registration state, `systemctl --user is-enabled/is-active` for
