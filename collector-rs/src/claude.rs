@@ -1194,7 +1194,11 @@ fn linked(state: &Path, row: &mut Object, appended: Appended, overlap: u64) {
         }
         Appended::Gap(gap) => {
             if gap == "reflog_rewritten" {
-                drops::note(state, "reflog_rotated");
+                drops::note(
+                    state,
+                    "reflog_rotated",
+                    row.get("event").and_then(Value::as_str),
+                );
             }
             row.insert("commit_gap".into(), gap.into());
         }
@@ -1273,10 +1277,12 @@ pub fn hook_for(plan_path: &Path, raw: Result<Vec<u8>>, selected: Vendor) -> Res
     }
     let data = raw.and_then(|raw| fields(&raw, selected));
     let state = Path::new(text(&p, "state")?);
-    let data = data.inspect_err(|error| drops::note(state, input_reason(error.as_ref())))?;
+    let data = data.inspect_err(|error| drops::note(state, input_reason(error.as_ref()), None))?;
     let outcome = capture(plan_path, &p, state, &data);
     if let Err(error) = &outcome {
-        drops::note(state, drop_reason(error.as_ref()));
+        // `fields` accepted only an event this harness names.
+        let event = data.get("hook_event_name").and_then(Value::as_str);
+        drops::note(state, drop_reason(error.as_ref()), event);
     }
     outcome
 }

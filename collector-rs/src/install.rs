@@ -1300,6 +1300,7 @@ fn health(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Health> {
         .map(|raw| serde_json::from_slice::<Value>(&raw))
         .transpose()?;
     let status = load(&connection(&data).join(SYNC_STATUS))?;
+    let drops = drops::counts(&store, &outbox)?;
     let report = json!({
         "installed": true,
         "runtime": vendor.runtime(),
@@ -1310,7 +1311,8 @@ fn health(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Health> {
         "timer": scheduler.state(vendor),
         "pending": pending,
         "delivered": delivered,
-        "drops": drops::counts(&store, &outbox)?,
+        "drops": drops.reasons,
+        "drops_by_event": drops.events,
         "orchestrators": orchestrators::summary(&outbox),
         "outside_repos": crate::outside::allowed(&outbox),
         "revoked": connection(&data).join("revoked").exists(),

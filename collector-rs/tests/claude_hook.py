@@ -951,6 +951,32 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
         self.hook(dict(self.raw, cwd=str(outside)))
         self.assertEqual(self.rows(), [])
         self.assertEqual(self.drops(), {"outside_scope": 1})
+        self.assertEqual(
+            self.doctor()["drops_by_event"], {"outside_scope": {"PostToolUse": 1}}
+        )
+
+    def test_a_repeated_stop_keeps_the_first_and_counts_a_stop_drop(self):
+        stop = {
+            "hook_event_name": "Stop",
+            "session_id": "session-1",
+            "cwd": str(self.repo),
+            "prompt_id": "prompt-1",
+            "stop_hook_active": False,
+            "last_assistant_message": "PRIVATE_SENTINEL",
+        }
+        self.hook(stop)
+        first = self.rows()
+        self.hook(dict(stop, stop_hook_active=True))
+        self.assertEqual(self.rows(), first)
+        self.assertEqual(len(first), 1)
+        doctor = self.doctor()
+        self.assertEqual(doctor["drops"], {"observation_conflict": 1})
+        self.assertEqual(
+            doctor["drops_by_event"], {"observation_conflict": {"Stop": 1}}
+        )
+        log = (self.outbox / "drops.log").read_bytes()
+        self.assertNotIn(b"PRIVATE", log)
+        self.assertNotIn(b"prompt-1", log)
 
     def test_settings_readable_by_others_but_writable_only_by_owner(self):
         self.uninstall()
