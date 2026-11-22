@@ -1,5 +1,5 @@
 """Runs a collector command with a terminal on stdin and answers its questions:
-the [y/N] questions and setup's choice of harnesses."""
+the [y/N] and [y/N/d] questions and setup's choice of harnesses."""
 
 import os
 import pty
@@ -8,11 +8,19 @@ import subprocess
 import time
 
 PROMPT = b"[y/N]"
+# A question about a summarised change, where d shows the exact entries.
+DETAILS = b"[y/N/d]"
 CHOICE = b"[both/claude/codex]"
 
 
 def questions(out):
-    return out.count(PROMPT) + out.count(CHOICE)
+    return out.count(PROMPT) + out.count(DETAILS) + out.count(CHOICE)
+
+
+def local_browser(env):
+    """`env` as on a desktop session: setup offers the browser's return there."""
+    away = ("SSH_CONNECTION", "WAYLAND_DISPLAY", "NO_COLOR")
+    return {**{k: v for k, v in env.items() if k not in away}, "DISPLAY": ":0"}
 
 
 def answering(

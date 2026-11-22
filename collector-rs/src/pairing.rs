@@ -11,6 +11,7 @@ use crate::{
     scope,
     store::{Store, private},
     text,
+    ui::{Out, Style},
     vendor::Vendor,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -277,8 +278,11 @@ impl Target {
         config["scope_kind"] = json!("installation");
         let v2 = versions.contains(&json!(2));
         if self.record_outside && !v2 {
-            eprintln!(
-                "Server does not accept observation schema v2: --record-orchestrated-outside-repos is not saved."
+            Out::stderr().line(
+                "",
+                Some(crate::ui::Mark::Attention),
+                None,
+                "Server does not accept observation schema v2: --record-orchestrated-outside-repos is not saved.",
             );
         }
         config["observation_schema_versions"] = if v2 { json!([1, 2]) } else { json!([1]) };
@@ -344,7 +348,9 @@ fn start_body(
     body
 }
 
-pub fn setup(o: Options<'_>) -> Result<()> {
+/// Pairs every harness without a saved connection, and returns the name of
+/// the workspace they joined, or None when every harness had a connection.
+pub fn setup(o: Options<'_>) -> Result<Option<String>> {
     let origin = origin(o.origin, o.trust_origin)?;
     let target = Target {
         record_outside: o.record_orchestrated_outside_repos,
@@ -362,18 +368,19 @@ pub fn setup(o: Options<'_>) -> Result<()> {
                 return Err("frozen_scope_conflict".into());
             }
             initialize(harness.root, &connection(harness.root)?)?;
-            println!(
+            Out::stdout().done(&format!(
                 "{}: connection already saved, so it is not paired again.",
                 harness.vendor.name()
-            );
+            ));
         } else {
             unused(harness.root)?;
             unpaired.push(harness);
         }
     }
     if unpaired.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
+    let local = local_browser(Os::THIS, |name| std::env::var_os(name));
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .retry(reqwest::retry::never())
@@ -386,11 +393,23 @@ pub fn setup(o: Options<'_>) -> Result<()> {
         origin: &origin,
         target: &target,
         harnesses: &unpaired,
-        listener: Listener::bind(),
+        // A browser on another device cannot reach this machine's loopback.
+        listener: local.then(Listener::bind).flatten(),
         typed: Typed::default(),
         sent: o.sent,
     }
-    .run(o.browser)
+    .run(o.browser && local, local)
+    .map(Some)
+}
+/// Whether a browser can open on this machine: a graphical session on Linux,
+/// and on either system not over SSH.
+fn local_browser(os: Os, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    let set = |name: &str| var(name).is_some_and(|v| !v.is_empty());
+    !set("SSH_CONNECTION")
+        && match os {
+            Os::Linux => set("DISPLAY") || set("WAYLAND_DISPLAY"),
+            Os::Macos => true,
+        }
 }
 fn lock(root: &Path) -> Result<File> {
     directory(root)?;
@@ -499,21 +518,29 @@ struct Pairing<'a> {
     sent: &'a Cell<bool>,
 }
 impl Pairing<'_> {
-    fn run(mut self, browser: bool) -> Result<()> {
+    /// Returns the workspace the harnesses joined.
+    fn run(mut self, browser: bool, local: bool) -> Result<String> {
+        let out = Out::stdout();
         let mut first = true;
         loop {
             let request = self.start()?;
             let code = grouped(&request.code);
             let link = format!("{}{APPROVE}{code}", self.origin);
-            println!("Approval code: {code}\nApprove at {link}");
-            println!(
-                "{}\nBrowser approval does not install hooks or establish host trust.",
-                if self.listener.is_some() {
-                    "When you approve, the browser returns here. If it can't, type the verifier the approval page shows, then press Enter."
+            if !local {
+                out.say("Open this link on any device, then type the code the page shows.");
+            }
+            out.raw(&format!(
+                "  Approval code: {}",
+                crate::ui::paint(out.mode(), Style::Accent, &code)
+            ));
+            out.say(&format!("Approve at {link}"));
+            if local {
+                out.say(if self.listener.is_some() {
+                    "When you approve, the browser returns here. If it doesn't, type the code the approval page shows, then press Enter."
                 } else {
-                    "After you approve, type the verifier the approval page shows, then press Enter."
-                }
-            );
+                    "After you approve, type the code the approval page shows, then press Enter."
+                });
+            }
             std::io::stdout().flush()?;
             // The server's own copy tells the person to open a fresh request's
             // link themselves, so only the first one opens on its own.
@@ -523,9 +550,8 @@ impl Pairing<'_> {
             first = false;
             match self.wait(&request)? {
                 Waited::Connected(doc) => return self.save(&request, &doc),
-                Waited::Expired => {
-                    println!("This setup expired before it was approved. A new one starts now.")
-                }
+                Waited::Expired => out
+                    .attention("This setup expired before it was approved. A new one starts now."),
             }
         }
     }
@@ -556,8 +582,13 @@ impl Pairing<'_> {
                     (now()? + seconds).to_string().as_bytes(),
                 )?;
             }
-            eprintln!(
-                "Pairing rate limited: wait at least {seconds} seconds before running setup again."
+            Out::stderr().line(
+                "",
+                Some(crate::ui::Mark::Attention),
+                None,
+                &format!(
+                    "Pairing rate limited: wait at least {seconds} seconds before running setup again."
+                ),
             );
             return Err("start_rate_limited".into());
         }
@@ -625,7 +656,8 @@ impl Pairing<'_> {
                         continue;
                     }
                     let Some(verifier) = normalised(&line) else {
-                        println!("Verifiers are 8 letters, such as BCDF-GHJK. Type it again.");
+                        Out::stdout()
+                            .attention("Codes are 8 letters, such as BCDF-GHJK. Type it again.");
                         continue;
                     };
                     if let Some(done) = settle(self.present(request, &verifier)?)? {
@@ -639,9 +671,11 @@ impl Pairing<'_> {
                     Polled::Approved => {
                         if !approved {
                             approved = true;
-                            println!(
-                                "Approved in DevDiary. If the browser didn't return here, type the verifier the approval page shows."
-                            );
+                            Out::stdout().attention(if self.listener.is_some() {
+                                "Approved in DevDiary, but the browser did not return here. Type the code the approval page shows, then press Enter."
+                            } else {
+                                "Approved in DevDiary. Type the code the approval page shows, then press Enter."
+                            });
                         }
                         request.interval
                     }
@@ -764,7 +798,7 @@ impl Pairing<'_> {
             _ => return Err("repair_new_pair".into()),
         })
     }
-    fn save(&self, request: &Request, doc: &Object) -> Result<()> {
+    fn save(&self, request: &Request, doc: &Object) -> Result<String> {
         let (workspace, saved) =
             self.target
                 .connections(doc, request, self.origin, &self.vendors())?;
@@ -777,11 +811,11 @@ impl Pairing<'_> {
             })
             .collect::<Vec<_>>();
         commit(self.harnesses, &records, &saved)?;
-        println!(
-            "Connected to the DevDiary workspace {}.\nConnection saved privately.",
-            machine::shown(&workspace)
-        );
-        Ok(())
+        let workspace = machine::shown(&workspace);
+        let out = Out::stdout();
+        out.done(&format!("Connected to the DevDiary workspace {workspace}."));
+        out.say("Connection saved privately.");
+        Ok(workspace)
     }
 }
 fn settle(tried: Tried) -> Result<Option<Waited>> {
@@ -789,11 +823,13 @@ fn settle(tried: Tried) -> Result<Option<Waited>> {
         Tried::Connected(doc) => Ok(Some(Waited::Connected(doc))),
         Tried::Wrong(left) => {
             let attempts = if left == 1 { "attempt" } else { "attempts" };
-            println!("That verifier is wrong. {left} {attempts} left.");
+            Out::stdout().attention(&format!("That code is wrong. {left} {attempts} left."));
             Ok(None)
         }
         Tried::Refused => {
-            println!("DevDiary did not take that verifier. Type the one the approval page shows.");
+            Out::stdout().attention(
+                "DevDiary did not take that code. Type the one the approval page shows.",
+            );
             Ok(None)
         }
         Tried::Denied => Err("pairing_denied".into()),
@@ -878,61 +914,34 @@ fn opener(os: Os) -> &'static str {
         Os::Macos => "/usr/bin/open",
     }
 }
-pub const SETUP_INCOMPLETE: &str = "Setup incomplete. No secret is recoverable from a consumed exchange. Revoke unused connections in the browser, then move the connection folder aside and run setup again. The folder is ~/.local/share/devdiary/cli/claude/connection, or codex/connection for Codex.";
-pub fn guidance(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "trust_origin_required" | "invalid_origin" => {
-            "Use the default HTTPS origin or an explicit --origin ORIGIN --trust-origin (HTTP only for numeric loopback)."
-        }
-        "frozen_scope_conflict" => {
-            "The saved connection was made for a different scope and cannot be changed. To pair again, move the connection folder aside; it keeps its outbox."
-        }
-        "start_rate_limited" => {
-            "Pairing starts are rate limited. The saved Retry-After cooldown must expire before setup tries again."
-        }
-        "pairing_unavailable" => {
-            "DevDiary did not accept the pairing request. Nothing changed on this machine. Run `devdiary setup` again later."
-        }
-        "pairing_denied" => {
-            "This setup was denied in DevDiary, or a wrong verifier was typed five times. Nothing changed on this machine. Run `devdiary setup` to start again."
-        }
-        "scope_refresh_network_failure" | "scope_refresh_read_failure" => {
-            "Scope refresh failed. Check the connection and retry sync. Stored scope remains unchanged."
-        }
-        "scope_refresh_http_failure" => {
-            "The server refused scope refresh. Check server access and retry sync. Stored scope remains unchanged."
-        }
-        "scope_refresh_invalid_response" | "scope_refresh_response_too_large" => {
-            "The scope response is invalid. Check server compatibility and retry sync. Stored scope remains unchanged."
-        }
-        "scope_refresh_offer_refused" => {
-            "The server offered an orchestrator entry that is not allowed. Check server compatibility and retry sync. The refused entry was not saved."
-        }
-        "revoked" => {
-            "The server revoked this connection. Capture and sync have stopped; run uninstall, move the connection folder aside, then run setup again."
-        }
-        "sync_rate_limited" => {
-            "The server asked the collector to wait. Sync resumes after the saved Retry-After time."
-        }
-        "repair_required" => {
-            "This outbox uses an older storage format that this version does not read. Move the connection folder aside and run setup again."
-        }
-        "python_observer_registered" => {
-            "These settings already register the Python observer hook. Remove it before registering this collector."
-        }
-        "unsafe_settings" => {
-            "Settings and their directory must be owned by you and not writable by group or others, with no symlinks or hardlinks."
-        }
-        "approved_scope_mismatch" => {
-            "The approved scope does not match this installation. Revoke the unused browser connection, move the connection folder aside, then run setup again. Hooks are unchanged."
-        }
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_browser_opens_locally_only_in_a_graphical_session_and_never_over_ssh() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        assert!(local_browser(Os::Linux, env(&[("DISPLAY", ":0")])));
+        assert!(local_browser(
+            Os::Linux,
+            env(&[("WAYLAND_DISPLAY", "wayland-0")])
+        ));
+        assert!(!local_browser(Os::Linux, env(&[])));
+        assert!(!local_browser(Os::Linux, env(&[("DISPLAY", "")])));
+        let ssh = &[
+            ("DISPLAY", ":0"),
+            ("SSH_CONNECTION", "10.0.0.2 5 10.0.0.1 22"),
+        ];
+        assert!(!local_browser(Os::Linux, env(ssh)));
+        assert!(local_browser(Os::Macos, env(&[])));
+        assert!(!local_browser(Os::Macos, env(&[("SSH_CONNECTION", "x")])));
+    }
     #[test]
     fn each_platform_opens_the_browser_with_its_own_system_opener() {
         assert_eq!(opener(Os::Macos), "/usr/bin/open");

@@ -183,7 +183,7 @@ class ConnectionSyncRefusalTest(unittest.TestCase):
         self.run_collector("sync", self.connection)
 
     def health(self):
-        return json.loads(self.run_collector("doctor").stdout)
+        return json.loads(self.run_collector("doctor", "--json").stdout)
 
     def test_revoked_credential_stops_spooling_and_syncing(self):
         self.hook("before-revoke")
@@ -369,13 +369,13 @@ class InstallationPairingTest(unittest.TestCase):
         self.scope_status = 503
         self.run_collector("sync", self.connection)
         self.assertEqual(refs.read_bytes(), before)
-        doctor = json.loads(self.run_collector("doctor").stdout)
+        doctor = json.loads(self.run_collector("doctor", "--json").stdout)
         self.assertEqual(
             doctor["last_scope_refresh_error"], "scope_refresh_http_failure"
         )
         self.scope_status = 200
         self.run_collector("sync", self.connection)
-        doctor = json.loads(self.run_collector("doctor").stdout)
+        doctor = json.loads(self.run_collector("doctor", "--json").stdout)
         self.assertIsNone(doctor["last_scope_refresh_error"])
 
     def test_a_server_without_v2_pairs_a_v1_installation(self):
@@ -390,7 +390,7 @@ class InstallationPairingTest(unittest.TestCase):
         self.assertIn(b"--record-orchestrated-outside-repos", err)
         saved = json.loads((self.connection / "connection.json").read_bytes())
         self.assertFalse(saved["scope"]["record_orchestrated_outside_repos"])
-        self.run_collector("doctor")
+        self.run_collector("doctor", "--json")
         self.run_collector("sync", self.connection)
         self.run_collector("uninstall")
         self.setup_collector("--record-orchestrated-outside-repos")

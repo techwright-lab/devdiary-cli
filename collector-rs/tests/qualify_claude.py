@@ -443,7 +443,7 @@ def execute(args, report):
         try:
             # machine.env holds the Ruby PATH and none of the person's XDG folders.
             rails_interop(args, root, machine.env, report, session)
-            doctor = json.loads(run([exe, "doctor"], env=machine.env))
+            doctor = json.loads(run([exe, "doctor", "--json"], env=machine.env))
             report["doctor"] = {k: doctor.get(k) for k in ("pending", "delivered")}
             expected = json.loads((root / "expected-receipts.json").read_text())
             require(

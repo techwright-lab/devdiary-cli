@@ -660,7 +660,9 @@ class Harness:
         f.run_collector("sync", f.data / "connection")
         require(len(f.received) == before + 1, "delivery_failure_not_exercised")
         first = f.received_raw[-1]
-        status = json.loads(f.run_collector("doctor", "--vendor", "codex").stdout)
+        status = json.loads(
+            f.run_collector("doctor", "--json", "--vendor", "codex").stdout
+        )
         require(status["pending"] > 0, "failed_delivery_lost_pending")
         f.run_collector("uninstall", "--vendor", "codex")
         require(self.hooks() == [], "stock_hooks_survived_removal")

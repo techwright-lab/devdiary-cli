@@ -49,9 +49,13 @@ fn target(uid: u32, vendor: Vendor) -> String {
 }
 
 fn string(path: &Path) -> Result<String> {
-    let s = path.to_str().ok_or("unsupported_path")?;
-    if !path.is_absolute() || s.chars().any(char::is_control) {
-        return Err("unsupported_path".into());
+    let refuse = |why: &str| crate::exit::Refusal::with("unsupported_path", path, why);
+    let s = path.to_str().ok_or_else(|| refuse("is not valid UTF-8"))?;
+    if !path.is_absolute() {
+        return Err(refuse("is not an absolute path"));
+    }
+    if s.chars().any(char::is_control) {
+        return Err(refuse("holds a control character"));
     }
     Ok(s.replace('&', "&amp;")
         .replace('<', "&lt;")

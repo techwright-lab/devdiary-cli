@@ -110,7 +110,7 @@ begin
   before = [WorkSession.count, SessionEvent.count, Attribution.count]
   # The scheduler's sync exits 0 and leaves the failure for doctor.
   collector_command.call("sync", connection.to_s)
-  lost = JSON.parse(collector_command.call("doctor"))
+  lost = JSON.parse(collector_command.call("doctor", "--json"))
   raise "response loss not reported" unless lost["last_sync_error"] && lost["pending"].positive?
   first = CollectorObservation.order(:id).first
   raise "response-loss not committed" unless first&.metadata&.fetch("observation_id") == JSON.parse(state[:requests].first)["observation_id"]
