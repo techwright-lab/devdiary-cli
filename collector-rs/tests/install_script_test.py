@@ -15,6 +15,8 @@ import time
 import unittest
 from pathlib import Path
 
+import isolation
+
 SCRIPT = Path(__file__).resolve().parents[1] / "install.sh"
 DOWNLOADS = "https://github.com/techwright-lab/devdiary-cli/releases/download/"
 LINUX = "x86_64-unknown-linux-musl"
@@ -355,6 +357,10 @@ class BashPosixInstallScriptTest(InstallScriptTest):
     """macOS runs `sh` as bash in POSIX mode; Ubuntu and Debian run it as dash."""
 
     shell = ("bash", "--posix")
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

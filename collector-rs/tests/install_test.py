@@ -26,6 +26,7 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import isolation
 import pairing_server
 import terminal
 
@@ -258,8 +259,8 @@ class InstallTest(unittest.TestCase):
     def env(self):
         base = {
             k: v
-            for k, v in terminal.local_browser(os.environ).items()
-            if not k.startswith(("PAPERCLIP_", "XDG_", "HOME", "CODEX_HOME"))
+            for k, v in isolation.inherited(terminal.local_browser(os.environ)).items()
+            if not k.startswith(("PAPERCLIP_", "XDG_"))
         }
         return {
             **base,
@@ -2117,6 +2118,10 @@ class InstallTest(unittest.TestCase):
         self.assert_failed_exit(result.stderr, "not_installed")
         self.assertIn(b"Next: devdiary setup", result.stderr)
         self.assertEqual(self.contract.starts(), [])
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

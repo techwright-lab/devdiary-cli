@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+import isolation
 import pairing_rails as p
 import pairing_server
 import saved_connection
@@ -444,6 +445,10 @@ class LocalRailsInteropTest(unittest.TestCase):
         self.assertTrue(report["exact_rails_receipt"])
         self.assertTrue(report["fake_scheduler_only"])
         self.assertTrue(report["database_dropped"])
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

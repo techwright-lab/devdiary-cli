@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import install_test
+import isolation
 import qualify_claude
 import terminal
 
@@ -232,12 +233,14 @@ class Harness:
             "--chdir",
             str(self.repo),
         ]
-        self.env = {
-            "HOME": str(f.home),
-            "PATH": str(f.root / "stock-package/codex-path") + ":/usr/bin:/bin",
-            "LANG": "C.UTF-8",
-            "TERM": "xterm-256color",
-        }
+        self.env = isolation.checked(
+            {
+                "HOME": str(f.home),
+                "PATH": str(f.root / "stock-package/codex-path") + ":/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "TERM": "xterm-256color",
+            }
+        )
         cache = Path.home() / ".codex/models_cache.json"
         if cache.is_file():
             shutil.copyfile(cache, f.home / ".codex/models_cache.json")

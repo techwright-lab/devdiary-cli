@@ -5,6 +5,7 @@ import subprocess
 import unittest
 
 import install_test
+import isolation
 
 
 class CodexHookTest(unittest.TestCase):
@@ -151,6 +152,10 @@ class CodexHookTest(unittest.TestCase):
         rows = self.sync()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["runtime"], "codex")
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

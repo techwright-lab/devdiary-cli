@@ -16,6 +16,7 @@ import tomllib
 import unittest
 from pathlib import Path
 
+import isolation
 import pairing_server
 import terminal
 from pairing_server import EXCHANGE, START, display
@@ -55,11 +56,7 @@ class PairingTest(unittest.TestCase):
             (bin_dir / name).chmod(0o700)
         self.opened = bin_dir / "opened"
         self.env = {
-            **{
-                k: v
-                for k, v in terminal.local_browser(os.environ).items()
-                if k != "CODEX_HOME"
-            },
+            **isolation.inherited(terminal.local_browser(os.environ)),
             "HOME": str(self.home),
             "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
             "XDG_CONFIG_HOME": str(self.root / "config"),
@@ -540,6 +537,10 @@ class PairingTest(unittest.TestCase):
         code, _, _, _ = terminal.answering(untrusted, self.env)
         self.assertNotEqual(code, 0)
         self.assertEqual(self.contract.calls, [])
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

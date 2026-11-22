@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 import install_test
+import isolation
 
 HERE = Path(__file__).resolve().parent
 CLI = HERE.parents[1]
@@ -214,15 +215,21 @@ class Machine:
         self.settings = self.home / ".claude/settings.json"
         save(self.settings, ORIGINAL_SETTINGS)
         self.connection = self.home / ".local/share/devdiary/cli/claude/connection"
-        self.env = {
-            **{k: v for k, v in base.items() if not k.startswith("XDG_")},
-            "HOME": str(self.home),
-            "XDG_CONFIG_HOME": str(self.config),
-            "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(root / "no-user-bus"),
-            # Step 4 of setup returns at once; delivery is the Rails stage's job.
-            "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
-            **self.scheduler.env(),
-        }
+        self.env = isolation.checked(
+            {
+                **{
+                    k: v
+                    for k, v in isolation.inherited(base).items()
+                    if not k.startswith("XDG_")
+                },
+                "HOME": str(self.home),
+                "XDG_CONFIG_HOME": str(self.config),
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(root / "no-user-bus"),
+                # Step 4 of setup returns at once; delivery is the Rails stage's job.
+                "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
+                **self.scheduler.env(),
+            }
+        )
         self.repo = root / "repo"
         self.repo.mkdir(mode=0o700)
         (self.repo / "fixture.txt").write_text(SENTINELS[1])
@@ -261,14 +268,16 @@ def claude_command(machine, claude, auth, args):
 
 
 def claude_env(machine):
-    return {
-        "HOME": str(machine.home),
-        "PATH": str(machine.root / "stock") + ":/usr/bin:/bin",
-        "LANG": "C.UTF-8",
-        "TERM": "xterm-256color",
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "DISABLE_AUTOUPDATER": "1",
-    }
+    return isolation.checked(
+        {
+            "HOME": str(machine.home),
+            "PATH": str(machine.root / "stock") + ":/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "TERM": "xterm-256color",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "DISABLE_AUTOUPDATER": "1",
+        }
+    )
 
 
 def inspect_outbox(connection, root):

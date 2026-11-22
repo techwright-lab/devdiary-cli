@@ -586,6 +586,13 @@ On Claude Code 2.1.314, a stock `claude -p` run passed the variable to the comma
 hooks for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop and
 SessionEnd.
 
+No harness can reach the real `~/.claude` or `~/.codex`. Every test module that
+starts a process calls `isolation.guard()` from `setUpModule`: the caller's `HOME`,
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR` leave the process, and a process whose
+environment leads to the real home folder does not start. The live qualification
+scripts check each environment they build instead. `isolation_test.py` asserts
+both, and fails when a new harness starts processes without the guard.
+
 Verification: `python3 collector-rs/tests/install_test.py -v` (temp HOME, a mock
 pairing/ingest server and a fake systemctl, or a fake launchctl on macOS; debug
 builds only honour `DEVDIARY_COLLECTOR_SYSTEMCTL` and `DEVDIARY_COLLECTOR_LAUNCHCTL`,
