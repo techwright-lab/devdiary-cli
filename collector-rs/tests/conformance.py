@@ -19,6 +19,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import isolation
 import saved_connection
 import terminal
 
@@ -421,6 +422,10 @@ class CollectorTest(unittest.TestCase):
         self.sync()
         self.assertLess(time.monotonic() - start, 7)
         self.assertEqual(self.pending(), 1)
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

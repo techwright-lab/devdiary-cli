@@ -19,6 +19,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import isolation
 import saved_connection
 import terminal
 
@@ -372,7 +373,7 @@ class ClaudeHookTest(InstallationFixture, unittest.TestCase):
             capture_output=True,
             check=False,
             timeout=2,
-            env={"PATH": "/nonexistent"},
+            env={"PATH": "/nonexistent", "HOME": str(self.home)},
         )
         self.assertEqual(
             (result.returncode, result.stdout, result.stderr), (0, b"", b"")
@@ -1701,7 +1702,11 @@ class OutsideReposHookTest(InstallationFixture, unittest.TestCase):
         consent.chmod(0o600)
 
     def plain_folder(self):
-        folder = Path.home() / f"devdiary-outside-{os.getpid()}"
+        # The hook keeps temporary folders out, and a folder in the checkout is
+        # inside a repository. The account's home is neither on every machine.
+        # The folder is empty and goes at cleanup; ~/.claude and ~/.codex stay
+        # out of reach.
+        folder = isolation.real_home() / f"devdiary-outside-{os.getpid()}"
         folder.mkdir(exist_ok=True)
         self.addCleanup(folder.rmdir)
         return folder
@@ -2131,6 +2136,10 @@ class CommitBracketHookTest(InstallationFixture, unittest.TestCase):
         self.assert_captured(self.post("busy"), [sha])
         print(f"bracket hook latency reading ~63 KiB appended: {elapsed * 1000:.1f} ms")
         self.assertLess(elapsed, 0.700)
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

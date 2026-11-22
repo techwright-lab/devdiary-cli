@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import install_test
+import isolation
 import qualify_claude as q
 
 
@@ -638,6 +639,10 @@ class SyntheticRailsStagesTest(unittest.TestCase):
             log = machine.scheduler.log()
             for call in machine.scheduler.started() + machine.scheduler.stopped():
                 self.assertIn(call, log)
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

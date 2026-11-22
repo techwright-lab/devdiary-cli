@@ -400,10 +400,15 @@ pub fn plan_for(
 }
 fn registrable(settings_path: &Path) -> Result<(Vec<u8>, Object)> {
     let (raw, doc) = settings(settings_path)?;
-    refusal(settings_path, &raw)?;
+    refusal(
+        settings_path,
+        &raw,
+        "that no install on this machine recorded",
+    )?;
     Ok((raw, doc))
 }
-fn refusal(settings_path: &Path, raw: &[u8]) -> Result<()> {
+/// `which` says which DevDiary entries the refusal is about, after their count.
+fn refusal(settings_path: &Path, raw: &[u8], which: &str) -> Result<()> {
     if String::from_utf8_lossy(raw).contains("observer_hook") {
         return Err(Refusal::about("python_observer_registered", settings_path));
     }
@@ -413,10 +418,192 @@ fn refusal(settings_path: &Path, raw: &[u8]) -> Result<()> {
         return Err(Refusal::about("old_collector_registered", settings_path));
     }
     // Do not stack registrations or silently take over another adapter.
-    if text.contains(" hook claude ") || text.contains(" hook codex ") {
-        return Err(Refusal::about("already_registered", settings_path));
+    let held = text.matches(" hook claude ").count() + text.matches(" hook codex ").count();
+    if held > 0 {
+        return Err(Refusal::with(
+            "already_registered",
+            settings_path,
+            format!("{} {which}", entries_named(held)),
+        ));
     }
     Ok(())
+}
+/// "1 DevDiary hook entry", "2 DevDiary hook entries".
+pub fn entries_named(n: usize) -> String {
+    format!(
+        "{n} DevDiary hook {}",
+        if n == 1 { "entry" } else { "entries" }
+    )
+}
+
+/// A DevDiary hook entry in a settings file: the event it is under, its
+/// command, and the binary and plan that command runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub event: String,
+    pub command: String,
+    pub executable: PathBuf,
+    pub plan: PathBuf,
+}
+impl Entry {
+    /// Its binary or its plan is gone, so it records nothing. A deleted
+    /// temporary folder or data root leaves these behind.
+    pub fn stale(&self) -> bool {
+        !self.executable.exists() || !self.plan.exists()
+    }
+    /// The entry as `d` shows it.
+    pub fn line(&self) -> String {
+        format!("{}: {}", self.event, self.command)
+    }
+}
+const QUIET: &str = " >/dev/null 2>&1 || :";
+/// The word `quote` wrote at the start of `s`, and what follows it.
+fn unquote(s: &str) -> Option<(String, &str)> {
+    let mut rest = s.strip_prefix('\'')?;
+    let mut word = String::new();
+    loop {
+        let end = rest.find('\'')?;
+        word.push_str(&rest[..end]);
+        rest = &rest[end + 1..];
+        match rest.strip_prefix("\"'\"'") {
+            Some(more) => {
+                word.push('\'');
+                rest = more;
+            }
+            None => return Some((word, rest)),
+        }
+    }
+}
+/// The binary and plan of a command exactly as `entry_for` writes it, for
+/// either harness. Every release since the `devdiary` binary writes this shape.
+fn devdiary_command(command: &str) -> Option<(PathBuf, PathBuf)> {
+    let (exe, rest) = unquote(command)?;
+    let rest = [Vendor::Claude, Vendor::Codex]
+        .iter()
+        .find_map(|v| rest.strip_prefix(format!(" hook {} ", v.slug()).as_str()))?;
+    let (plan, rest) = unquote(rest)?;
+    (rest == QUIET).then(|| (exe.into(), plan.into()))
+}
+/// The hook commands of one `hooks.<event>` list item.
+fn commands(item: &Value) -> impl Iterator<Item = &str> {
+    item.get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+}
+/// Every DevDiary entry in the settings, in the order of the hook events.
+fn entries_in(doc: &Object) -> Vec<Entry> {
+    let mut found = Vec::new();
+    for (event, items) in doc
+        .get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        for item in items.as_array().into_iter().flatten() {
+            for command in commands(item) {
+                if let Some((executable, plan)) = devdiary_command(command) {
+                    found.push(Entry {
+                        event: event.clone(),
+                        command: command.into(),
+                        executable,
+                        plan,
+                    });
+                }
+            }
+        }
+    }
+    let order = |e: &Entry| {
+        EVENTS
+            .iter()
+            .chain(&["Interrupt"])
+            .position(|known| *known == e.event)
+            .unwrap_or(usize::MAX)
+    };
+    found.sort_by_key(order);
+    found
+}
+/// The DevDiary entries in a settings file.
+pub fn devdiary_entries(settings_path: &Path) -> Result<Vec<Entry>> {
+    Ok(entries_in(&settings(settings_path)?.1))
+}
+/// How many stale entries a settings file holds besides those of `own`, the
+/// plan an install record names. Unreadable settings count none: doctor
+/// reports them on their own.
+pub fn stale_entries(settings_path: &Path, own: Option<&Path>) -> usize {
+    devdiary_entries(settings_path).map_or(0, |entries| {
+        entries
+            .iter()
+            .filter(|e| e.stale() && Some(e.plan.as_path()) != own)
+            .count()
+    })
+}
+/// `raw` without the hooks whose command `gone` picks. A list item left with
+/// no hook goes, and so does an event left with no item. Lists that were
+/// already empty stay.
+fn without_commands(raw: &[u8], gone: &dyn Fn(&str) -> bool) -> Result<Vec<u8>> {
+    fn command(hook: &Json) -> Option<&str> {
+        match hook {
+            Json::Object(fields) => fields.iter().find_map(|(k, v)| match v {
+                Json::String(s) if k == "command" => Some(s.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+    let mut ordered = ordered::parse(raw)?;
+    if let Some(Json::Object(events)) = ordered.get_mut("hooks") {
+        events.retain_mut(|(_, items)| {
+            let Json::Array(items) = items else {
+                return true;
+            };
+            let before = items.len();
+            items.retain_mut(|item| {
+                let Some(Json::Array(hooks)) = item.get_mut("hooks") else {
+                    return true;
+                };
+                let had = hooks.len();
+                hooks.retain(|hook| !command(hook).is_some_and(gone));
+                !(hooks.is_empty() && hooks.len() < had)
+            });
+            !(items.is_empty() && items.len() < before)
+        });
+    }
+    ordered::render(&ordered, raw)
+}
+/// Where setup keeps the settings as they were before it removed stale
+/// entries. Unlike `backup`, the copy stays: the person may want an entry back.
+fn stale_copy(settings_path: &Path) -> Result<PathBuf> {
+    let at = chrono::DateTime::from_timestamp(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
+        0,
+    )
+    .ok_or("invalid_time")?;
+    let mut name = settings_path.as_os_str().to_os_string();
+    name.push(format!(".devdiary-stale-{}", at.format("%Y%m%dT%H%M%SZ")));
+    Ok(name.into())
+}
+/// Removes the stale entries the person agreed to remove, after it copies the
+/// settings beside them. It refuses with `stale_plan`, and writes nothing,
+/// when the file is not the one checked or its entries are not the ones shown
+/// or not all stale. Returns the SHA-256 of the settings it wrote, and the copy.
+pub fn remove_stale(
+    settings_path: &Path,
+    agreed: &str,
+    shown: &[String],
+) -> Result<(String, PathBuf)> {
+    let (raw, doc) = settings(settings_path).map_err(preflight_code(settings_path))?;
+    let entries = entries_in(&doc);
+    let lines: Vec<_> = entries.iter().map(Entry::line).collect();
+    if hash(&raw) != agreed || lines != shown || !entries.iter().all(Entry::stale) {
+        return Err(Refusal::about("stale_plan", settings_path));
+    }
+    let bytes = without_commands(&raw, &|c| entries.iter().any(|e| e.command == c))?;
+    let copy = stale_copy(settings_path)?;
+    save_copy(settings_path, &raw, &copy)?;
+    replace(settings_path, &bytes, &raw)?;
+    Ok((hash(&bytes), copy))
 }
 /// The refusal a person can act on for an unreadable settings file.
 fn preflight_code(
@@ -435,12 +622,28 @@ fn preflight_code(
         _ => e,
     }
 }
-/// The SHA-256 of the settings it checked, so a later plan can prove they are
-/// the ones the person agreed to change.
-pub fn preflight(settings_path: &Path) -> Result<String> {
-    registrable(settings_path)
-        .map(|(raw, _)| hash(&raw))
-        .map_err(preflight_code(settings_path))
+/// What setup checked in a settings file before it asks anything.
+#[derive(Debug)]
+pub struct Checked {
+    /// The SHA-256 of the settings, so a later plan can prove they are the
+    /// ones the person agreed to change.
+    pub digest: String,
+    /// The DevDiary entries already in them. Setup decides what they mean.
+    pub entries: Vec<Entry>,
+}
+/// Refuses settings setup cannot add to: the older hooks, and a DevDiary
+/// command it cannot read as an entry.
+pub fn preflight(settings_path: &Path) -> Result<Checked> {
+    (|| {
+        let (raw, doc) = settings(settings_path)?;
+        let unread = without_commands(&raw, &|c| devdiary_command(c).is_some())?;
+        refusal(settings_path, &unread, "that setup cannot read")?;
+        Ok(Checked {
+            digest: hash(&raw),
+            entries: entries_in(&doc),
+        })
+    })()
+    .map_err(preflight_code(settings_path))
 }
 
 /// The refusals a fresh plan would give once `plan_path`'s entries are gone,
@@ -449,10 +652,11 @@ pub fn preflight_replacing(plan_path: &Path) -> Result<()> {
     let p = load(plan_path)?;
     let path = Path::new(text(&p, "settings")?);
     let (raw, doc) = settings(path).map_err(preflight_code(path))?;
+    let other = "that this install did not write";
     if owned_plan(&doc, &p).is_err() {
-        return refusal(path, &raw);
+        return refusal(path, &raw, other);
     }
-    refusal(path, &without(&p, &raw)?)
+    refusal(path, &without(&p, &raw)?, other)
 }
 /// The connection scope a plan was made for; the hook records only while the
 /// outbox holds the same one.
@@ -670,13 +874,16 @@ pub fn backup(settings_path: &Path) -> PathBuf {
     name.into()
 }
 fn save_backup(settings_path: &Path, raw: &[u8]) -> Result<()> {
-    let path = backup(settings_path);
+    save_copy(settings_path, raw, &backup(settings_path))
+}
+/// `raw` at `path`, beside the settings and with their mode.
+fn save_copy(settings_path: &Path, raw: &[u8], path: &Path) -> Result<()> {
     let mode = fs::metadata(settings_path)?.mode() & 0o777;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)?;
+        .open(path)?;
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     file.write_all(raw)?;
     file.sync_all()?;
@@ -1603,5 +1810,219 @@ mod recovery_tests {
             assert!(!manifest_path(&plan).exists());
             assert!(!dir.path().join("settings.json.devdiary-backup").exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const KEPT: &str = "codegraph hook prompt";
+
+    /// A folder with a settings file, and the paths an earlier install's entries name.
+    struct Machine {
+        dir: tempfile::TempDir,
+        settings: PathBuf,
+    }
+    impl Machine {
+        fn new() -> Self {
+            let dir = crate::tempdir();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let settings = dir.path().join("hooks.json");
+            Self { dir, settings }
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+        /// Settings whose Stop and SessionStart hold the entries of `exe` and
+        /// `plan`, beside a hook of the person's own.
+        fn write(&self, exe: &Path, plan: &Path, vendor: Vendor) -> Vec<u8> {
+            let ours = entry_for(plan, exe.to_str().unwrap(), vendor).unwrap();
+            let kept = json!({"hooks": [{"type": "command", "command": KEPT}]});
+            let doc = json!({"model": "fixture", "hooks": {
+                "SessionStart": [ours],
+                "Stop": [kept, ours],
+            }});
+            let raw = serde_json::to_vec_pretty(&doc).unwrap();
+            fs::write(&self.settings, &raw).unwrap();
+            fs::set_permissions(&self.settings, fs::Permissions::from_mode(0o640)).unwrap();
+            raw
+        }
+        fn shown(&self) -> Vec<String> {
+            devdiary_entries(&self.settings)
+                .unwrap()
+                .iter()
+                .map(Entry::line)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn an_entry_is_read_back_from_the_command_setup_writes() {
+        let m = Machine::new();
+        let exe = m.path("it's/0.4.0/devdiary");
+        let plan = m.path("plans/codex-1.json");
+        m.write(&exe, &plan, Vendor::Codex);
+        let found = devdiary_entries(&m.settings).unwrap();
+        assert_eq!(found.len(), 2);
+        for entry in &found {
+            assert_eq!(entry.executable, exe);
+            assert_eq!(entry.plan, plan);
+        }
+        assert_eq!(
+            found.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
+            ["SessionStart", "Stop"]
+        );
+        assert!(
+            found[1].line().starts_with("Stop: '"),
+            "{}",
+            found[1].line()
+        );
+    }
+
+    #[test]
+    fn a_command_that_only_looks_like_an_entry_is_not_one() {
+        for command in [
+            "'/x/devdiary' hook codex '/x/plan.json'",
+            "'/x/devdiary' hook codex '/x/plan.json' >/dev/null 2>&1 || : ; rm -rf ~",
+            "/x/devdiary hook codex /x/plan.json >/dev/null 2>&1 || :",
+            "'/x/devdiary' hook pi '/x/plan.json' >/dev/null 2>&1 || :",
+        ] {
+            assert_eq!(devdiary_command(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn an_entry_is_stale_when_its_binary_or_its_plan_is_gone() {
+        let m = Machine::new();
+        let (exe, plan) = (m.path("devdiary"), m.path("plan.json"));
+        let entry = |exe: &Path, plan: &Path| Entry {
+            event: "Stop".into(),
+            command: String::new(),
+            executable: exe.into(),
+            plan: plan.into(),
+        };
+        assert!(entry(&exe, &plan).stale());
+        fs::write(&exe, b"").unwrap();
+        assert!(entry(&exe, &plan).stale());
+        fs::write(&plan, b"{}").unwrap();
+        assert!(!entry(&exe, &plan).stale());
+        fs::remove_file(&exe).unwrap();
+        assert!(entry(&exe, &plan).stale());
+    }
+
+    #[test]
+    fn preflight_lists_the_entries_and_refuses_a_mention_it_cannot_read() {
+        let m = Machine::new();
+        let (exe, plan) = (m.path("gone/devdiary"), m.path("gone/plan.json"));
+        let raw = m.write(&exe, &plan, Vendor::Claude);
+        let checked = preflight(&m.settings).unwrap();
+        assert_eq!(checked.digest, hash(&raw));
+        assert_eq!(checked.entries.len(), 2);
+        assert!(checked.entries.iter().all(Entry::stale));
+
+        let mut doc: Value = serde_json::from_slice(&raw).unwrap();
+        doc["note"] = json!("'/x/devdiary' hook claude '/x/plan.json'");
+        fs::write(&m.settings, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let refused = preflight(&m.settings).unwrap_err();
+        let refusal = refused.downcast_ref::<Refusal>().unwrap();
+        assert_eq!(refusal.code, "already_registered");
+        assert_eq!(refusal.file, m.settings);
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("1 DevDiary hook entry that setup cannot read")
+        );
+    }
+
+    #[test]
+    fn removing_stale_entries_keeps_a_copy_and_every_other_hook() {
+        let m = Machine::new();
+        let (exe, plan) = (m.path("gone/devdiary"), m.path("gone/plan.json"));
+        let raw = m.write(&exe, &plan, Vendor::Codex);
+        let (digest, copy) = remove_stale(&m.settings, &hash(&raw), &m.shown()).unwrap();
+
+        let left = fs::read(&m.settings).unwrap();
+        assert_eq!(digest, hash(&left));
+        let doc: Value = serde_json::from_slice(&left).unwrap();
+        assert_eq!(
+            doc,
+            json!({"model": "fixture", "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": KEPT}]}],
+            }})
+        );
+        assert!(
+            left.starts_with(b"{\n  \"hooks\": {\n"),
+            "the layout is kept"
+        );
+        assert_eq!(fs::metadata(&m.settings).unwrap().mode() & 0o777, 0o640);
+
+        assert_eq!(copy.parent(), m.settings.parent());
+        let name = copy.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("hooks.json.devdiary-stale-"), "{name}");
+        assert_eq!(fs::read(&copy).unwrap(), raw);
+        assert_eq!(fs::metadata(&copy).unwrap().mode() & 0o777, 0o640);
+        assert!(preflight(&m.settings).unwrap().entries.is_empty());
+        assert!(
+            !backup(&m.settings).exists(),
+            "not the interrupted-run copy"
+        );
+    }
+
+    #[test]
+    fn a_hook_grouped_with_an_entry_stays_when_the_entry_goes() {
+        let m = Machine::new();
+        let (exe, plan) = (m.path("gone/devdiary"), m.path("gone/plan.json"));
+        let mut item = entry_for(&plan, exe.to_str().unwrap(), Vendor::Claude).unwrap();
+        item["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "command", "command": KEPT}));
+        let raw = serde_json::to_vec(&json!({"hooks": {"Stop": [item], "Other": []}})).unwrap();
+        fs::write(&m.settings, &raw).unwrap();
+        fs::set_permissions(&m.settings, fs::Permissions::from_mode(0o600)).unwrap();
+        remove_stale(&m.settings, &hash(&raw), &m.shown()).unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(&m.settings).unwrap()).unwrap();
+        assert_eq!(
+            doc,
+            json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": KEPT}]}], "Other": []}})
+        );
+    }
+
+    #[test]
+    fn removal_refuses_a_changed_file_or_an_entry_that_is_not_stale() {
+        let m = Machine::new();
+        let (exe, plan) = (m.path("devdiary"), m.path("plan.json"));
+        let raw = m.write(&exe, &plan, Vendor::Codex);
+        let shown = m.shown();
+        let changed = remove_stale(&m.settings, &hash(b"other"), &shown).unwrap_err();
+        assert_eq!(changed.to_string(), "stale_plan");
+        let fewer = remove_stale(&m.settings, &hash(&raw), &shown[..1]).unwrap_err();
+        assert_eq!(fewer.to_string(), "stale_plan");
+        // The binary came back after consent, so its entries work again.
+        fs::write(&exe, b"").unwrap();
+        fs::write(&plan, b"{}").unwrap();
+        let working = remove_stale(&m.settings, &hash(&raw), &shown).unwrap_err();
+        assert_eq!(working.to_string(), "stale_plan");
+        assert_eq!(fs::read(&m.settings).unwrap(), raw);
+        let names: Vec<_> = fs::read_dir(m.dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains("devdiary-stale"))
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn stale_entries_leave_out_the_install_s_own() {
+        let m = Machine::new();
+        let (exe, own) = (m.path("devdiary"), m.path("own.json"));
+        let ours = entry_for(&own, exe.to_str().unwrap(), Vendor::Claude).unwrap();
+        let gone = entry_for(&m.path("gone.json"), exe.to_str().unwrap(), Vendor::Claude).unwrap();
+        let raw = serde_json::to_vec(&json!({"hooks": {"Stop": [ours, gone]}})).unwrap();
+        fs::write(&m.settings, raw).unwrap();
+        assert_eq!(stale_entries(&m.settings, Some(&own)), 1);
+        assert_eq!(stale_entries(&m.settings, None), 2);
+        assert_eq!(stale_entries(&m.path("missing.json"), None), 0);
     }
 }

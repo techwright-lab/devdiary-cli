@@ -16,6 +16,7 @@ import time
 import unittest
 
 import codex_hook
+import isolation
 
 
 @unittest.skipUnless(
@@ -130,6 +131,10 @@ class StockCodexSmoke(unittest.TestCase):
                 process.wait(timeout=5)
             process.stdin.close()
             process.stdout.close()
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

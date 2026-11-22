@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import isolation
+
 SCRIPT = Path(__file__).with_name("qualify_codex.py")
 
 
@@ -118,8 +120,10 @@ class CodexQualificationTest(unittest.TestCase):
 )
 class StockCodexQualification(unittest.TestCase):
     def test_real_stock_capture_correlation_replay_and_removal(self):
+        # Read only: the stock package and the vendor login stay in the real home.
+        real = isolation.real_home()
         package = (
-            Path.home()
+            real
             / ".codex/packages/standalone/releases/0.166.0-x86_64-unknown-linux-musl"
         )
         result = subprocess.run(
@@ -132,7 +136,7 @@ class StockCodexQualification(unittest.TestCase):
                 "--sha256",
                 "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
                 "--auth-file",
-                str(Path.home() / ".codex/auth.json"),
+                str(real / ".codex/auth.json"),
                 "--max-model-runs",
                 "6",
                 "--cases",
@@ -152,6 +156,10 @@ class StockCodexQualification(unittest.TestCase):
         self.assertTrue(report["gates"]["control_plane"]["passed"], report)
         self.assertTrue(report["gates"]["delivery_removal"]["passed"], report)
         self.assertEqual(report["model_runs_started"], 6)
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

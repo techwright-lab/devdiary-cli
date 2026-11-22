@@ -73,6 +73,8 @@ pub struct Refusal {
     pub code: &'static str,
     pub file: std::path::PathBuf,
     pub detail: Option<String>,
+    /// The command that fixes it, when it is not the code's usual one.
+    pub next: Option<String>,
 }
 impl Refusal {
     pub fn about(code: &'static str, file: &std::path::Path) -> Box<dyn std::error::Error> {
@@ -80,6 +82,7 @@ impl Refusal {
             code,
             file: file.to_path_buf(),
             detail: None,
+            next: None,
         })
     }
     pub fn with(
@@ -91,6 +94,20 @@ impl Refusal {
             code,
             file: file.to_path_buf(),
             detail: Some(detail.into()),
+            next: None,
+        })
+    }
+    pub fn with_next(
+        code: &'static str,
+        file: &std::path::Path,
+        detail: impl Into<String>,
+        next: impl Into<String>,
+    ) -> Box<dyn std::error::Error> {
+        Box::new(Self {
+            code,
+            file: file.to_path_buf(),
+            detail: Some(detail.into()),
+            next: Some(next.into()),
         })
     }
 }
@@ -214,12 +231,13 @@ pub fn explain(error: &(dyn std::error::Error + 'static), c: &Context) -> Guidan
         error.downcast_ref::<Refusal>(),
         error.downcast_ref::<crate::claude::UnreadableSettings>(),
     ) {
-        (Some(r), _) => Some((ui::path(&r.file), r.detail.clone())),
-        (_, Some(u)) => Some((ui::path(u.settings()), Some(u.position()))),
+        (Some(r), _) => Some((ui::path(&r.file), r.detail.clone(), r.next.clone())),
+        (_, Some(u)) => Some((ui::path(u.settings()), Some(u.position()), None)),
         _ => None,
     };
-    if let Some((file, detail)) = about {
+    if let Some((file, detail, next)) = about {
         name_the_file(&mut g, &code, &file, detail.as_deref(), c);
+        g.next = next.or(g.next);
     }
     g
 }
@@ -252,7 +270,11 @@ fn name_the_file(g: &mut Guidance, code: &str, f: &str, detail: Option<&str>, c:
         ),
         "already_registered" => (
             format!(
-                "{f} already holds DevDiary hook entries (commands with `hook claude` or `hook codex`) that no install on this machine recorded. Remove those entries from it."
+                "{f} holds {}. Setup adds no second set, so nothing changed.",
+                match detail.trim_start() {
+                    "" => "DevDiary hook entries",
+                    held => held,
+                }
             ),
             c.again(&format!(", after you remove DevDiary's entries from {f}")),
         ),
@@ -474,8 +496,8 @@ pub fn guidance(code: &str, c: &Context) -> Guidance {
             c.again(", after you restore or delete those entries"),
         ),
         "already_registered" => g(
-            "These settings already hold a devdiary hook entry.",
-            "",
+            "These settings already hold DevDiary hook entries.",
+            "Setup adds no second set. Remove DevDiary's entries from the settings file.",
             fix_settings(),
         ),
         "trust_origin_required" | "invalid_origin" => g(
@@ -658,8 +680,12 @@ mod tests {
                 "devdiary setup, after you remove the Python observer hook from /nowhere/settings.json",
             ),
             (
-                Refusal::about("already_registered", file),
-                "/nowhere/settings.json already holds DevDiary hook entries",
+                Refusal::with(
+                    "already_registered",
+                    file,
+                    "2 DevDiary hook entries that no install on this machine recorded",
+                ),
+                "/nowhere/settings.json holds 2 DevDiary hook entries that no install on this machine recorded. Setup adds no second set, so nothing changed.",
                 "devdiary setup, after you remove DevDiary's entries from /nowhere/settings.json",
             ),
             (
@@ -693,6 +719,26 @@ mod tests {
             assert!(shown.starts_with(why), "{code}: {shown}");
             assert_eq!(g.next.as_deref(), Some(next), "{code}");
         }
+    }
+
+    #[test]
+    fn a_refusal_can_name_the_command_that_fixes_it() {
+        let file = Path::new("/nowhere/hooks.json");
+        let refusal = Refusal::with_next(
+            "already_registered",
+            file,
+            "1 DevDiary hook entry from an earlier setup",
+            "devdiary uninstall --vendor codex",
+        );
+        let g = explain(refusal.as_ref(), &SETUP);
+        assert_eq!(
+            g.why.as_deref(),
+            Some(
+                "/nowhere/hooks.json holds 1 DevDiary hook entry from an earlier setup. Setup adds no second set, so nothing changed."
+            )
+        );
+        assert_eq!(g.next.as_deref(), Some("devdiary uninstall --vendor codex"));
+        assert_eq!(code(refusal.as_ref()), "already_registered");
     }
 
     #[test]

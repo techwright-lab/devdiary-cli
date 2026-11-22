@@ -26,6 +26,7 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import isolation
 import pairing_server
 import terminal
 
@@ -91,6 +92,11 @@ STUCK_LAUNCHCTL = """#!/bin/sh
 printf '%s\\n' "$*" >> "$(dirname "$0")/scheduler.log"
 test "$1" != bootout
 """
+
+
+def flat(text):
+    """`text` with its wrapped lines joined, as a person reads it."""
+    return " ".join(text.split())
 
 
 class FakeScheduler:
@@ -258,8 +264,8 @@ class InstallTest(unittest.TestCase):
     def env(self):
         base = {
             k: v
-            for k, v in terminal.local_browser(os.environ).items()
-            if not k.startswith(("PAPERCLIP_", "XDG_", "HOME", "CODEX_HOME"))
+            for k, v in isolation.inherited(terminal.local_browser(os.environ)).items()
+            if not k.startswith(("PAPERCLIP_", "XDG_"))
         }
         return {
             **base,
@@ -461,6 +467,172 @@ class InstallTest(unittest.TestCase):
         commands = [e["hooks"][0]["command"] for (e,) in self.owned_entries().values()]
         for command in commands:
             self.assertIn(command, out)
+
+    def leave_entries(self, settings, vendor, exe, plan):
+        """DevDiary entries of an earlier install, as its setup wrote them, one
+        per event. Returns their commands."""
+        command = f"'{exe}' hook {vendor} '{plan}' >/dev/null 2>&1 || :"
+        entry = {"hooks": [{"type": "command", "command": command, "timeout": 2}]}
+        doc = json.loads(settings.read_bytes()) if settings.exists() else {}
+        for event in EVENTS:
+            doc.setdefault("hooks", {}).setdefault(event, []).append(entry)
+        settings.write_text(json.dumps(doc, indent=2) + "\n")
+        return command
+
+    def gone(self, vendor):
+        """A pinned copy in a temporary folder that was deleted, as a test run
+        before #68 left in a real Codex hooks file."""
+        data = self.root / f"T/install-gone/home/.local/share/devdiary/cli/{vendor}"
+        return data / "0.4.0/devdiary", data / f"plans/{vendor}-1.json"
+
+    def codex_hooks(self):
+        settings = self.home / ".codex/hooks.json"
+        settings.parent.mkdir(mode=0o700)
+        settings.write_text("{}")
+        return settings
+
+    def kept_copies(self, settings):
+        return sorted(settings.parent.glob(settings.name + ".devdiary-stale-*"))
+
+    def test_stale_claude_entries_are_shown_offered_and_removed_with_a_kept_copy(self):
+        exe, plan = self.gone("claude")
+        stale = self.leave_entries(self.settings, "claude", exe, plan)
+        before = self.settings.read_bytes()
+        out = self.install(answers=(b"d\n", b"y\n")).stdout.decode()
+        lines = out.splitlines()
+        self.assertIn(
+            "! Claude Code: ~/.claude/settings.json holds 10 DevDiary hook entries"
+            " whose binary or plan no longer exists, so they record nothing."
+            f" Setup offers to remove them. They run {exe}",
+            flat(out),
+        )
+        self.assertIn(
+            "  Claude Code   removes 10 stale DevDiary hooks from ~/.claude/settings.json",
+            lines,
+        )
+        self.assertIn("                adds 10 hooks to ~/.claude/settings.json", lines)
+        # d shows the exact entries to remove before those to add.
+        shown = out.index(
+            "Stale DevDiary hook entries to remove from ~/.claude/settings.json:"
+        )
+        self.assertLess(shown, out.index("Claude Code hook entries to append to"))
+        self.assertEqual(out.count(stale), len(EVENTS))
+
+        self.assertNotIn(stale, self.settings.read_text())
+        entries = self.owned_entries()
+        self.assertEqual(sum(len(v) for v in entries.values()), len(EVENTS))
+        for (entry,) in entries.values():
+            self.assertIn(
+                f"'{self.data / VERSION / 'devdiary'}' hook claude ",
+                entry["hooks"][0]["command"],
+            )
+        (copy,) = self.kept_copies(self.settings)
+        self.assertEqual(copy.read_bytes(), before)
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o644)
+        self.assertIn(
+            "Claude Code: removed 10 stale DevDiary hook"
+            " entries from ~/.claude/settings.json. The file as it was is kept at"
+            f" ~/.claude/{copy.name}.",
+            flat(out),
+        )
+        changed = out.index("Changed on this machine:")
+        self.assertLess(changed, out.index("Claude Code: removed 10 stale"))
+        self.assertLess(
+            out.index("Claude Code: removed 10 stale"), out.index("Sent to DevDiary")
+        )
+        self.assertFalse(self.backup().exists())
+        # Uninstall takes out what setup added, which leaves the person's own hooks.
+        self.run_collector("uninstall")
+        self.assertEqual(self.settings.read_bytes(), self.original)
+
+    def test_stale_codex_entries_from_a_deleted_test_folder_are_removed(self):
+        settings = self.codex_hooks()
+        exe, plan = self.gone("codex")
+        stale = self.leave_entries(settings, "codex", exe, plan)
+        result = self.install("--vendor", "codex")
+        out = result.stdout.decode()
+        self.assertIn(
+            "  Codex         removes 10 stale DevDiary hooks from ~/.codex/hooks.json",
+            out.splitlines(),
+        )
+        self.assertNotIn(stale, settings.read_text())
+        hooks = json.loads(settings.read_bytes())["hooks"]
+        commands = [i["hooks"][0]["command"] for items in hooks.values() for i in items]
+        self.assertTrue(commands)
+        self.assertTrue(
+            all(" hook codex " in c and str(self.codex_data) in c for c in commands)
+        )
+        self.assertEqual(len(self.kept_copies(settings)), 1)
+        doctor = json.loads(
+            self.run_collector("doctor", "--json", "--vendor", "codex").stdout
+        )
+        self.assertEqual(doctor["stale_entries"], 0)
+
+    def test_declining_leaves_stale_entries_and_writes_nothing(self):
+        for vendor in ("claude", "codex"):
+            with self.subTest(vendor=vendor):
+                settings = self.settings if vendor == "claude" else self.codex_hooks()
+                exe, plan = self.gone(vendor)
+                self.leave_entries(settings, vendor, exe, plan)
+                before = settings.read_bytes()
+                result = self.install("--vendor", vendor, code=2, answers=(b"n\n",))
+                self.assertEqual(settings.read_bytes(), before)
+                self.assertEqual(self.kept_copies(settings), [])
+                self.assertEqual(self.scheduler.changes(), [])
+                self.assertEqual(self.contract.starts(), [])
+                rows = result.stderr.decode().splitlines()
+                self.assertIn("  Changed on this machine: nothing.", rows)
+                self.assertEqual(rows[-1], "error_code: consent_declined")
+
+    def test_entries_that_run_an_existing_binary_still_stop_setup_naming_the_file(self):
+        other = self.root / "other-install"
+        other.mkdir()
+        exe, plan = other / "devdiary", other / "codex-1.json"
+        exe.write_bytes(b"")
+        plan.write_text("{}")
+        for vendor, settings, shown in (
+            ("claude", self.settings, "~/.claude/settings.json"),
+            ("codex", self.codex_hooks(), "~/.codex/hooks.json"),
+        ):
+            with self.subTest(vendor=vendor):
+                self.leave_entries(settings, vendor, exe, plan)
+                before = settings.read_bytes()
+                result = self.install("--vendor", vendor, code=2)
+                err = result.stderr.decode()
+                rows = err.splitlines()
+                self.assertEqual(
+                    rows[0], "✗ These settings already hold DevDiary hook entries."
+                )
+                self.assertIn(
+                    f"✗ These settings already hold DevDiary hook entries. {shown} holds"
+                    f" 10 DevDiary hook entries that run {exe}, which still exists:"
+                    " another DevDiary install uses it. Remove its entries with that"
+                    " install's `devdiary uninstall`, or move that install to this build"
+                    " with its `devdiary upgrade`. Setup adds no second set, so nothing"
+                    " changed.",
+                    flat(err),
+                )
+                self.assertEqual(rows[-1], "error_code: already_registered")
+                self.assertEqual(settings.read_bytes(), before)
+                self.assertEqual(self.kept_copies(settings), [])
+                self.assertEqual(self.contract.starts(), [])
+                self.assertNotIn("Set up", result.stdout.decode())
+
+    def test_doctor_reports_stale_entries_and_names_setup(self):
+        exe, plan = self.gone("claude")
+        self.leave_entries(self.settings, "claude", exe, plan)
+        out = self.run_collector("doctor", "--vendor", "claude").stdout.decode()
+        lines = out.splitlines()
+        self.assertIn("! Claude Code: not set up.", lines)
+        self.assertIn(
+            "! Claude Code: ~/.claude/settings.json holds 10 stale DevDiary hook entries."
+            " Their binary or plan no longer exists, so they record nothing. Setup"
+            " offers to remove them.",
+            flat(out),
+        )
+        self.assertEqual(lines[-1], "Next: devdiary setup")
+        report = json.loads(self.run_collector("doctor", "--json").stdout)
+        self.assertEqual(report["stale_entries"], 10)
 
     def test_a_plain_setup_is_four_numbered_steps_under_the_header(self):
         (self.home / ".codex").mkdir()
@@ -2117,6 +2289,10 @@ class InstallTest(unittest.TestCase):
         self.assert_failed_exit(result.stderr, "not_installed")
         self.assertIn(b"Next: devdiary setup", result.stderr)
         self.assertEqual(self.contract.starts(), [])
+
+
+def setUpModule():
+    isolation.guard()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import os
 import uuid
 from pathlib import Path
 
+import isolation
 import terminal
 
 COLLECTOR_REF = "urn:devdiary:collector:11111111-1111-4111-8111-111111111111"
@@ -64,7 +65,7 @@ def environment(root, home, base=None):
     systemctl.chmod(0o700)
     base = terminal.local_browser(os.environ if base is None else base)
     return {
-        **{k: v for k, v in base.items() if k != "CODEX_HOME"},
+        **isolation.inherited(base),
         "HOME": str(home),
         "DEVDIARY_DEBUG_FIRST_SESSION_WAIT": "0",
         "XDG_CONFIG_HOME": str(Path(root) / "config"),
