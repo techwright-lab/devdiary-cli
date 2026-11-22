@@ -215,6 +215,7 @@ cargo build --release --locked --manifest-path collector-rs/Cargo.toml
 collector-rs/target/release/devdiary setup \
   [--settings ~/.claude/settings.json] [--record-orchestrated-outside-repos] \
   [--origin ORIGIN --trust-origin] [--no-browser]
+devdiary login
 devdiary doctor
 devdiary sync
 devdiary upgrade [--yes]
@@ -412,6 +413,52 @@ sha256. The connection
 and any pending rows stay; revoke the connection in the browser to retire the
 credential. Headless machines need `loginctl enable-linger` for the timer to run
 while logged out.
+
+### Moving this machine to another account
+
+A machine records to the DevDiary account that approved it. `devdiary login`, in a
+terminal, moves every harness that is set up to another account with one approval:
+
+```sh
+devdiary login [--no-browser]
+```
+
+1. **Check this machine.** It names the workspace each harness records to now,
+   from `workspace.json` in its connection folder. With nothing set up it stops
+   with `not_installed` and names `devdiary setup`; without a terminal, with
+   `no_terminal`.
+2. **Choose what DevDiary may change.** The new connections need new hook entries,
+   because each plan names the connection it records to. Login summarises them
+   for each harness, `d` prints the exact entries, and it asks once:
+   `Sign this machine in to another account? [y/N/d]`. Declining stops with
+   `consent_declined`; nothing is sent.
+3. **Retire the old connections.** It runs one sync for each harness, so what waits
+   goes to the old account. It then calls `DELETE /ingest/v1/collector/connection`
+   with each old connection's token, on the origin that connection was paired with.
+   `204` and `401` both count as retired. A network failure stops login with
+   `revoke_unreachable`, and any other answer with `revoke_refused`, before anything
+   on this machine changes. Only once every old connection is retired does it move
+   each connection folder aside, as `connection.retired-<UTC time>` beside it and
+   as private as it was. Rows still waiting stay there and are never sent; login
+   says how many.
+4. **Approve this machine in DevDiary.** One pairing request covers every harness,
+   with the same browser and no-browser handling as `setup`. It says first to
+   approve while signed in to the account the machine should record to. It then
+   replaces each harness's hook entries through the same plan and checks as
+   `upgrade`, and runs the self-test. The pinned copy and the sync job stay as
+   they are. It ends with a checklist of the workspace each harness records to,
+   the Codex `/hooks` reminder, and `Next: devdiary doctor`.
+
+A Ctrl+C or a failed approval after step 3 leaves the machine unpaired with the
+hooks in place; meanwhile `sync` answers `not_paired` and writes nothing in the
+empty connection folder. Running `devdiary login` again finishes the job: it pairs
+the harnesses without a connection, and rewrites the hooks of any harness an
+earlier run paired but did not finish. A folder an interrupted pairing left behind
+is moved aside too. If that pairing presented a verifier whose answer was lost,
+login says to revoke the connection DevDiary may hold for it.
+
+`setup` for a harness with a saved connection says which workspace it is
+connected to and names `devdiary login` for another account.
 
 ### Sessions outside repositories
 

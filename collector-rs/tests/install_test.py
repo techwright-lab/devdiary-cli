@@ -186,6 +186,8 @@ class InstallTest(unittest.TestCase):
         self.codex_data = self.home / ".local/share/devdiary/cli/codex"
         self.received_raw = []
         self.received = []
+        # The connection token each received observation carried.
+        self.received_tokens = []
         self.observation_status = 201
         self.orchestrators = None
         self.scope_status = 200
@@ -223,8 +225,12 @@ class InstallTest(unittest.TestCase):
                     return
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
                 data = json.loads(raw)
+                authorization = self.headers["Authorization"]
                 owner.received_raw.append(raw)
                 owner.received.append(data)
+                owner.received_tokens.append(pairing_server.bearer(authorization))
+                if contract.refuses(authorization):
+                    return self.reply(401, {"error": "unauthorized"})
                 if owner.observation_status != 201:
                     return self.reply(owner.observation_status, {"error": "refused"})
                 self.reply(
@@ -236,6 +242,10 @@ class InstallTest(unittest.TestCase):
                         "record_id": len(owner.received),
                     },
                 )
+
+            def do_DELETE(self):
+                if not contract.handle(self):
+                    self.reply(404, {"error": "not_found"})
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1478,6 +1488,11 @@ class InstallTest(unittest.TestCase):
         self.install(code=2)
         self.contract.on_exchange = None
         out = self.install(answers=(b"d\n", b"y\n")).stdout
+        self.assertIn(
+            "Claude Code: connected to the workspace acme-diary. To use another account, run `devdiary login`.",
+            self.flat(out),
+        )
+        self.assertNotIn(b"not paired again", out)
         self.assertEqual(len(self.contract.starts()), 1)
         self.assertEqual(out.count(b" hook claude "), len(EVENTS))
         self.assertEqual(
@@ -1828,6 +1843,280 @@ class InstallTest(unittest.TestCase):
         self.assertTrue((self.data / "install.json").is_file())
         self.assertTrue((self.data / "connection/connection.json").is_file())
         self.assertEqual(self.scheduler.changes(), self.scheduler.started())
+
+    # Moving this machine to another account.
+
+    RETIRED = r"\Aconnection\.retired-\d{8}T\d{6}Z(-\d+)?\Z"
+
+    def login_args(self):
+        return [
+            str(BIN),
+            "login",
+            "--origin",
+            self.origin,
+            "--trust-origin",
+            "--no-browser",
+        ]
+
+    def login(self, code=0, answers=(b"y\n",), env=None):
+        status, out, err, asked = terminal.answering(
+            self.login_args(), env or self.env(), answers
+        )
+        self.assertEqual(status, code, err)
+        self.assertNotIn(b"dc_live_", out + err)
+        self.asked = asked
+        return subprocess.CompletedProcess(self.login_args(), status, out, err)
+
+    def interrupted_login(self, until, env=None):
+        """Answer yes until `until` shows on stdout or stderr, then press Ctrl+C."""
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        process = subprocess.Popen(
+            self.login_args(),
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env or self.env(),
+        )
+        os.close(slave)
+        seen, answered = b"", 0
+        deadline = time.monotonic() + 30
+        while until not in seen and time.monotonic() < deadline:
+            ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.5)
+            for stream in ready:
+                seen += os.read(stream.fileno(), 4096)
+            if terminal.questions(seen) > answered:
+                os.write(master, b"y\n")
+                answered += 1
+        self.assertIn(until, seen)
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=10)
+        self.assertNotIn(b"dc_live_", seen)
+
+    def flat(self, raw):
+        """Output with its wrapped lines joined, so a sentence reads as one line."""
+        text = raw.decode() if isinstance(raw, bytes) else raw
+        return " ".join(text.split())
+
+    def saved_token(self, data):
+        return json.loads((data / "connection/connection.json").read_text())["token"]
+
+    def retired(self, data):
+        folders = sorted(p for p in data.iterdir() if p.name.startswith("connection."))
+        for folder in folders:
+            self.assertRegex(folder.name, self.RETIRED)
+            self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
+        return folders
+
+    def test_login_moves_both_harnesses_to_another_account_with_one_approval(self):
+        self.find_codex()
+        self.install(answers=self.BOTH)
+        self.hook_event("claude")
+        old = self.contract.issued()
+        log = self.scheduler.changes()
+        self.contract.workspace_name = "other-diary"
+        out = self.login().stdout.decode()
+        self.assertEqual(self.asked, 1)
+        before = out[: out.index("[2/4]")]
+        self.assertIn("✓ Claude Code records to the workspace acme-diary", before)
+        self.assertIn("✓ Codex records to the workspace acme-diary", before)
+        self.assertIn("Sign this machine in to another account? [y/N/d]", out)
+        self.assertLess(
+            out.index(
+                "Approve while signed in to the account this machine should record to."
+            ),
+            out.index("Approval code"),
+        )
+        # What waited went to the old account, before both old connections were revoked.
+        self.assertEqual(len(self.received), 1)
+        self.assertIn(self.received_tokens[0], old)
+        self.assertEqual(self.contract.revoked, old)
+        self.assertEqual(
+            sorted(pairing_server.bearer(a) for a in self.contract.revocations()),
+            sorted(old),
+        )
+        (_, start) = self.contract.starts()
+        self.assertEqual(start["harnesses"], ["claude-code", "codex"])
+        new = self.contract.issued() - old
+        for data in (self.data, self.codex_data):
+            self.assertIn(self.saved_token(data), new)
+            self.assertEqual(len(self.retired(data)), 1)
+        # The hooks and the sync jobs stay, and now record to the new account.
+        self.assertEqual(self.scheduler.changes(), log)
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
+        self.hook_event("claude")
+        self.hook_event("codex")
+        self.run_collector("sync")
+        self.assertEqual(len(self.received), 3)
+        self.assertLessEqual(set(self.received_tokens[1:]), new)
+        after = out[out.index("[4/4]") :]
+        self.assertIn("✓ Claude Code records to the workspace other-diary", after)
+        self.assertIn("✓ Codex records to the workspace other-diary", after)
+        self.assertIn("! Codex: trust the DevDiary entries in /hooks", after)
+        self.assertNotIn("never received", self.flat(out))
+        self.assertEqual(out.splitlines()[-1], "Next: devdiary doctor")
+
+    def test_rows_still_waiting_stay_behind_and_never_reach_the_new_account(self):
+        self.install()
+        self.observation_status = 503
+        self.spool(2)
+        out = self.login().stdout.decode()
+        self.assertRegex(
+            self.flat(out),
+            r"Claude Code: 2 events that were not sent stay in "
+            r"~/\.local/share/devdiary/cli/claude/connection\.retired-\S+ "
+            r"and are never sent\.",
+        )
+        (retired,) = self.retired(self.data)
+        with closing(
+            sqlite3.connect(retired / "outbox/collector-rust-v1.sqlite3")
+        ) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 2)
+        self.observation_status = 201
+        self.hook_event("claude")
+        self.run_collector("sync")
+        # Only the new session reaches the new account.
+        new = self.saved_token(self.data)
+        self.assertEqual(self.received_tokens.count(new), 1)
+
+    def test_a_connection_revoked_in_the_browser_is_retired_too(self):
+        self.install()
+        self.spool(1)
+        self.contract.revoked.add(self.saved_token(self.data))
+        self.assertTrue(self.timer_sync()["revoked"])
+        out = self.login().stdout.decode()
+        self.assertIn(
+            "Claude Code: its connection to the workspace acme-diary was revoked",
+            out[: out.index("[2/4]")],
+        )
+        self.assertEqual(len(self.contract.revocations()), 1)
+        (retired,) = self.retired(self.data)
+        self.assertTrue((retired / "revoked").exists())
+        doctor = json.loads(self.run_collector("doctor", "--json").stdout)
+        self.assertFalse(doctor["revoked"])
+        self.assertEqual(doctor["registration"]["registration"], "installed")
+
+    def assert_login_stops_before_anything_changes(self, answer, code):
+        self.install()
+        settings, token = self.settings.read_bytes(), self.saved_token(self.data)
+        log = self.scheduler.changes()
+        self.contract.intercept = lambda path, body: (
+            answer if path == pairing_server.CONNECTION else None
+        )
+        result = self.login(code=2)
+        self.assert_failed_exit(result.stderr, code)
+        self.assertIn(b"Nothing changed on this machine.", result.stderr)
+        self.assertEqual(len(self.contract.revocations()), 1)
+        self.assertEqual(self.saved_token(self.data), token)
+        self.assertEqual(self.retired(self.data), [])
+        self.assertEqual(self.settings.read_bytes(), settings)
+        self.assertEqual(len(self.contract.starts()), 1)
+        self.assertEqual(self.scheduler.changes(), log)
+
+    def test_an_unreachable_server_stops_login_before_anything_changes(self):
+        self.assert_login_stops_before_anything_changes("close", "revoke_unreachable")
+
+    def test_a_server_that_does_not_revoke_stops_login_before_anything_changes(self):
+        missing = (404, {}, b'{"error":"not_found"}')
+        self.assert_login_stops_before_anything_changes(missing, "revoke_refused")
+
+    def test_an_interrupted_login_run_again_completes(self):
+        self.find_codex()
+        self.install(answers=self.BOTH)
+        self.contract.on_start = pairing_server.nobody
+        self.interrupted_login(b"Approval code")
+        # Unpaired, with the hooks in place.
+        self.assertEqual(
+            sum(len(v) for v in self.owned_entries().values()), len(EVENTS)
+        )
+        for data in (self.data, self.codex_data):
+            self.assertFalse((data / "connection/connection.json").exists())
+            self.assertEqual(len(self.retired(data)), 1)
+        # The sync job runs meanwhile and leaves the folder as pairing needs it.
+        result = self.run_collector(
+            "sync", self.data / "connection", exe=self.record()["executable"], code=2
+        )
+        self.assertEqual(
+            result.stderr.decode().splitlines()[-1], "error_code: not_paired"
+        )
+        self.assertIn(b"Next: devdiary login", result.stderr)
+        self.assertLessEqual(
+            {p.name for p in (self.data / "connection").iterdir()}, {"setup.lock"}
+        )
+        self.contract.on_start = pairing_server.approve_in_browser
+        self.contract.workspace_name = "other-diary"
+        out = self.login().stdout.decode()
+        self.assertIn("Claude Code: not paired", out[: out.index("[2/4]")])
+        self.assertIn("Finish signing this machine in? [y/N/d]", out)
+        starts = self.contract.starts()
+        self.assertEqual(len(starts), 3)
+        self.assertEqual(starts[-1]["harnesses"], ["claude-code", "codex"])
+        for data in (self.data, self.codex_data):
+            self.assertIn(self.saved_token(data), self.contract.requests[-1].tokens())
+        self.hook_event("codex")
+        self.run_collector("sync")
+        self.assertIn(self.received_tokens[-1], self.contract.requests[-1].tokens())
+
+    def test_a_login_whose_new_connection_never_arrived_finishes_on_the_next_run(self):
+        self.install()
+        self.contract.intercept = lambda path, body: (
+            "close" if isinstance(body, dict) and "verifier" in body else None
+        )
+        result = self.login(code=2)
+        self.assert_failed_exit(result.stderr, "login_incomplete")
+        self.assertIn(b"Next: devdiary login", result.stderr)
+        self.contract.intercept = None
+        out = self.login().stdout.decode()
+        self.assertIn(
+            "may have left a connection in DevDiary that this machine never received",
+            self.flat(out),
+        )
+        self.assertEqual(len(self.retired(self.data)), 2)
+        self.assertIn(self.saved_token(self.data), self.contract.requests[-1].tokens())
+
+    def test_a_login_stopped_after_the_approval_moves_the_hooks_on_the_next_run(self):
+        self.install()
+        self.contract.workspace_name = "other-diary"
+        paused = {**self.env(), "DEVDIARY_DEBUG_PAUSE_AT": "login_paired"}
+        self.interrupted_login(b"paused at login_paired", env=paused)
+        out = self.login().stdout.decode()
+        self.assertIn(
+            "Claude Code: connected to the workspace other-diary, but its hook entries still name the old connection.",
+            self.flat(out[: out.index("[2/4]")]),
+        )
+        self.assertEqual(len(self.contract.starts()), 2)
+        self.assertEqual(len(self.retired(self.data)), 1)
+        self.hook_event("claude")
+        self.run_collector("sync")
+        self.assertEqual(self.received_tokens, [self.saved_token(self.data)])
+        self.assertIn("✓ Claude Code records to the workspace other-diary", out)
+
+    def test_declining_login_sends_and_changes_nothing(self):
+        self.install()
+        self.spool(1)
+        settings, token = self.settings.read_bytes(), self.saved_token(self.data)
+        result = self.login(code=2, answers=(b"n\n",))
+        self.assert_failed_exit(result.stderr, "consent_declined")
+        self.assertIn(b"Sent to DevDiary: nothing", result.stderr)
+        self.assertEqual(self.received, [])
+        self.assertEqual(self.contract.revocations(), [])
+        self.assertEqual(len(self.contract.starts()), 1)
+        self.assertEqual(self.saved_token(self.data), token)
+        self.assertEqual(self.settings.read_bytes(), settings)
+
+    def test_login_without_a_terminal_refuses_before_anything_is_sent(self):
+        self.install()
+        result = self.run_collector("login", code=2)
+        self.assert_failed_exit(result.stderr, "no_terminal")
+        self.assertEqual(self.contract.revocations(), [])
+
+    def test_login_with_nothing_set_up_says_to_run_setup(self):
+        result = self.login(code=2, answers=())
+        self.assert_failed_exit(result.stderr, "not_installed")
+        self.assertIn(b"Next: devdiary setup", result.stderr)
+        self.assertEqual(self.contract.starts(), [])
 
 
 if __name__ == "__main__":

@@ -454,6 +454,12 @@ pub fn preflight_replacing(plan_path: &Path) -> Result<()> {
     }
     refusal(path, &without(&p, &raw)?)
 }
+/// The connection scope a plan was made for; the hook records only while the
+/// outbox holds the same one.
+pub fn plan_scope(plan_path: &Path) -> Result<Object> {
+    let p = load(plan_path)?;
+    Ok(p["scope"].as_object().ok_or("invalid_scope")?.clone())
+}
 pub fn entries(plan_path: &Path) -> Result<Vec<String>> {
     let p = load(plan_path)?;
     lines(&p["entry"], vendor(&p)?)

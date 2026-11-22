@@ -10,6 +10,7 @@ pub mod drops;
 pub mod exit;
 pub mod install;
 pub mod launchd;
+pub mod login;
 mod machine;
 pub mod orchestrators;
 mod ordered;

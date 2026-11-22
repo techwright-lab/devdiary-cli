@@ -28,6 +28,7 @@ use std::{
 use uuid::Uuid;
 const START: &str = "/ingest/v1/collector_pairings";
 const EXCHANGE: &str = "/ingest/v1/collector_pairings/exchange";
+const REVOKE: &str = "/ingest/v1/collector/connection";
 const APPROVE: &str = "/collector/approve?code=";
 pub const DEFAULT_ORIGIN: &str = "https://devdiary.me";
 const ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
@@ -36,7 +37,7 @@ const LONGEST_WAIT: Duration = Duration::from_secs(660);
 const ATTEMPT: &str = "pairing-attempted";
 const COOLDOWN: &str = "start-retry-after";
 /// The name of the workspace a connection joined, kept so `doctor` can name it.
-pub(crate) const WORKSPACE: &str = "workspace.json";
+const WORKSPACE: &str = "workspace.json";
 const CONNECTED: &str = "Connected. Return to the terminal.";
 const NOT_CONNECTED: &str = "The terminal did not connect. Return to the terminal to see why.";
 
@@ -370,8 +371,10 @@ pub fn setup(o: Options<'_>) -> Result<Option<String>> {
                 return Err("frozen_scope_conflict".into());
             }
             initialize(harness.root, &connection(harness.root)?)?;
+            let workspace = workspace(harness.root)
+                .map_or("DevDiary".into(), |name| format!("the workspace {name}"));
             Out::stdout().done(&format!(
-                "{}: connection already saved, so it is not paired again.",
+                "{}: connected to {workspace}. To use another account, run `devdiary login`.",
                 harness.vendor.name()
             ));
         } else {
@@ -383,15 +386,8 @@ pub fn setup(o: Options<'_>) -> Result<Option<String>> {
         return Ok(None);
     }
     let local = local_browser(Os::THIS, |name| std::env::var_os(name));
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .retry(reqwest::retry::never())
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(4))
-        .timeout(Duration::from_secs(5))
-        .build()?;
     Pairing {
-        client,
+        client: client()?,
         origin: &origin,
         target: &target,
         harnesses: &unpaired,
@@ -402,6 +398,90 @@ pub fn setup(o: Options<'_>) -> Result<Option<String>> {
     }
     .run(o.browser && local, local)
     .map(Some)
+}
+fn client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(5))
+        .build()?)
+}
+/// The name of the workspace a connection folder joined, as it was saved.
+pub(crate) fn workspace(root: &Path) -> Option<String> {
+    let saved = object(&read(&root.join(WORKSPACE)).ok()?).ok()?;
+    saved.get("name")?.as_str().map(machine::shown)
+}
+
+/// Revokes a saved connection on the server it belongs to. Returns true when
+/// it is revoked now, false when the server no longer knew it or had revoked it.
+pub(crate) fn revoke(root: &Path) -> Result<bool> {
+    let token = text(&connection(root)?, "token")?.to_owned();
+    let saved = object(&read(&root.join("installation.json"))?)?;
+    let origin = origin(text(&saved, "origin")?, true)?;
+    let r = client()?
+        .delete(format!("{origin}{REVOKE}"))
+        .bearer_auth(token)
+        .send()
+        .map_err(|_| "revoke_unreachable")?;
+    match r.status().as_u16() {
+        204 => Ok(true),
+        401 => Ok(false),
+        _ => Err("revoke_refused".into()),
+    }
+}
+/// Moves a connection folder aside, beside it and as private as it was, so a
+/// new pairing can use its place. Returns where it went.
+pub(crate) fn retire(root: &Path) -> Result<std::path::PathBuf> {
+    let parent = root.parent().ok_or("invalid_path")?;
+    let stamp = chrono::DateTime::from_timestamp(now()? as i64, 0)
+        .ok_or("invalid_time")?
+        .format("%Y%m%dT%H%M%SZ");
+    for n in 1..100 {
+        let suffix = if n == 1 {
+            String::new()
+        } else {
+            format!("-{n}")
+        };
+        let target = parent.join(format!("connection.retired-{stamp}{suffix}"));
+        match rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            root,
+            rustix::fs::CWD,
+            &target,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Err(rustix::io::Errno::EXIST) => continue,
+            result => result?,
+        }
+        File::open(parent)?.sync_all()?;
+        return Ok(target);
+    }
+    Err("retire_failed".into())
+}
+/// Whether a folder without a saved connection holds something a new
+/// pairing refuses, such as an attempt whose answer was lost.
+pub(crate) fn stranded(root: &Path) -> Result<bool> {
+    if !root.exists() || root.join("connection.json").exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(root)? {
+        let name = entry?.file_name();
+        if !spare(&name.to_string_lossy()) && name != COOLDOWN {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+/// Whether a verifier was presented from this folder and its answer lost, so
+/// the server may hold a connection this machine never received.
+pub(crate) fn attempted(root: &Path) -> bool {
+    root.join(ATTEMPT).exists()
+}
+// What a folder may hold before its pairing: the lock and an unfinished write.
+fn spare(name: &str) -> bool {
+    name == "setup.lock" || (name.starts_with(".pairing-") && name.ends_with(".tmp"))
 }
 /// Whether a browser can open on this machine: a graphical session on Linux,
 /// and on either system not over SSH.
@@ -442,9 +522,7 @@ fn unused(root: &Path) -> Result<()> {
         return Err("repair_new_pair".into());
     }
     for entry in fs::read_dir(root)? {
-        let name = entry?.file_name();
-        let name = name.to_string_lossy();
-        if name != "setup.lock" && !(name.starts_with(".pairing-") && name.ends_with(".tmp")) {
+        if !spare(&entry?.file_name().to_string_lossy()) {
             return Err("new_private_directory_required".into());
         }
     }

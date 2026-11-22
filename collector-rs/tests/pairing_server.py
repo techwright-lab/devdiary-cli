@@ -1,8 +1,9 @@
 """A local DevDiary pairing server for tests, speaking pairing contract v2.
 
 It applies the server's rules for the start, the approval and its 127.0.0.1
-redirect, the status poll and the verifier exchange. A test plays the person:
-it approves or denies, and follows the redirect as a browser would.
+redirect, the status poll and the verifier exchange, and for a collector that
+revokes its own connection. A test plays the person: it approves or denies,
+and follows the redirect as a browser would.
 """
 
 import json
@@ -17,6 +18,7 @@ from dataclasses import dataclass, field
 
 START = "/ingest/v1/collector_pairings"
 EXCHANGE = START + "/exchange"
+CONNECTION = "/ingest/v1/collector/connection"
 ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"
 CODE = re.compile(rf"\A[{ALPHABET}]{{8}}\Z")
 HARNESSES = ("claude-code", "codex")
@@ -97,6 +99,9 @@ class Request:
     def approval_path(self):
         return f"/collector/approve?code={display(self.code)}"
 
+    def tokens(self):
+        return {c["token"] for c in self.connections}
+
 
 class Contract:
     """Server state for every request a test starts. Mutate the knobs to vary it."""
@@ -120,6 +125,8 @@ class Contract:
         # (status, headers, raw body).
         self.intercept = None
         self.pages = []
+        # Connection tokens revoked, from the machine or in the browser.
+        self.revoked = set()
 
     @property
     def latest(self):
@@ -130,6 +137,25 @@ class Contract:
 
     def exchanges(self):
         return [body for path, body, _, _ in self.calls if path == EXCHANGE]
+
+    def issued(self):
+        """Every connection token the server issued."""
+        return {c["token"] for r in self.requests for c in r.connections}
+
+    def revocations(self):
+        """The bearer each revoke call carried, in order."""
+        return [auth for path, _, auth, _ in self.calls if path == CONNECTION]
+
+    def refuses(self, authorization):
+        """Whether ingest refuses this bearer: a revoked connection's."""
+        return bearer(authorization) in self.revoked
+
+    def revoke(self, authorization):
+        token = bearer(authorization)
+        if token not in self.issued() or token in self.revoked:
+            return 401, {}, {"error": "unauthorized"}
+        self.revoked.add(token)
+        return 204, {"Cache-Control": "no-store"}, None
 
     def start(self, raw, content_type):
         if content_type != "application/json" or len(raw) > 1024:
@@ -295,8 +321,12 @@ class Contract:
         return {k: v for k, v in made.items() if v is not None}
 
     def handle(self, handler):
-        """Answer a pairing call on a BaseHTTPRequestHandler; False for other paths."""
-        if handler.path not in (START, EXCHANGE):
+        """Answer a pairing or revoke call on a BaseHTTPRequestHandler; False for other paths."""
+        if (handler.command, handler.path) not in (
+            ("POST", START),
+            ("POST", EXCHANGE),
+            ("DELETE", CONNECTION),
+        ):
             return False
         raw = handler.rfile.read(int(handler.headers.get("Content-Length", 0)))
         try:
@@ -313,10 +343,12 @@ class Contract:
         if answer is None:
             if handler.path == START:
                 answer = self.start(raw, handler.headers.get("Content-Type"))
+            elif handler.path == CONNECTION:
+                answer = self.revoke(authorization)
             else:
                 answer = self.exchange(authorization, raw)
             status, headers, doc = answer
-            answer = status, headers, json.dumps(doc).encode()
+            answer = status, headers, b"" if doc is None else json.dumps(doc).encode()
         status, headers, out = answer
         handler.send_response(status)
         for name, value in headers.items():
@@ -341,6 +373,13 @@ class Contract:
             result = None, str(error)
         self.pages.append(result)
         return result
+
+
+def bearer(authorization):
+    prefix = "Bearer "
+    if authorization is None or not authorization.startswith(prefix):
+        return None
+    return authorization[len(prefix) :]
 
 
 def approve_in_browser(contract, request):
