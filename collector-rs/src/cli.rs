@@ -2,7 +2,7 @@
 //! The hook commands never come here: `main` runs them first, before any
 //! parsing, to stay inside their deadline.
 use crate::{
-    Result, exit, install,
+    Result, exit, install, login,
     scheduler::Scheduler,
     ui::{self, Out},
     vendor::Vendor,
@@ -71,6 +71,18 @@ pub enum Run {
         after_help = "Examples:\n  devdiary setup\n  devdiary setup --vendor codex"
     )]
     Setup(SetupArgs),
+    #[command(
+        about = "Move this machine to another DevDiary account",
+        before_help = concat!(
+            "Login sends what this machine has recorded to the account it records to now,\n",
+            "revokes that connection, then connects every harness set up here to the account\n",
+            "you approve in the browser. The hooks and the sync jobs stay. What it cannot\n",
+            "send first stays on this machine and is never sent.",
+        ),
+        override_usage = "devdiary login [options]",
+        after_help = "Examples:\n  devdiary login\n  devdiary login --no-browser"
+    )]
+    Login(LoginArgs),
     #[command(
         about = "Check that recording works",
         before_help = concat!(
@@ -188,6 +200,16 @@ pub struct SetupArgs {
     pub settings: Option<PathBuf>,
     #[arg(long, help = "Also record orchestrated runs outside git repositories")]
     pub record_orchestrated_outside_repos: bool,
+    #[arg(long, help = "Print the approval link without opening a browser")]
+    pub no_browser: bool,
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct LoginArgs {
+    #[arg(long, hide = true)]
+    pub origin: Option<String>,
+    #[arg(long, hide = true)]
+    pub trust_origin: bool,
     #[arg(long, help = "Print the approval link without opening a browser")]
     pub no_browser: bool,
 }
@@ -390,6 +412,7 @@ pub fn run(args: Vec<OsString>) -> i32 {
 fn dispatch(run: Run) -> i32 {
     let (command, vendor) = match &run {
         Run::Setup(a) => ("setup", &a.vendor),
+        Run::Login(_) => ("login", &None),
         Run::Doctor { vendor, .. } => ("doctor", vendor),
         Run::Sync { .. } => ("sync", &None),
         Run::Upgrade { vendor, .. } => ("upgrade", vendor),
@@ -435,6 +458,14 @@ fn execute(run: Run, named: Option<Vendor>) -> Result<i32> {
             },
             &scheduler,
         ),
+        Run::Login(a) => login::login(
+            login::Options {
+                origin: a.origin.as_deref(),
+                trust_origin: a.trust_origin,
+                browser: !a.no_browser,
+            },
+            &scheduler,
+        ),
         Run::Doctor { json, .. } => {
             return install::doctor(&scheduler, named, json).map(|outcome| match outcome {
                 install::Doctor::Reported => 0,
@@ -472,6 +503,7 @@ mod tests {
         )), "{overview}");
         for (name, about) in [
             ("setup", "Connect Claude Code and Codex on this machine"),
+            ("login", "Move this machine to another DevDiary account"),
             ("doctor", "Check that recording works"),
             ("sync", "Send recorded sessions now"),
             ("upgrade", "Move hooks to this version"),
@@ -528,6 +560,7 @@ mod tests {
     fn each_command_has_help_with_a_paragraph_its_options_and_examples() {
         for name in [
             "setup",
+            "login",
             "doctor",
             "sync",
             "upgrade",
@@ -573,6 +606,14 @@ mod tests {
             })))
         );
         assert_eq!(
+            parse(&["login", "--no-browser"]),
+            Ok(Parsed::Run(Run::Login(LoginArgs {
+                origin: None,
+                trust_origin: false,
+                no_browser: true,
+            })))
+        );
+        assert_eq!(
             parse(&["upgrade", "--yes", "--vendor", "claude"]),
             Ok(Parsed::Run(Run::Upgrade {
                 yes: true,
@@ -604,6 +645,7 @@ mod tests {
             &["setup", "--no-browser", "--no-browser"],
             &["setup", "--vendor", "claude", "--vendor", "codex"],
             &["setup", "--vendor"],
+            &["login", "--vendor", "codex"],
             &["sync", "relative"],
             &["sync", "--vendor", "claude"],
             &["outside-repos", "maybe"],

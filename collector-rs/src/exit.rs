@@ -8,7 +8,7 @@ use crate::{
 };
 
 // Static refusal codes only; other errors can carry input or paths.
-const REPORTED: [&str; 31] = [
+const REPORTED: [&str; 35] = [
     "invalid_command",
     "no_terminal",
     "no_harness_found",
@@ -40,6 +40,10 @@ const REPORTED: [&str; 31] = [
     "setup_incomplete",
     "owned_entry_changed",
     "owned_entry_missing",
+    "not_paired",
+    "revoke_unreachable",
+    "revoke_refused",
+    "login_incomplete",
 ];
 // Codes from pairing, scope refresh and sync.
 const PAIRING: [&str; 14] = [
@@ -444,6 +448,26 @@ pub fn guidance(code: &str, c: &Context) -> Guidance {
             )),
             next: Some(MOVE_ASIDE.into()),
         },
+        "not_paired" => g(
+            "This harness has no saved connection, so nothing was sent.",
+            "An earlier `devdiary login` stopped before the approval, or the connection folder was moved aside. The hooks stay in place and record nothing until it is paired.",
+            Some("devdiary login".into()),
+        ),
+        "revoke_unreachable" => g(
+            "DevDiary could not be reached to revoke this machine's old connection.",
+            "Nothing changed on this machine. The hooks still record to the old account.",
+            Some("devdiary login, once DevDiary can be reached".into()),
+        ),
+        "revoke_refused" => g(
+            "DevDiary did not revoke this machine's old connection.",
+            "Nothing changed on this machine. To retire it by hand, revoke it under Settings › Collectors in the old account, then run login again.",
+            Some("devdiary login".into()),
+        ),
+        "login_incomplete" => g(
+            "Login stopped before this machine received its new connection.",
+            "DevDiary may hold a connection this machine never received: revoke it under Settings › Collectors in the account you approved. The hooks stay in place, and the next login finishes.",
+            Some("devdiary login".into()),
+        ),
         "owned_entry_changed" | "owned_entry_missing" => g(
             "The collector's hook entries in the settings were edited, so the settings were left as they are.",
             "Restore or delete those entries.",

@@ -51,12 +51,12 @@ fn home() -> Result<PathBuf> {
 // Fixed under HOME, not XDG_DATA_HOME: a shell without that variable must still
 // find the same install record, connection and pinned binary. Never the old
 // devdiary-collector folder: setup pairs again rather than adopt its connection.
-fn data_dir(vendor: Vendor) -> Result<PathBuf> {
+pub(crate) fn data_dir(vendor: Vendor) -> Result<PathBuf> {
     Ok(home()?
         .join(".local/share/devdiary/cli")
         .join(vendor.slug()))
 }
-fn connection(data: &Path) -> PathBuf {
+pub(crate) fn connection(data: &Path) -> PathBuf {
     data.join("connection")
 }
 fn private_dir(path: &Path) -> Result<()> {
@@ -107,12 +107,14 @@ fn load(path: &Path) -> Result<Option<Object>> {
     Ok(Some(object(&raw)?))
 }
 
-struct Record {
-    settings: PathBuf,
-    plan: PathBuf,
-    version: String,
+pub(crate) struct Record {
+    pub(crate) settings: PathBuf,
+    pub(crate) plan: PathBuf,
+    pub(crate) version: String,
+    /// The pinned copy the hooks and the scheduler run.
+    pub(crate) executable: PathBuf,
 }
-fn record(data: &Path) -> Result<Option<Record>> {
+pub(crate) fn record(data: &Path) -> Result<Option<Record>> {
     let Some(doc) = load(&data.join(RECORD))? else {
         return Ok(None);
     };
@@ -120,6 +122,7 @@ fn record(data: &Path) -> Result<Option<Record>> {
         settings: text(&doc, "settings")?.into(),
         plan: text(&doc, "plan")?.into(),
         version: text(&doc, "version")?.into(),
+        executable: text(&doc, "executable")?.into(),
     }))
 }
 
@@ -153,7 +156,7 @@ fn pin_binary(data: &Path) -> Result<PathBuf> {
     result.map(|_| target)
 }
 
-fn require_consent_channel(yes: bool) -> Result<()> {
+pub(crate) fn require_consent_channel(yes: bool) -> Result<()> {
     if !yes && !std::io::stdin().is_terminal() {
         return Err("no_terminal".into());
     }
@@ -176,7 +179,7 @@ fn answer(question: &str, choices: &str) -> Result<String> {
     Ok(line.trim().to_owned())
 }
 /// A yes or no to a summarised change, where `d` prints the exact entries first.
-fn consent_to(question: &str, details: &dyn Fn()) -> Result<()> {
+pub(crate) fn consent_to(question: &str, details: &dyn Fn()) -> Result<()> {
     require_consent_channel(false)?;
     loop {
         match answer(question, "y/N/d")?.as_str() {
@@ -217,7 +220,18 @@ fn warn_other_on_path() {
 /// accepted harness with one approval, set each up, then wait for a first session.
 pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
     let mut journal = Journal::default();
-    let Err(error) = guided(&o, scheduler, &mut journal) else {
+    let result = guided(&o, scheduler, &mut journal);
+    reported("setup", o.vendor, &journal, result)
+}
+/// A guided command's failure as printed: what happened, what it changed and
+/// sent, and the next command. `named` is the harness the command was limited to.
+pub(crate) fn reported(
+    command: &'static str,
+    named: Option<Vendor>,
+    journal: &Journal,
+    result: Result<()>,
+) -> Result<()> {
+    let Err(error) = result else {
         return Ok(());
     };
     let stopped = error.downcast_ref::<Stopped>();
@@ -225,8 +239,8 @@ pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
     let cause = stopped.map_or(error.as_ref(), |s| s.error.as_ref());
     let code = exit::code(cause);
     let context = exit::Context {
-        command: "setup",
-        vendor: harness.or(o.vendor),
+        command,
+        vendor: harness.or(named),
     };
     let out = Out::stderr();
     let report = exit::explain(cause, &context).render(
@@ -238,11 +252,11 @@ pub fn setup(o: Options<'_>, scheduler: &Scheduler<'_>) -> Result<()> {
     Err(Box::new(exit::Shown(code)))
 }
 
-/// What setup changed on this machine and sent to DevDiary, for its exit.
+/// What a guided command changed on this machine and sent to DevDiary, for its exit.
 #[derive(Default)]
-struct Journal {
-    changed: Vec<String>,
-    sent: Vec<String>,
+pub(crate) struct Journal {
+    pub(crate) changed: Vec<String>,
+    pub(crate) sent: Vec<String>,
 }
 impl Journal {
     /// Both lists, each item indented under its title.
@@ -261,7 +275,7 @@ impl Journal {
         }
         rows
     }
-    fn print(&self, out: Out) {
+    pub(crate) fn print(&self, out: Out) {
         for row in self.lines() {
             let item = row.trim_start();
             let indent = 2 + row.len() - item.len();
@@ -272,9 +286,9 @@ impl Journal {
 
 /// A harness that stopped in step 3 while the others went on, and why.
 #[derive(Debug)]
-struct Stopped {
-    vendor: Vendor,
-    error: Box<dyn std::error::Error>,
+pub(crate) struct Stopped {
+    pub(crate) vendor: Vendor,
+    pub(crate) error: Box<dyn std::error::Error>,
 }
 impl std::fmt::Display for Stopped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -408,9 +422,9 @@ fn guided(o: &Options<'_>, scheduler: &Scheduler<'_>, journal: &mut Journal) -> 
     out.next("devdiary doctor");
     Ok(())
 }
-const CODEX_TRUST: &str = "Codex: trust the DevDiary entries in /hooks";
+pub(crate) const CODEX_TRUST: &str = "Codex: trust the DevDiary entries in /hooks";
 /// The checklist line for a harness that records now.
-fn recording(vendor: Vendor, workspace: Option<&str>) -> String {
+pub(crate) fn recording(vendor: Vendor, workspace: Option<&str>) -> String {
     match workspace {
         Some(workspace) => format!("{} records to the workspace {workspace}", vendor.name()),
         None => format!("{} records to DevDiary", vendor.name()),
@@ -542,7 +556,7 @@ fn choose(found: Vec<Found>, os: Os, journal: &mut Journal) -> Result<Vec<Accept
             }
         };
         let exe = pinned(&h.data);
-        let registration = Registration::new(&h.data, &h.settings, &exe, h.vendor)?;
+        let registration = Registration::new(&h.data, &h.settings, &exe, h.vendor, VERSION)?;
         let shown = registration.entries()?;
         for row in summary(
             os,
@@ -651,11 +665,8 @@ fn pair(
         sent: &sent,
     });
     if sent.get() {
-        let names: Vec<_> = unpaired.iter().map(|(v, _)| v.name()).collect();
-        journal.sent.push(format!(
-            "A pairing request for {}, with this machine's hostname, OS name and version, CPU and CLI version.",
-            names.join(" and ")
-        ));
+        let vendors: Vec<_> = unpaired.iter().map(|(v, _)| *v).collect();
+        journal.sent.push(pairing_request(&vendors));
     }
     for (vendor, root) in &unpaired {
         if root.join("connection.json").exists() {
@@ -670,6 +681,14 @@ fn pair(
         newly: unpaired.iter().map(|(vendor, _)| *vendor).collect(),
         workspace: paired.map_err(setup_failure)?,
     })
+}
+/// What a pairing request sent, for the journal.
+pub(crate) fn pairing_request(vendors: &[Vendor]) -> String {
+    let names: Vec<_> = vendors.iter().map(|v| v.name()).collect();
+    format!(
+        "A pairing request for {}, with this machine's hostname, OS name and version, CPU and CLI version.",
+        names.join(" and ")
+    )
 }
 /// Step 3 for one harness, after the exchange.
 fn set_up(a: &Accepted, scheduler: &Scheduler<'_>, journal: &mut Journal) -> Result<()> {
@@ -694,7 +713,8 @@ fn first_session_wait() -> Duration {
         .and_then(|seconds| seconds.parse().ok())
         .map_or(FIRST_SESSION_WAIT, Duration::from_secs)
 }
-fn counts(root: &Path) -> Result<(i64, i64)> {
+/// The rows a connection folder's outbox has waiting, and how many it delivered.
+pub(crate) fn counts(root: &Path) -> Result<(i64, i64)> {
     Store::open(&root.join("outbox"), None)?.counts()
 }
 /// Step 4: the first receipt any harness's outbox records, and when, read
@@ -811,15 +831,23 @@ fn setup_failure(error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error
     }
 }
 
-struct Registration {
+/// One harness's hook entries for a new plan, run by the pinned copy `exe` of `version`.
+pub(crate) struct Registration {
     vendor: Vendor,
     data: PathBuf,
     settings: PathBuf,
     exe: PathBuf,
     plan: PathBuf,
+    version: String,
 }
 impl Registration {
-    fn new(data: &Path, settings: &Path, exe: &Path, vendor: Vendor) -> Result<Self> {
+    pub(crate) fn new(
+        data: &Path,
+        settings: &Path,
+        exe: &Path,
+        vendor: Vendor,
+        version: &str,
+    ) -> Result<Self> {
         let plans = data.join("plans");
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let plan = plans.join(format!("{}-{nanos}.json", vendor.slug()));
@@ -829,14 +857,15 @@ impl Registration {
             settings: settings.into(),
             exe: exe.into(),
             plan,
+            version: version.into(),
         })
     }
     /// The exact entries the hooks would add, as consent is given to them.
-    fn entries(&self) -> Result<Vec<String>> {
+    pub(crate) fn entries(&self) -> Result<Vec<String>> {
         claude::entry_lines_for(&self.plan, &self.exe, self.vendor)
     }
     /// The exact entries, for a person who asked to see them.
-    fn print(&self, entries: &[String]) {
+    pub(crate) fn print(&self, entries: &[String]) {
         let out = Out::stdout();
         out.say(&format!(
             "{} hook entries to append to {}:",
@@ -849,7 +878,7 @@ impl Registration {
     }
     // Consent is given to the lines `show` printed and, during setup, to the
     // settings as they were then, so the saved plan must match both.
-    fn plan(&self, shown: &[String], agreed: Option<&str>) -> Result<()> {
+    pub(crate) fn plan(&self, shown: &[String], agreed: Option<&str>) -> Result<()> {
         private_dir(self.plan.parent().ok_or("invalid_path")?)?;
         pairing::plan_with(
             &connection(&self.data),
@@ -873,7 +902,14 @@ impl Registration {
         backup: bool,
         done: &mut dyn FnMut(String),
     ) -> Result<()> {
-        let (data, exe, plan) = (&self.data, &self.exe, &self.plan);
+        self.write(backup, done)?;
+        scheduler.enable(&self.exe, &connection(&self.data), self.vendor)?;
+        done(format!("started {}", job(scheduler.os, self.vendor)));
+        self.check(scheduler.os)
+    }
+    /// Applies the plan and saves the install record that names it.
+    pub(crate) fn write(&self, backup: bool, done: &mut dyn FnMut(String)) -> Result<()> {
+        let plan = &self.plan;
         if backup {
             claude::apply_with_backup(plan)?;
         } else {
@@ -884,37 +920,42 @@ impl Registration {
             ui::path(&self.settings)
         ));
         pause("hooks_written");
-        let out = Out::stdout();
         if self.vendor == Vendor::Codex {
-            out.attention(&format!(
+            Out::stdout().attention(&format!(
                 "{CODEX_TRUST} before it can record. After an upgrade, trust them again."
             ));
         }
         save(
-            &data.join(RECORD),
-            &json!({"version": VERSION, "executable": exe, "plan": plan, "settings": self.settings}),
+            &self.data.join(RECORD),
+            &json!({"version": self.version, "executable": self.exe, "plan": plan, "settings": self.settings}),
         )?;
         if backup {
             claude::discard_backup(&self.settings)?;
         }
-        scheduler.enable(exe, &connection(data), self.vendor)?;
-        let job = match scheduler.os {
-            Os::Linux => self.vendor.timer(),
-            Os::Macos => self.vendor.label(),
-        };
-        done(format!("started {job}"));
-        self_test(exe, plan, &connection(data).join("outbox"), self.vendor)?;
-        out.done(&format!(
-            "Self-test passed for {}: the installed hook recorded a local test event that is never uploaded. {job} syncs every 2 minutes.",
-            self.vendor.name()
+        Ok(())
+    }
+    /// The local self-test of the hooks this registration wrote.
+    pub(crate) fn check(&self, os: Os) -> Result<()> {
+        let outbox = connection(&self.data).join("outbox");
+        self_test(&self.exe, &self.plan, &outbox, self.vendor)?;
+        Out::stdout().done(&format!(
+            "Self-test passed for {}: the installed hook recorded a local test event that is never uploaded. {} syncs every 2 minutes.",
+            self.vendor.name(),
+            job(os, self.vendor)
         ));
         Ok(())
+    }
+}
+fn job(os: Os, vendor: Vendor) -> &'static str {
+    match os {
+        Os::Linux => vendor.timer(),
+        Os::Macos => vendor.label(),
     }
 }
 
 // Debug builds wait here when a test names the stage, so it can kill setup at
 // that exact point. Release builds never read the variable.
-fn pause(stage: &str) {
+pub(crate) fn pause(stage: &str) {
     if cfg!(debug_assertions)
         && std::env::var_os("DEVDIARY_DEBUG_PAUSE_AT").is_some_and(|s| s == stage)
     {
@@ -969,7 +1010,7 @@ pub fn upgrade(yes: bool, scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<(
     }
     claude::preflight_replacing(&old.plan)?;
     let exe = pinned(&data);
-    let registration = Registration::new(&data, &old.settings, &exe, vendor)?;
+    let registration = Registration::new(&data, &old.settings, &exe, vendor, VERSION)?;
     let shown = registration.entries()?;
     out.raw("");
     let settings = ui::path(&old.settings);
@@ -1248,8 +1289,7 @@ fn doctor_json(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Doctor> {
 }
 /// The workspace a harness's connection joined, when pairing kept its name.
 fn workspace(data: &Path) -> Option<String> {
-    let saved = load(&connection(data).join(pairing::WORKSPACE)).ok()??;
-    saved.get("name")?.as_str().map(crate::machine::shown)
+    pairing::workspace(&connection(data))
 }
 /// What a drop reason means, as the end of "N came …".
 fn dropped(reason: &str) -> String {
@@ -1628,6 +1668,11 @@ fn note_sync(root: &Path, error: Option<String>) -> Result<()> {
 /// Server refusals end the run quietly and are left for `doctor`; only local
 /// failures make the service fail.
 pub fn timer_sync(root: &Path) -> Result<()> {
+    // Between a login's retirement and its approval the folder holds no
+    // connection, and the next pairing needs it left as it is.
+    if !root.join("connection.json").exists() {
+        return Err("not_paired".into());
+    }
     match drain(|limit| pairing::sync(root, limit)) {
         Ok(refusal) => note_sync(root, refusal),
         Err(error) => {
