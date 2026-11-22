@@ -304,12 +304,16 @@ struct Found {
     settings: PathBuf,
     /// The settings as checked, or None for a Codex hooks file that does not exist yet.
     agreed: Option<String>,
+    /// DevDiary entries whose binary or plan is gone, which setup offers to remove.
+    stale: Vec<claude::Entry>,
 }
 /// A harness the person agreed to, with the entries they were shown.
 struct Accepted {
     registration: Registration,
     shown: Vec<String>,
     agreed: String,
+    /// The stale entries they agreed to remove, as `d` shows them.
+    stale: Vec<String>,
 }
 
 fn guided(o: &Options<'_>, scheduler: &Scheduler<'_>, journal: &mut Journal) -> Result<()> {
@@ -503,11 +507,16 @@ fn check(o: &Options<'_>, journal: &mut Journal) -> Result<Vec<Found>> {
             return Err(exit::Refusal::about("codex_hooks_json_required", &settings));
         }
         offer_restore(&data, &settings, journal)?;
-        let agreed = if vendor == Vendor::Codex && !settings.exists() {
-            None
+        let (agreed, stale) = if vendor == Vendor::Codex && !settings.exists() {
+            (None, Vec::new())
         } else {
-            Some(claude::preflight(&settings)?)
+            let checked = claude::preflight(&settings)?;
+            let stale = left_behind(vendor, &data, &settings, checked.entries)?;
+            (Some(checked.digest), stale)
         };
+        if !stale.is_empty() {
+            show_stale(vendor, &settings, &stale);
+        }
         if revoked(&data) {
             return Err("connection_revoked".into());
         }
@@ -516,12 +525,81 @@ fn check(o: &Options<'_>, journal: &mut Journal) -> Result<Vec<Found>> {
             data,
             settings,
             agreed,
+            stale,
         });
     }
     if found.is_empty() && !installed {
         return Err("no_harness_found".into());
     }
     Ok(found)
+}
+
+/// The DevDiary entries a settings file holds before setup adds its own. When
+/// every one is stale, setup offers to remove them. Any whose binary and plan
+/// exist belongs to an install, so setup stops and names it.
+fn left_behind(
+    vendor: Vendor,
+    data: &Path,
+    settings: &Path,
+    entries: Vec<claude::Entry>,
+) -> Result<Vec<claude::Entry>> {
+    let working: Vec<_> = entries.iter().filter(|e| !e.stale()).collect();
+    let Some(first) = working.first() else {
+        return Ok(entries);
+    };
+    let held = claude::entries_named(entries.len());
+    // Uninstall finds a run that stopped before its record by its plan.
+    if first.plan.starts_with(data) {
+        return Err(exit::Refusal::with_next(
+            "already_registered",
+            settings,
+            format!(
+                "{held} from an earlier setup on this machine that stopped before it saved its install record"
+            ),
+            format!("devdiary uninstall{}", vendor_flag(vendor)),
+        ));
+    }
+    let runs = match (working.len(), entries.len()) {
+        (n, total) if n == total => format!("that run{}", if n == 1 { "s" } else { "" }),
+        (n, _) => format!(", and {n} of them run{}", if n == 1 { "s" } else { "" }),
+    };
+    Err(exit::Refusal::with(
+        "already_registered",
+        settings,
+        format!(
+            "{held}{}{runs} {}, which still exists: another DevDiary install uses it. Remove its entries with that install's `devdiary uninstall`, or move that install to this build with its `devdiary upgrade`",
+            if runs.starts_with(',') { "" } else { " " },
+            ui::path(&first.executable)
+        ),
+    ))
+}
+/// Step 1's note on stale entries, with the binaries they run.
+fn show_stale(vendor: Vendor, settings: &Path, stale: &[claude::Entry]) {
+    let out = Out::stdout();
+    out.attention(&format!(
+        "{}: {} holds {} whose binary or plan no longer exists, so they record nothing. Setup offers to remove them.",
+        vendor.name(),
+        ui::path(settings),
+        claude::entries_named(stale.len())
+    ));
+    let mut shown = Vec::new();
+    for entry in stale {
+        if !shown.contains(&&entry.executable) {
+            shown.push(&entry.executable);
+            out.line(
+                "    ",
+                None,
+                Some(Style::Dim),
+                &format!("They run {}", ui::path(&entry.executable)),
+            );
+        }
+    }
+}
+fn vendor_flag(vendor: Vendor) -> &'static str {
+    match vendor {
+        Vendor::Codex => " --vendor codex",
+        Vendor::Claude => "",
+    }
 }
 
 /// Step 2: which harnesses, then a separate yes or no for each one's entries.
@@ -552,18 +630,20 @@ fn choose(found: Vec<Found>, os: Os, journal: &mut Journal) -> Result<Vec<Accept
                     "{name}: created an empty hooks file at {}.",
                     ui::path(&h.settings)
                 ));
-                claude::preflight(&h.settings)?
+                claude::preflight(&h.settings)?.digest
             }
         };
         let exe = pinned(&h.data);
         let registration = Registration::new(&h.data, &h.settings, &exe, h.vendor, VERSION)?;
         let shown = registration.entries()?;
+        let stale: Vec<_> = h.stale.iter().map(claude::Entry::line).collect();
         for row in summary(
             os,
             h.vendor,
             shown.len(),
             Path::new(&ui::path(&h.settings)),
             None,
+            stale.len(),
         ) {
             out.raw(&format!("  {row}"));
         }
@@ -572,7 +652,19 @@ fn choose(found: Vec<Found>, os: Os, journal: &mut Journal) -> Result<Vec<Accept
         }
         out.dim("Type d to see the exact entries first.");
         let question = format!("Set up {name}?");
-        if !agrees(consent_to(&question, &|| registration.print(&shown)))? {
+        let details = || {
+            if !stale.is_empty() {
+                out.say(&format!(
+                    "Stale DevDiary hook entries to remove from {}:",
+                    ui::path(&h.settings)
+                ));
+                for line in &stale {
+                    out.raw(&format!("    {line}"));
+                }
+            }
+            registration.print(&shown)
+        };
+        if !agrees(consent_to(&question, &details))? {
             out.attention(&format!("{name}: not set up."));
             continue;
         }
@@ -580,6 +672,7 @@ fn choose(found: Vec<Found>, os: Os, journal: &mut Journal) -> Result<Vec<Accept
             registration,
             shown,
             agreed,
+            stale,
         });
     }
     Ok(accepted)
@@ -693,9 +786,21 @@ pub(crate) fn pairing_request(vendors: &[Vendor]) -> String {
 /// Step 3 for one harness, after the exchange.
 fn set_up(a: &Accepted, scheduler: &Scheduler<'_>, journal: &mut Journal) -> Result<()> {
     let r = &a.registration;
-    pin_binary(&r.data)?;
-    r.plan(&a.shown, Some(&a.agreed))?;
     let name = r.vendor.name();
+    pin_binary(&r.data)?;
+    let agreed = if a.stale.is_empty() {
+        a.agreed.clone()
+    } else {
+        let (agreed, copy) = claude::remove_stale(&r.settings, &a.agreed, &a.stale)?;
+        journal.changed.push(format!(
+            "{name}: removed {} from {}. The file as it was is kept at {}.",
+            stale_named(a.stale.len()),
+            ui::path(&r.settings),
+            ui::path(&copy)
+        ));
+        agreed
+    };
+    r.plan(&a.shown, Some(&agreed))?;
     r.finish(scheduler, true, &mut |done| {
         journal.changed.push(format!("{name}: {done}."))
     })
@@ -1020,6 +1125,7 @@ pub fn upgrade(yes: bool, scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<(
         shown.len(),
         Path::new(&settings),
         Some(&old.version),
+        0,
     ) {
         out.raw(&format!("  {row}"));
     }
@@ -1376,8 +1482,9 @@ struct Health {
 fn health(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Health> {
     let data = data_dir(vendor)?;
     let Some(current) = record(&data)? else {
+        let stale = claude::stale_entries(&settings_path(vendor, None)?, None);
         return Ok(Health {
-            report: json!({"installed": false, "timer": scheduler.state(vendor)}),
+            report: json!({"installed": false, "timer": scheduler.state(vendor), "stale_entries": stale}),
             unreadable: None,
         });
     };
@@ -1418,6 +1525,7 @@ fn health(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Health> {
         "last_receipt": receipt,
         "last_sync_error": status.as_ref().and_then(|s| s.get("last_sync_error").cloned()),
         "last_sync_at": last_sync_at(status),
+        "stale_entries": claude::stale_entries(&current.settings, Some(&current.plan)),
     });
     Ok(Health { report, unreadable })
 }
@@ -1453,8 +1561,10 @@ fn assess(
         why,
         next,
     };
+    let stale = report["stale_entries"].as_u64().unwrap_or(0) as usize;
+    let f = ui::path(settings);
     if report["installed"] != json!(true) {
-        return vec![if found {
+        let mut rows = vec![if found {
             finding(
                 Mark::Attention,
                 format!("{name}: not set up."),
@@ -1469,12 +1579,33 @@ fn assess(
                 next: None,
             }
         }];
+        if stale > 0 {
+            rows.push(finding(
+                Mark::Attention,
+                format!("{name}: {f} holds {}.", stale_named(stale)),
+                Some(format!(
+                    "{} no longer exists, so {} nothing. Setup offers to remove {}.",
+                    if stale == 1 {
+                        "Its binary or plan"
+                    } else {
+                        "Their binary or plan"
+                    },
+                    if stale == 1 {
+                        "it records"
+                    } else {
+                        "they record"
+                    },
+                    if stale == 1 { "it" } else { "them" },
+                )),
+                Some(format!("devdiary setup{flag}")),
+            ));
+        }
+        return rows;
     }
     let context = exit::Context {
         command: "doctor",
         vendor: Some(vendor),
     };
-    let f = ui::path(settings);
     let mut rows = Vec::new();
     let revoked = report["revoked"] == json!(true);
     if revoked {
@@ -1663,6 +1794,23 @@ fn assess(
             next: None,
         });
     }
+    // Stale entries do nothing, so they never hide that the harness records.
+    if stale > 0 {
+        let (its, it) = if stale == 1 {
+            ("Its", "it")
+        } else {
+            ("Their", "them")
+        };
+        rows.push(finding(
+            Mark::Attention,
+            format!("{name}: {f} also holds {}.", stale_named(stale)),
+            Some(format!(
+                "{its} binary or plan no longer exists, so {} nothing. Remove {it} from {f} by hand: setup removes stale entries only while it sets a harness up.",
+                if stale == 1 { "it records" } else { "they record" }
+            )),
+            None,
+        ));
+    }
     // The worst first: failures, then what needs attention.
     rows.sort_by_key(|r| r.mark != Some(Mark::Failed));
     rows
@@ -1670,32 +1818,52 @@ fn assess(
 
 /// One harness's change in two rows: what it adds or replaces in which file,
 /// then the sync job or the new version. `old` is the version an upgrade replaces.
+/// `stale` entries to remove come first, on their own row.
 fn summary(
     os: Os,
     vendor: Vendor,
     entries: usize,
     settings: &Path,
     old: Option<&str>,
-) -> [String; 2] {
+    stale: usize,
+) -> Vec<String> {
     let name = format!("{:<14}", vendor.name());
     let under = " ".repeat(14);
     let settings = settings.display();
-    match old {
-        Some(old) => [
-            format!("{name}replaces its hooks of version {old} in {settings}"),
-            format!("{under}with {entries} hooks of version {VERSION}"),
+    let mut rows = match old {
+        Some(old) => vec![
+            format!("replaces its hooks of version {old} in {settings}"),
+            format!("with {entries} hooks of version {VERSION}"),
         ],
-        None => [
-            format!("{name}adds {entries} hooks to {settings}"),
+        None => vec![
+            format!("adds {entries} hooks to {settings}"),
             format!(
-                "{under}and a sync job, {}, that runs every 2 minutes",
+                "and a sync job, {}, that runs every 2 minutes",
                 match os {
                     Os::Linux => vendor.timer().to_owned(),
                     Os::Macos => format!("the launch agent {}", vendor.label()),
                 }
             ),
         ],
+    };
+    if stale > 0 {
+        let hooks = if stale == 1 { "hook" } else { "hooks" };
+        rows.insert(
+            0,
+            format!("removes {stale} stale DevDiary {hooks} from {settings}"),
+        );
     }
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| format!("{}{row}", if i == 0 { &name } else { &under }))
+        .collect()
+}
+/// "1 stale DevDiary hook entry", "10 stale DevDiary hook entries".
+fn stale_named(n: usize) -> String {
+    format!(
+        "{n} stale DevDiary hook {}",
+        if n == 1 { "entry" } else { "entries" }
+    )
 }
 fn macos_note(os: Os, vendor: Vendor) -> Option<String> {
     (os == Os::Macos).then(|| format!(
@@ -1822,22 +1990,135 @@ mod tests {
     fn the_consent_step_summarises_the_hooks_and_the_sync_job() {
         let settings = Path::new("/home/ada/.claude/settings.json");
         assert_eq!(
-            summary(Os::Linux, Vendor::Claude, 10, settings, None),
+            summary(Os::Linux, Vendor::Claude, 10, settings, None, 0),
             [
                 "Claude Code   adds 10 hooks to /home/ada/.claude/settings.json",
                 "              and a sync job, devdiary-claude-sync.timer, that runs every 2 minutes",
             ]
         );
         assert_eq!(
-            summary(Os::Macos, Vendor::Codex, 10, settings, None)[1],
+            summary(Os::Macos, Vendor::Codex, 10, settings, None, 0)[1],
             "              and a sync job, the launch agent me.devdiary.codex-sync, that runs every 2 minutes"
         );
         assert_eq!(
-            summary(Os::Linux, Vendor::Claude, 10, settings, Some("0.3.0")),
+            summary(Os::Linux, Vendor::Claude, 10, settings, Some("0.3.0"), 0),
             [
                 "Claude Code   replaces its hooks of version 0.3.0 in /home/ada/.claude/settings.json",
                 &format!("              with 10 hooks of version {VERSION}"),
             ]
+        );
+    }
+
+    #[test]
+    fn stale_entries_to_remove_are_their_own_line_of_the_consent_summary() {
+        let settings = Path::new("/home/ada/.codex/hooks.json");
+        assert_eq!(
+            summary(Os::Linux, Vendor::Codex, 10, settings, None, 10),
+            [
+                "Codex         removes 10 stale DevDiary hooks from /home/ada/.codex/hooks.json",
+                "              adds 10 hooks to /home/ada/.codex/hooks.json",
+                "              and a sync job, devdiary-codex-sync.timer, that runs every 2 minutes",
+            ]
+        );
+        assert_eq!(
+            summary(Os::Linux, Vendor::Codex, 10, settings, None, 1)[0],
+            "Codex         removes 1 stale DevDiary hook from /home/ada/.codex/hooks.json"
+        );
+    }
+
+    /// An entry of `exe` and `plan` under Stop.
+    fn found(exe: &Path, plan: &Path) -> claude::Entry {
+        claude::Entry {
+            event: "Stop".into(),
+            command: format!(
+                "'{}' hook codex '{}' >/dev/null 2>&1 || :",
+                exe.display(),
+                plan.display()
+            ),
+            executable: exe.into(),
+            plan: plan.into(),
+        }
+    }
+
+    #[test]
+    fn only_entries_that_are_all_stale_are_offered_for_removal() {
+        let dir = crate::tempdir();
+        let data = dir.path().join("cli/codex");
+        let settings = dir.path().join("hooks.json");
+        let gone = found(
+            &dir.path().join("gone/devdiary"),
+            &dir.path().join("gone/plan.json"),
+        );
+        assert_eq!(
+            left_behind(
+                Vendor::Codex,
+                &data,
+                &settings,
+                vec![gone.clone(), gone.clone()]
+            )
+            .unwrap(),
+            [gone.clone(), gone.clone()]
+        );
+        assert!(
+            left_behind(Vendor::Codex, &data, &settings, vec![])
+                .unwrap()
+                .is_empty()
+        );
+
+        // A binary and plan that exist belong to an install, so setup stops.
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        for name in ["devdiary", "plan.json"] {
+            fs::write(other.join(name), b"").unwrap();
+        }
+        let working = found(&other.join("devdiary"), &other.join("plan.json"));
+        let error =
+            left_behind(Vendor::Codex, &data, &settings, vec![gone.clone(), working]).unwrap_err();
+        let refusal = error.downcast_ref::<exit::Refusal>().unwrap();
+        assert_eq!(
+            (refusal.code, refusal.file.as_path()),
+            ("already_registered", settings.as_path())
+        );
+        let detail = refusal.detail.as_deref().unwrap();
+        assert!(
+            detail.starts_with("2 DevDiary hook entries, and 1 of them runs "),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&ui::path(&other.join("devdiary"))),
+            "{detail}"
+        );
+        assert!(detail.contains("devdiary uninstall"), "{detail}");
+        assert!(detail.contains("devdiary upgrade"), "{detail}");
+        assert_eq!(refusal.next, None);
+    }
+
+    #[test]
+    fn entries_of_an_earlier_setup_on_this_machine_point_to_uninstall() {
+        let dir = crate::tempdir();
+        let data = dir.path().join("cli/codex");
+        fs::create_dir_all(data.join("plans")).unwrap();
+        fs::create_dir_all(data.join(VERSION)).unwrap();
+        let (exe, plan) = (
+            data.join(VERSION).join("devdiary"),
+            data.join("plans/codex-1.json"),
+        );
+        for path in [&exe, &plan] {
+            fs::write(path, b"").unwrap();
+        }
+        let settings = dir.path().join("hooks.json");
+        let error =
+            left_behind(Vendor::Codex, &data, &settings, vec![found(&exe, &plan)]).unwrap_err();
+        let refusal = error.downcast_ref::<exit::Refusal>().unwrap();
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some(
+                "1 DevDiary hook entry from an earlier setup on this machine that stopped before it saved its install record"
+            )
+        );
+        assert_eq!(
+            refusal.next.as_deref(),
+            Some("devdiary uninstall --vendor codex")
         );
     }
 
@@ -2139,6 +2420,54 @@ mod tests {
         );
         assert_eq!((absent[0].mark, absent[0].next.as_deref()), (None, None));
         assert_eq!(absent[0].text, "Codex: not found on this machine.");
+    }
+
+    #[test]
+    fn doctor_names_stale_entries_and_what_removes_them() {
+        let missing = json!({"installed": false, "timer": {}, "stale_entries": 10});
+        let rows = assess(
+            Os::Linux,
+            Vendor::Codex,
+            Path::new("/h.json"),
+            true,
+            None,
+            &missing,
+        );
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].text, "Codex: not set up.");
+        assert_eq!(
+            rows[0].next.as_deref(),
+            Some("devdiary setup --vendor codex")
+        );
+        assert_eq!(rows[1].mark, Some(Mark::Attention));
+        assert_eq!(
+            rows[1].text,
+            "Codex: /h.json holds 10 stale DevDiary hook entries."
+        );
+        assert_eq!(
+            rows[1].why.as_deref(),
+            Some(
+                "Their binary or plan no longer exists, so they record nothing. Setup offers to remove them."
+            )
+        );
+
+        let mut report = healthy();
+        report["stale_entries"] = json!(1);
+        let rows = check(report);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].mark, Some(Mark::Done));
+        assert_eq!(rows[1].mark, Some(Mark::Attention));
+        assert_eq!(
+            rows[1].text,
+            "Claude Code: /s.json also holds 1 stale DevDiary hook entry."
+        );
+        assert_eq!(
+            rows[1].why.as_deref(),
+            Some(
+                "Its binary or plan no longer exists, so it records nothing. Remove it from /s.json by hand: setup removes stale entries only while it sets a harness up."
+            )
+        );
+        assert_eq!(rows[1].next, None);
     }
 
     #[test]

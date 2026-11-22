@@ -245,10 +245,16 @@ does not stop the others:
    `--settings` alone names Claude Code. For each harness it refuses a relative
    `--settings` path (`unsupported_path`), a
    missing settings file (`settings_missing`), settings that are not valid JSON
-   (`invalid_settings`), already hold a `devdiary` hook (`already_registered`) or a
+   (`invalid_settings`), already hold a `devdiary` hook whose binary and plan still
+   exist (`already_registered`: the message names the file, how many entries it
+   holds and the binary they run, or `devdiary uninstall` for entries an earlier
+   setup on this machine wrote before it saved its install record) or a
    hook of the older `devdiary-collector` (`old_collector_registered`: run
    `devdiary-collector uninstall` first, then set up again with a new pairing), or
-   register the Python observer. It warns, without stopping, when another
+   register the Python observer. A `devdiary` entry whose binary or plan no longer
+   exists, such as one left by a deleted temporary folder, records nothing: when
+   every such entry in the file is stale, setup names the file, how many there are
+   and the binaries they run, and offers to remove them in step 2. It warns, without stopping, when another
    `devdiary` comes first on `PATH`. An alternate `--origin` without `--trust-origin` is refused, as for
    `setup`. A saved connection that the server revoked is refused
    (`connection_revoked`): run `uninstall`, move the connection folder aside (its
@@ -261,6 +267,8 @@ does not stop the others:
    set up (`both`, `claude` or `codex`); `--vendor` skips the question. For each one
    it summarises the change (how many hook entries, the settings file they go in and
    the sync job) and asks `[y/N/d]`. `d` prints the exact entries, then asks again.
+   Stale entries to remove get their own first row of the summary, and `d` prints
+   them before the entries to add.
    For Codex without a hooks file it first asks to create an empty `hooks.json`.
    A declined harness is left as it was. Declining every harness stops with
    `consent_declined`: nothing is sent and nothing changes.
@@ -278,7 +286,10 @@ does not stop the others:
    so the registered hook survives rebuilds and `cargo clean`.
 5. Plans the hook entries for that copy and applies the plan. Entries that differ
    from the ones shown, or settings edited after step 1, give `stale_plan`, and the
-   settings are left exactly as they are; run `setup` again. Before the write, setup
+   settings are left exactly as they are; run `setup` again. Stale entries the
+   person agreed to remove go first, in their own write: setup copies the settings
+   to `<settings file>.devdiary-stale-<UTC time>` with the same mode, keeps that
+   copy, and names it under "Changed on this machine". Before the hook write, setup
    copies the settings to `<settings file>.devdiary-backup` with the same mode. It
    removes the copy once the install record that names the write is saved. The
    plan never holds a copy of the settings.
@@ -363,7 +374,8 @@ for the one `--vendor` names) with `✓`, `!` or `✗`, a dimmed reason under ea
 problem, and `Next:` with the command that fixes the first problem. A harness that
 records reads like `✓ Claude Code records to DevDiary: 0 waiting to send, 12 sent,
 last sync 2026-11-22T00:10:00Z.` It checks the hooks, the sync job, a revoked
-connection, the last sync and scope refresh, and orchestrator names that wait.
+connection, the last sync and scope refresh, orchestrator names that wait, and
+stale `devdiary` entries in the settings file besides the install's own.
 It names the workspace a harness records to when pairing saved the name in
 `workspace.json` in the connection folder; connections paired before 0.5.0 read
 "records to DevDiary". When the hooks dropped events and nothing was sent, the
@@ -385,7 +397,8 @@ delivered counts, drops by reason (`drops`), the same drops by reason and hook
 event (`drops_by_event`, for example `{"observation_conflict": {"Stop": 2}}`;
 drops recorded by v0.5.0, or before the hook read the event's name, are counted
 in `drops` only), the last receipt, `last_sync_error`, `last_sync_at` (the
-last sync run, from the sync status file) and `last_scope_refresh_error`. When the harness settings file
+last sync run, from the sync status file), `last_scope_refresh_error` and
+`stale_entries`, the number of stale `devdiary` entries. When the harness settings file
 is not valid JSON, the registration reads `settings_unreadable` with the file's
 path, the error's line and column, and any backup setup left beside it. `doctor`
 still runs the other checks, names the file and the fix (on stderr with `--json`),
