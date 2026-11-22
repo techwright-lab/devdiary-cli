@@ -1702,9 +1702,11 @@ class OutsideReposHookTest(InstallationFixture, unittest.TestCase):
         consent.chmod(0o600)
 
     def plain_folder(self):
-        # Neither a temporary folder, which the hook keeps out, nor the real home.
-        target = Path(__file__).resolve().parents[1] / "target"
-        folder = target.resolve() / f"devdiary-outside-{os.getpid()}"
+        # The hook keeps temporary folders out, and a folder in the checkout is
+        # inside a repository. The account's home is neither on every machine.
+        # The folder is empty and goes at cleanup; ~/.claude and ~/.codex stay
+        # out of reach.
+        folder = isolation.real_home() / f"devdiary-outside-{os.getpid()}"
         folder.mkdir(exist_ok=True)
         self.addCleanup(folder.rmdir)
         return folder
