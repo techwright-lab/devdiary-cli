@@ -33,7 +33,8 @@ const ADDED_TABLES: &str = "
     CREATE TABLE delivered (observation_id TEXT PRIMARY KEY, digest BLOB NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TABLE drops (reason TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at INTEGER NOT NULL) WITHOUT ROWID;";
 const FOLD_TABLE: &str = "CREATE TABLE IF NOT EXISTS drops_folded (singleton INTEGER PRIMARY KEY CHECK(singleton=1), inode INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS self_test (session_id TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;";
+    CREATE TABLE IF NOT EXISTS self_test (session_id TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS drop_events (reason TEXT NOT NULL, event TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(reason, event)) WITHOUT ROWID;";
 const SELF_TESTS: i64 = 10;
 const MARKS_TABLE: &str = "CREATE TABLE IF NOT EXISTS bracket_marks (session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, checkout_key TEXT NOT NULL, offset INTEGER NOT NULL, ino INTEGER NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, PRIMARY KEY(session_id, tool_use_id)) WITHOUT ROWID;";
 const SCOPE_FAILURE_TABLE: &str = "CREATE TABLE IF NOT EXISTS scope_refresh_failure (singleton INTEGER PRIMARY KEY CHECK(singleton=1), code TEXT NOT NULL);";

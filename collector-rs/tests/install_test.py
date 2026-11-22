@@ -606,6 +606,13 @@ class InstallTest(unittest.TestCase):
         self.event_from(repo)
         report = json.loads(self.run_collector("doctor", "--json").stdout)
         self.assertEqual(report["drops"], {"outside_scope": 1, "unknown_repository": 2})
+        self.assertEqual(
+            report["drops_by_event"],
+            {
+                "outside_scope": {"SessionStart": 1},
+                "unknown_repository": {"SessionStart": 2},
+            },
+        )
         self.assertNotIn("workspace", report)
         out = self.run_collector("doctor").stdout.decode()
         flat = " ".join(out.split())
@@ -615,9 +622,13 @@ class InstallTest(unittest.TestCase):
             flat,
         )
         self.assertIn(
-            "2 came from sessions in a repository this workspace doesn't track.", flat
+            "2 SessionStart events came from sessions in a repository this workspace"
+            + " doesn't track.",
+            flat,
         )
-        self.assertIn("1 came from sessions outside the recording scope", flat)
+        self.assertIn(
+            "1 SessionStart event came from sessions outside the recording scope", flat
+        )
         self.assertNotIn("✓ Claude Code", out)
         self.assertEqual(
             out.splitlines()[-1],
@@ -643,7 +654,8 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(row < dim < codex, lines)
         self.assertTrue(lines[dim].startswith("  1 event was dropped: "), lines)
         self.assertIn(
-            "1 from sessions outside the recording scope", " ".join(out.split())
+            "1 SessionStart event came from sessions outside the recording scope",
+            " ".join(out.split()),
         )
         self.assertNotIn("Next:", out)
 

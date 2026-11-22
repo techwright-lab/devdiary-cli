@@ -1252,15 +1252,73 @@ fn workspace(data: &Path) -> Option<String> {
     saved.get("name")?.as_str().map(crate::machine::shown)
 }
 /// What a drop reason means, as the end of "N came …".
-fn dropped(reason: &str) -> String {
-    match reason {
-        "unknown_repository" => "from sessions in a repository this workspace doesn't track".into(),
-        "outside_scope" => "from sessions outside the recording scope, such as a folder that is not a git repository".into(),
-        "spool_full" => "while the outbox on this machine was full".into(),
-        "revoked" => "after the server revoked the connection".into(),
-        "stale_plan" => "while the hook entries did not match this install".into(),
+/// The positive counts in a JSON object, largest first.
+fn positive(value: &Value) -> Vec<(&str, u64)> {
+    let mut out: Vec<(&str, u64)> = value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, n)| Some((key.as_str(), n.as_u64().filter(|n| *n > 0)?)))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    out
+}
+/// `n` drops for one reason in plain words, naming the hook events where they
+/// are known: "2 Stop events repeated for a turn already recorded".
+fn dropped(reason: &str, n: u64, events: &[(&str, u64)]) -> String {
+    let one = n == 1;
+    let (was, its) = if one {
+        ("was", "its")
+    } else {
+        ("were", "their")
+    };
+    let known: u64 = events.iter().map(|(_, k)| k).sum();
+    let single = match events {
+        [(event, k)] if *k == n => Some(*event),
+        _ => None,
+    };
+    let what = match single {
+        Some(event) => format!("{n} {event} event{}", if one { "" } else { "s" }),
+        None if events.is_empty() => n.to_string(),
+        None => {
+            let mut parts: Vec<_> = events.iter().map(|(e, k)| format!("{k} {e}")).collect();
+            if known < n {
+                parts.push(format!("{} other", n - known));
+            }
+            format!("{n} ({})", parts.join(", "))
+        }
+    };
+    let repeated = |event| match event {
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => Some("a tool call"),
+        "UserPromptSubmit" | "Stop" | "Interrupt" => Some("a turn"),
+        "SubagentStart" | "SubagentStop" => Some("a subagent"),
+        _ => None,
+    };
+    let how = match reason {
+        "outside_scope" => "came from sessions outside the recording scope, such as a folder that is not a git repository".into(),
+        "unknown_repository" => "came from sessions in a repository this workspace doesn't track".into(),
+        "spool_full" => "arrived while the outbox on this machine was full".into(),
+        "permission" => "arrived while a DevDiary file or folder had the wrong owner or permissions".into(),
+        "invalid" => "had an event name, session ID or working folder the hook can't use".into(),
+        "observation_conflict" => match single.and_then(repeated) {
+            Some(identity) => format!("repeated for {identity} already recorded"),
+            None => "repeated an event already recorded".into(),
+        },
+        "reflog_rotated" => format!("{was} recorded without {its} commits, because the git reflog was rewritten while the command ran"),
+        "revoked" => "arrived after DevDiary revoked this connection".into(),
+        "stale_plan" => "arrived while the hook entries did not match this install".into(),
+        "busy" => "arrived while another DevDiary process held the outbox for too long".into(),
+        "error" => "failed on an unexpected error in the hook".into(),
+        "invalid_json" => format!("{was} not valid JSON"),
+        "invalid_metadata" => "had a value DevDiary doesn't accept in a field it sends, such as the session ID".into(),
+        "input_too_large" => format!("{was} larger than the hook's 64 KiB input limit"),
+        "invalid_prompt_id" => "had a prompt ID the hook can't use".into(),
+        "invalid_tool_use_id" => "had a tool-use ID the hook can't use".into(),
+        "invalid_agent_id" => "had an agent ID the hook can't use".into(),
+        "invalid_agent_type" => "had an agent type the hook can't use".into(),
         other => format!("for the reason {other}"),
-    }
+    };
+    format!("{what} {how}")
 }
 fn events_dropped(total: u64) -> String {
     match total {
@@ -1300,6 +1358,7 @@ fn health(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Health> {
         .map(|raw| serde_json::from_slice::<Value>(&raw))
         .transpose()?;
     let status = load(&connection(&data).join(SYNC_STATUS))?;
+    let drops = drops::counts(&store, &outbox)?;
     let report = json!({
         "installed": true,
         "runtime": vendor.runtime(),
@@ -1310,7 +1369,8 @@ fn health(scheduler: &Scheduler<'_>, vendor: Vendor) -> Result<Health> {
         "timer": scheduler.state(vendor),
         "pending": pending,
         "delivered": delivered,
-        "drops": drops::counts(&store, &outbox)?,
+        "drops": drops.reasons,
+        "drops_by_event": drops.events,
         "orchestrators": orchestrators::summary(&outbox),
         "outside_repos": crate::outside::allowed(&outbox),
         "revoked": connection(&data).join("revoked").exists(),
@@ -1505,21 +1565,18 @@ fn assess(
         ));
     }
     let target = workspace.map_or("DevDiary".into(), |w| format!("the workspace {w}"));
-    let mut drops: Vec<(&str, u64)> = report["drops"]
-        .as_object()
+    let say = |(reason, n): &(&str, u64)| {
+        dropped(reason, *n, &positive(&report["drops_by_event"][*reason]))
+    };
+    // A rewritten reflog loses an event's commits, not the event.
+    let (unlinked, drops): (Vec<_>, Vec<_>) = positive(&report["drops"])
         .into_iter()
-        .flatten()
-        .filter_map(|(reason, n)| Some((reason.as_str(), n.as_u64().filter(|n| *n > 0)?)))
-        .collect();
-    drops.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        .partition(|(reason, _)| *reason == "reflog_rotated");
     let total: u64 = drops.iter().map(|(_, n)| n).sum();
     let delivered = report["delivered"].as_u64().unwrap_or(0);
     let has = |reason| drops.iter().any(|(r, _)| *r == reason);
     if total > 0 && delivered == 0 {
-        let why: Vec<_> = drops
-            .iter()
-            .map(|(reason, n)| format!("{n} came {}.", dropped(reason)))
-            .collect();
+        let why: Vec<_> = drops.iter().map(|d| format!("{}.", say(d))).collect();
         let mut todo = Vec::new();
         if has("unknown_repository") {
             todo.push("track the repository in DevDiary".to_owned());
@@ -1550,13 +1607,18 @@ fn assess(
         ));
     }
     if total > 0 && delivered > 0 {
-        let reasons: Vec<_> = drops
-            .iter()
-            .map(|(reason, n)| format!("{n} {}", dropped(reason)))
-            .collect();
+        let reasons: Vec<_> = drops.iter().map(say).collect();
         rows.push(Finding {
             mark: None,
             text: format!("{}: {}.", events_dropped(total), reasons.join("; ")),
+            why: None,
+            next: None,
+        });
+    }
+    for lost in &unlinked {
+        rows.push(Finding {
+            mark: None,
+            text: format!("{}.", say(lost)),
             why: None,
             next: None,
         });
@@ -1857,6 +1919,152 @@ mod tests {
             rows[1].text
         );
         assert!(rows[1].text.contains("doesn't track"), "{}", rows[1].text);
+    }
+
+    #[test]
+    fn every_drop_reason_has_plain_words() {
+        let cases = [
+            (
+                "outside_scope",
+                "came from sessions outside the recording scope, such as a folder that is not a git repository",
+            ),
+            (
+                "unknown_repository",
+                "came from sessions in a repository this workspace doesn't track",
+            ),
+            (
+                "spool_full",
+                "arrived while the outbox on this machine was full",
+            ),
+            (
+                "permission",
+                "arrived while a DevDiary file or folder had the wrong owner or permissions",
+            ),
+            (
+                "invalid",
+                "had an event name, session ID or working folder the hook can't use",
+            ),
+            ("observation_conflict", "repeated an event already recorded"),
+            (
+                "reflog_rotated",
+                "were recorded without their commits, because the git reflog was rewritten while the command ran",
+            ),
+            ("revoked", "arrived after DevDiary revoked this connection"),
+            (
+                "stale_plan",
+                "arrived while the hook entries did not match this install",
+            ),
+            (
+                "busy",
+                "arrived while another DevDiary process held the outbox for too long",
+            ),
+            ("error", "failed on an unexpected error in the hook"),
+            ("invalid_json", "were not valid JSON"),
+            (
+                "invalid_metadata",
+                "had a value DevDiary doesn't accept in a field it sends, such as the session ID",
+            ),
+            (
+                "input_too_large",
+                "were larger than the hook's 64 KiB input limit",
+            ),
+            ("invalid_prompt_id", "had a prompt ID the hook can't use"),
+            (
+                "invalid_tool_use_id",
+                "had a tool-use ID the hook can't use",
+            ),
+            ("invalid_agent_id", "had an agent ID the hook can't use"),
+            ("invalid_agent_type", "had an agent type the hook can't use"),
+        ];
+        assert_eq!(cases.len(), drops::REASONS.len());
+        for (reason, words) in cases {
+            assert!(drops::REASONS.contains(&reason), "{reason}");
+            assert_eq!(dropped(reason, 2, &[]), format!("2 {words}"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn one_drop_reads_in_the_singular() {
+        assert_eq!(dropped("invalid_json", 1, &[]), "1 was not valid JSON");
+        assert_eq!(
+            dropped("reflog_rotated", 1, &[("PostToolUse", 1)]),
+            "1 PostToolUse event was recorded without its commits, because the git reflog was rewritten while the command ran"
+        );
+    }
+
+    #[test]
+    fn a_repeat_names_the_event_and_what_it_repeated() {
+        assert_eq!(
+            dropped("observation_conflict", 2, &[("Stop", 2)]),
+            "2 Stop events repeated for a turn already recorded"
+        );
+        assert_eq!(
+            dropped("observation_conflict", 1, &[("PreToolUse", 1)]),
+            "1 PreToolUse event repeated for a tool call already recorded"
+        );
+        assert_eq!(
+            dropped("observation_conflict", 1, &[("SubagentStop", 1)]),
+            "1 SubagentStop event repeated for a subagent already recorded"
+        );
+        assert_eq!(
+            dropped(
+                "observation_conflict",
+                3,
+                &[("Stop", 2), ("PostToolUse", 1)]
+            ),
+            "3 (2 Stop, 1 PostToolUse) repeated an event already recorded"
+        );
+    }
+
+    #[test]
+    fn drops_with_only_some_events_known_count_the_rest_as_other() {
+        assert_eq!(
+            dropped("unknown_repository", 4, &[("SessionStart", 3)]),
+            "4 (3 SessionStart, 1 other) came from sessions in a repository this workspace doesn't track"
+        );
+        assert_eq!(
+            dropped("unknown_repository", 3, &[("SessionStart", 3)]),
+            "3 SessionStart events came from sessions in a repository this workspace doesn't track"
+        );
+    }
+
+    #[test]
+    fn doctor_names_the_repeated_event_beside_deliveries() {
+        let mut report = healthy();
+        report["drops"] = json!({"observation_conflict": 2});
+        report["drops_by_event"] = json!({"observation_conflict": {"Stop": 2}});
+        let rows = check(report);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].text,
+            "2 events were dropped: 2 Stop events repeated for a turn already recorded."
+        );
+    }
+
+    #[test]
+    fn commits_lost_to_a_rewritten_reflog_are_not_counted_as_dropped_events() {
+        let mut report = healthy();
+        report["delivered"] = json!(0);
+        report["drops"] = json!({"reflog_rotated": 1});
+        let rows = check(report);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].mark, Some(Mark::Done));
+        assert_eq!(
+            rows[1].text,
+            "1 was recorded without its commits, because the git reflog was rewritten while the command ran."
+        );
+        let mut report = healthy();
+        report["drops"] = json!({"reflog_rotated": 1, "busy": 2});
+        let rows = check(report);
+        assert_eq!(
+            rows[1].text,
+            "2 events were dropped: 2 arrived while another DevDiary process held the outbox for too long."
+        );
+        assert!(
+            rows[2]
+                .text
+                .starts_with("1 was recorded without its commits")
+        );
     }
 
     #[test]

@@ -1,6 +1,10 @@
-//! Counts of hook events that were not stored, by reason. The hook appends one
-//! byte per drop to an O_APPEND log, so counting never needs the SQLite store;
-//! sync folds the log into the store's drops table.
+//! Counts of hook events that were not stored, by reason and by hook event.
+//! The hook appends one or two bytes per drop to an O_APPEND log, so counting
+//! never needs the SQLite store; sync folds the log into the store's tables.
+//!
+//! A drop is its reason's byte, then its event's byte when the event is known.
+//! Reason bytes are `a` onward and event bytes `A` onward, so v0.5.0, which
+//! wrote reason bytes only and skips any other byte, reads either log.
 use crate::{
     Result,
     store::{Store, private},
@@ -39,13 +43,41 @@ pub const REASONS: [&str; 18] = [
     "invalid_agent_type",
 ];
 
+// Append only: an event's index is its byte in the log. Only these fixed
+// names are ever written, never a name taken from the hook input.
+pub const EVENTS: [&str; 11] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PermissionRequest",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+    "SessionEnd",
+    "Interrupt",
+];
+
+/// Drop counts by reason, and by reason and hook event where the event is
+/// known. Drops written by v0.5.0 or before the event was read have no event.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub reasons: BTreeMap<String, i64>,
+    pub events: BTreeMap<String, BTreeMap<String, i64>>,
+}
+
 /// Best effort and silent: a drop that cannot be counted is not an error.
-pub fn note(state: &Path, reason: &str) {
+pub fn note(state: &Path, reason: &str, event: Option<&str>) {
     let Some(index) = REASONS.iter().position(|r| *r == reason) else {
         return;
     };
+    let mut record = vec![b'a' + index as u8];
+    if let Some(e) = event.and_then(|event| EVENTS.iter().position(|e| *e == event)) {
+        record.push(b'A' + e as u8);
+    }
     for _ in 0..2 {
-        match open(state).and_then(|log| append(&log, state, b'a' + index as u8)) {
+        match open(state).and_then(|log| append(&log, state, &record)) {
             Ok(false) => continue,
             _ => return,
         }
@@ -62,7 +94,8 @@ fn open(state: &Path) -> Result<File> {
 }
 // Sync may rename the log between open and write. A handle that no longer
 // names the live log must not write: its inode may already be tallied.
-fn append(log: &File, state: &Path, byte: u8) -> Result<bool> {
+// One write call, so concurrent hooks never interleave a drop's two bytes.
+fn append(log: &File, state: &Path, record: &[u8]) -> Result<bool> {
     log.lock_shared()?;
     let m = log.metadata()?;
     let live = fs::symlink_metadata(state.join(LOG))
@@ -73,22 +106,34 @@ fn append(log: &File, state: &Path, byte: u8) -> Result<bool> {
         && m.nlink() == 1
         && m.len() < CAP
     {
-        (&*log).write_all(&[byte])?;
+        (&*log).write_all(record)?;
     }
     log.unlock()?;
     Ok(live)
 }
-fn tally(path: &Path, counts: &mut BTreeMap<String, i64>) -> Result<()> {
+fn tally(path: &Path, counts: &mut Counts) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
     private(path, false)?;
     let mut raw = Vec::new();
     File::open(path)?.take(CAP + 1).read_to_end(&mut raw)?;
+    // An event byte belongs to the reason byte just before it, if any.
+    let mut last: Option<&&str> = None;
     for byte in raw {
-        if let Some(reason) = byte.checked_sub(b'a').and_then(|i| REASONS.get(i as usize)) {
-            *counts.entry((*reason).to_owned()).or_default() += 1;
+        let reason = byte.checked_sub(b'a').and_then(|i| REASONS.get(i as usize));
+        let event = byte.checked_sub(b'A').and_then(|i| EVENTS.get(i as usize));
+        if let Some(reason) = reason {
+            *counts.reasons.entry((*reason).to_owned()).or_default() += 1;
+        } else if let (Some(event), Some(reason)) = (event, last) {
+            *counts
+                .events
+                .entry((*reason).to_owned())
+                .or_default()
+                .entry((*event).to_owned())
+                .or_default() += 1;
         }
+        last = reason;
     }
     Ok(())
 }
@@ -111,12 +156,23 @@ fn folded(store: &Store, folding: &Path) -> Result<bool> {
         .optional()?;
     Ok(row.is_some())
 }
-pub fn counts(store: &Store, state: &Path) -> Result<BTreeMap<String, i64>> {
-    let mut counts = BTreeMap::new();
+pub fn counts(store: &Store, state: &Path) -> Result<Counts> {
+    let mut counts = Counts::default();
     let mut statement = store.db.prepare("SELECT reason,count FROM drops")?;
     for row in statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))? {
         let (reason, count): (String, i64) = row?;
-        counts.insert(reason, count);
+        counts.reasons.insert(reason, count);
+    }
+    let mut statement = store
+        .db
+        .prepare("SELECT reason,event,count FROM drop_events")?;
+    for row in statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
+        let (reason, event, count): (String, String, i64) = row?;
+        counts
+            .events
+            .entry(reason)
+            .or_default()
+            .insert(event, count);
     }
     if !folded(store, &state.join(FOLDING))? {
         tally(&state.join(FOLDING), &mut counts)?;
@@ -128,15 +184,23 @@ pub fn counts(store: &Store, state: &Path) -> Result<BTreeMap<String, i64>> {
 // after a failure or crash before the unlink never adds them twice.
 fn commit(store: &Store, folding: &Path) -> Result<()> {
     let inode = inode(folding)?.ok_or("drops_log_missing")?;
-    let mut counts = BTreeMap::new();
+    let mut counts = Counts::default();
     tally(folding, &mut counts)?;
     let at = fs::symlink_metadata(folding)?.mtime();
     let tx = Transaction::new_unchecked(&store.db, TransactionBehavior::Immediate)?;
-    for (reason, count) in counts {
+    for (reason, count) in counts.reasons {
         tx.execute(
             "INSERT INTO drops(reason,count,last_at) VALUES(?1,?2,?3) ON CONFLICT(reason) DO UPDATE SET count=count+?2,last_at=MAX(last_at,?3)",
             params![reason, count, at],
         )?;
+    }
+    for (reason, events) in counts.events {
+        for (event, count) in events {
+            tx.execute(
+                "INSERT INTO drop_events(reason,event,count) VALUES(?1,?2,?3) ON CONFLICT(reason,event) DO UPDATE SET count=count+?3",
+                params![reason, event, count],
+            )?;
+        }
     }
     tx.execute(
         "INSERT OR REPLACE INTO drops_folded(singleton,inode) VALUES(1,?)",
@@ -187,6 +251,114 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    fn by_event(pairs: &[(&str, &str, i64)]) -> BTreeMap<String, BTreeMap<String, i64>> {
+        let mut out: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+        for (reason, event, n) in pairs {
+            out.entry((*reason).into())
+                .or_default()
+                .insert((*event).into(), *n);
+        }
+        out
+    }
+
+    #[test]
+    fn a_log_written_by_v0_5_0_still_counts_by_reason() {
+        let (_dir, state, store) = spool();
+        write(&state.join(LOG), b"aabf");
+        let counts = counts(&store, &state).unwrap();
+        let expected = BTreeMap::from([
+            ("outside_scope".into(), 2),
+            ("unknown_repository".into(), 1),
+            ("observation_conflict".into(), 1),
+        ]);
+        assert_eq!(counts.reasons, expected);
+        assert!(counts.events.is_empty());
+    }
+
+    #[test]
+    fn a_drop_with_a_known_event_is_counted_by_reason_and_by_event() {
+        let (_dir, state, store) = spool();
+        note(&state, "observation_conflict", Some("Stop"));
+        note(&state, "observation_conflict", Some("Stop"));
+        note(&state, "observation_conflict", Some("PreToolUse"));
+        note(&state, "observation_conflict", None);
+        let counts = counts(&store, &state).unwrap();
+        assert_eq!(
+            counts.reasons,
+            BTreeMap::from([("observation_conflict".into(), 4)])
+        );
+        assert_eq!(
+            counts.events,
+            by_event(&[
+                ("observation_conflict", "Stop", 2),
+                ("observation_conflict", "PreToolUse", 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_event_name_outside_the_list_is_never_written() {
+        let (_dir, state, store) = spool();
+        note(&state, "invalid", Some("/home/someone/private"));
+        assert_eq!(fs::read(state.join(LOG)).unwrap(), b"e");
+        assert!(counts(&store, &state).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn event_bytes_are_outside_the_reason_range_so_v0_5_0_skips_them() {
+        let reasons = b'a'..b'a' + REASONS.len() as u8;
+        for i in 0..EVENTS.len() {
+            assert!(!reasons.contains(&(b'A' + i as u8)));
+        }
+        assert!(EVENTS.len() <= 26);
+    }
+
+    #[test]
+    fn every_harness_event_has_a_byte() {
+        for vendor in [crate::vendor::Vendor::Claude, crate::vendor::Vendor::Codex] {
+            for event in vendor.events() {
+                assert!(EVENTS.contains(event), "{event}");
+            }
+        }
+    }
+
+    #[test]
+    fn per_event_counts_survive_a_fold() {
+        let (_dir, state, store) = spool();
+        note(&state, "observation_conflict", Some("Stop"));
+        fold(&store, &state).unwrap();
+        note(&state, "observation_conflict", Some("Stop"));
+        note(&state, "unknown_repository", Some("SessionStart"));
+        let counts = counts(&store, &state).unwrap();
+        assert_eq!(
+            counts.events,
+            by_event(&[
+                ("observation_conflict", "Stop", 2),
+                ("unknown_repository", "SessionStart", 1),
+            ])
+        );
+        fold(&store, &state).unwrap();
+        assert_eq!(
+            counts.events,
+            crate::drops::counts(&store, &state).unwrap().events
+        );
+    }
+
+    #[test]
+    fn an_event_byte_without_its_reason_counts_nothing() {
+        let (_dir, state, store) = spool();
+        write(&state.join(LOG), b"GfG");
+        let counts = counts(&store, &state).unwrap();
+        assert_eq!(
+            counts.reasons,
+            BTreeMap::from([("observation_conflict".into(), 1)])
+        );
+        assert_eq!(
+            counts.events,
+            by_event(&[("observation_conflict", "Stop", 1)])
+        );
+    }
+
     #[test]
     fn a_fold_interrupted_before_unlink_is_not_counted_twice() {
         let (_dir, state, store) = spool();
@@ -198,7 +370,7 @@ mod tests {
             ("outside_scope".into(), 2),
             ("unknown_repository".into(), 1),
         ]);
-        assert_eq!(counts(&store, &state).unwrap(), expected);
+        assert_eq!(counts(&store, &state).unwrap().reasons, expected);
     }
 
     #[test]
@@ -209,7 +381,7 @@ mod tests {
         write(&state.join(LOG), b"a");
         fold(&store, &state).unwrap();
         assert_eq!(
-            counts(&store, &state).unwrap(),
+            counts(&store, &state).unwrap().reasons,
             BTreeMap::from([("outside_scope".into(), 2)])
         );
     }
@@ -238,11 +410,11 @@ mod tests {
         let (_dir, state, store) = spool();
         let stale = open(&state).unwrap();
         fs::rename(state.join(LOG), state.join(FOLDING)).unwrap();
-        assert!(!append(&stale, &state, b'a').unwrap());
+        assert!(!append(&stale, &state, b"a").unwrap());
         fold(&store, &state).unwrap();
-        note(&state, "outside_scope");
+        note(&state, "outside_scope", None);
         assert_eq!(
-            counts(&store, &state).unwrap(),
+            counts(&store, &state).unwrap().reasons,
             BTreeMap::from([("outside_scope".into(), 1)])
         );
     }

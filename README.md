@@ -366,18 +366,24 @@ connection, the last sync and scope refresh, and orchestrator names that wait.
 It names the workspace a harness records to when pairing saved the name in
 `workspace.json` in the connection folder; connections paired before 0.5.0 read
 "records to DevDiary". When the hooks dropped events and nothing was sent, the
-line reads `!` and says what each reason means: `unknown_repository` is a session
-in a repository the workspace does not track, and `outside_scope` a session
-outside the recording scope, such as a folder that is not a git repository.
-`Next:` then says to track the repository in DevDiary, or to run
+line reads `!` and says in plain words what each reason means, for every reason
+the drop log counts: `unknown_repository` is a session in a repository the
+workspace does not track, `outside_scope` a session outside the recording scope,
+such as a folder that is not a git repository, and so on. Where the hook recorded
+the event, the words name it: "2 Stop events repeated for a turn already
+recorded". `Next:` then says to track the repository in DevDiary, or to run
 `devdiary outside-repos on` while that is off. Drops beside deliveries show as a
-dimmed line under the harness.
+dimmed line under the harness. A `reflog_rotated` count is not a dropped event:
+the event was kept without its commits, and doctor says so on its own line.
 
 `doctor --json` prints the report of one harness (Claude unless `--vendor codex`) as
 JSON, for scripts: the registration state, `systemctl --user is-enabled/is-active` for
 the timer (on macOS, `loaded` from the exit status of
 `launchctl print gui/UID/LABEL`, whose output it never reads), pending and
-delivered counts, drops, the last receipt, `last_sync_error`, `last_sync_at` (the
+delivered counts, drops by reason (`drops`), the same drops by reason and hook
+event (`drops_by_event`, for example `{"observation_conflict": {"Stop": 2}}`;
+drops recorded by v0.5.0, or before the hook read the event's name, are counted
+in `drops` only), the last receipt, `last_sync_error`, `last_sync_at` (the
 last sync run, from the sync status file) and `last_scope_refresh_error`. When the harness settings file
 is not valid JSON, the registration reads `settings_unreadable` with the file's
 path, the error's line and column, and any backup setup left beside it. `doctor`
@@ -628,9 +634,14 @@ entries and asks before writing them), `devdiary doctor` and `devdiary uninstall
   capture. Every refusal after the plan loads is counted by reason
   (`outside_scope`, `spool_full`, `permission`, `invalid`, `observation_conflict`,
   `revoked`, `stale_plan`, `busy`, `error`) as one byte appended to `outbox/drops.log`
-  without opening SQLite; sync folds it into the spool's `drops` table, and
-  `doctor` prints the totals. Drops before the plan loads cannot be attributed to
-  an outbox and are not counted.
+  without opening SQLite. When the hook has read the event's name, a second byte
+  in the same write names it, from a fixed list of the harnesses' hook events,
+  never from the hook input. Sync folds the log into the spool's `drops` and
+  `drop_events` tables, and `doctor` prints the totals. Reason bytes are `a`
+  onward and event bytes `A` onward, so a log written by v0.5.0 still counts by
+  reason, and v0.5.0 counts a newer log by reason and skips the event bytes.
+  Drops before the plan loads cannot be attributed to an outbox and are not
+  counted.
 
 Additional Linux fixture gate:
 
